@@ -1,0 +1,141 @@
+/* Global styles — Figma Music Player WPF */
+
+QMainWindow {
+    background-color: {{colors.bg_window}};
+}
+
+QLabel {
+    color: {{colors.text_primary}};
+}
+
+QSpinBox {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    border-radius: {{radius.md}};
+    padding: {{spacing.xs}} {{spacing.sm}};
+    min-height: 20px;
+}
+
+QSpinBox::up-button, QSpinBox::down-button {
+    background-color: {{colors.bg_control}};
+    border: none;
+    width: 12px;
+}
+
+QCheckBox {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+    spacing: {{spacing.md}};
+}
+
+QCheckBox::indicator {
+    width: {{sizes.indicator}};
+    height: {{sizes.indicator}};
+    border-radius: {{radius.md}};
+    background-color: {{colors.bg_control}};
+}
+
+QCheckBox::indicator:checked {
+    background-color: {{colors.text_primary}};
+    border: 3px solid {{colors.bg_control}};
+}
+
+QPushButton {
+    background-color: {{colors.bg_control}};
+    border: none;
+    border-radius: {{radius.lg}};
+    padding: {{spacing.xs}};
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+    color: {{colors.text_primary}};
+    min-width: {{sizes.icon_button}};
+    min-height: {{sizes.icon_button}};
+}
+
+QPushButton:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QPushButton:pressed {
+    background-color: {{colors.bg_control_pressed}};
+}
+
+QPushButton#accentButton {
+    background-color: {{colors.accent_red}};
+    min-width: 0;
+    min-height: {{sizes.button_min_height}};
+}
+
+QPushButton#accentButton:hover {
+    background-color: #f06666;
+}
+
+QPushButton#segmentButton {
+    min-width: 0;
+    min-height: {{sizes.button_min_height}};
+    border-radius: {{radius.lg}};
+    padding: {{spacing.xs}};
+    font-size: {{typography.size_lg}};
+    background-color: {{colors.bg_control}};
+}
+
+QPushButton#segmentButton[segmentActive="true"] {
+    background-color: {{colors.accent_red}};
+}
+
+QPushButton#stepperBtn {
+    min-width: {{sizes.stepper_btn}};
+    min-height: {{sizes.stepper_btn}};
+    max-width: {{sizes.stepper_btn}};
+    max-height: {{sizes.stepper_btn}};
+    padding: 0;
+    border-radius: {{radius.md}};
+}
+
+QLabel#stepperValue {
+    background-color: {{colors.bg_control}};
+    border-radius: {{radius.lg}};
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+    padding: 0;
+    min-width: {{sizes.stepper_value}};
+    max-width: {{sizes.stepper_value}};
+    min-height: {{sizes.stepper_value}};
+    max-height: {{sizes.stepper_value}};
+}
+
+QSpinBox#stepperSpin {
+    background-color: {{colors.bg_control}};
+    border-radius: {{radius.lg}};
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+    padding: 0 {{spacing.xs}};
+    min-height: {{sizes.stepper_value}};
+    max-height: {{sizes.stepper_value}};
+}
+
+QSpinBox#stepperSpin:focus {
+    background-color: {{colors.bg_control}};
+}
+
+QToolButton {
+    background-color: transparent;
+    border: none;
+    padding: 0;
+    min-width: {{sizes.tool_button}};
+    min-height: {{sizes.tool_button}};
+    max-width: {{sizes.tool_button}};
+    max-height: {{sizes.tool_button}};
+}
+
+QToolButton:hover {
+    background-color: {{colors.bg_control_hover}};
+    border-radius: {{radius.sm}};
+}
+
+QLabel#sectionLabel {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+    font-weight: normal;
+}

@@ -1,0 +1,41 @@
+/* Playlist list widget */
+
+QListWidget#playlistList {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    border: none;
+    border-radius: {{radius.lg}};
+    outline: none;
+    padding: {{spacing.xs}} {{spacing.sm}};
+}
+
+QListWidget#playlistList:focus {
+    outline: none;
+}
+
+QListWidget#playlistList::item {
+    background: transparent;
+    padding: 0;
+    border: none;
+}
+
+QListWidget#playlistList::item:selected,
+QListWidget#playlistList::item:selected:hover,
+QListWidget#playlistList::item:hover {
+    background: transparent;
+    color: {{colors.text_primary}};
+}
+
+QFrame#playlistToolbar {
+    background-color: transparent;
+}
+
+QFrame#playlistListFrame {
+    background-color: {{colors.bg_surface}};
+    border-radius: {{radius.lg}};
+    border: 2px solid transparent;
+}
+
+QFrame#playlistListFrame[playlistActive="true"] {
+    border-color: {{colors.border_focus}};
+}

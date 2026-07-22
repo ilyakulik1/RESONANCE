@@ -1,0 +1,10 @@
+/* Bottom playback control panel */
+
+QFrame#controlPanel {
+    background-color: {{colors.bg_primary}};
+    border: none;
+}
+
+QFrame#controlRow {
+    background-color: transparent;
+}

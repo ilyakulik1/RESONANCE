@@ -1,0 +1,265 @@
+/* Video Mixer panel */
+
+QWidget#videoMixerPanel {
+    background-color: {{colors.bg_primary}};
+    min-width: 300px;
+}
+
+QLabel#screenCaption {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+    font-weight: bold;
+}
+
+QFrame#screenResBar {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+}
+
+QComboBox#mixerScreenCombo {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    padding: 2px 6px;
+    min-height: 22px;
+}
+
+QComboBox#mixerScreenCombo::drop-down {
+    border: none;
+    width: 18px;
+}
+
+QComboBox#mixerScreenCombo QAbstractItemView {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    selection-background-color: {{colors.bg_control_hover}};
+}
+
+QWidget#mainScreen,
+QWidget#previewScreen {
+    background-color: {{colors.bg_black}};
+    border: 1px solid {{colors.border}};
+    min-height: 90px;
+}
+
+QScrollArea#scenesScroll {
+    background-color: {{colors.bg_secondary}};
+    border: 1px solid {{colors.border}};
+    min-height: 70px;
+}
+
+QSplitter#mixerMainSplitter::handle,
+QSplitter#mixerPanelSplitter::handle,
+QSplitter#mixerBottomSplitter::handle {
+    background-color: {{colors.bg_control}};
+}
+
+QSplitter#mixerMainSplitter::handle:horizontal {
+    width: 5px;
+}
+
+QSplitter#mixerPanelSplitter::handle:vertical,
+QSplitter#mixerBottomSplitter::handle:vertical {
+    height: 5px;
+}
+
+QSplitter#mixerBottomSplitter::handle:horizontal {
+    width: 5px;
+}
+
+QFrame#sceneSlot {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+}
+
+QFrame#sceneSlot[active="true"] {
+    border: 2px solid {{colors.accent_red}};
+}
+
+QFrame#sceneSlot[preview="true"] {
+    border: 1px solid {{colors.accent_blue}};
+}
+
+QFrame#sceneSlot[addSlot="true"] {
+    background-color: {{colors.bg_control}};
+}
+
+QLabel#sceneThumb {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_xxl}};
+    font-weight: bold;
+    background-color: {{colors.bg_black}};
+}
+
+QLabel#sceneName {
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_xs}};
+}
+
+QWidget#layersHost {
+    background-color: {{colors.bg_surface}};
+}
+
+QListWidget#layerList {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+    outline: none;
+}
+
+QListWidget#layerList::item {
+    background: transparent;
+    color: {{colors.text_primary}};
+    min-height: 24px;
+}
+
+QListWidget#layerList::item:selected,
+QListWidget#layerList::item:selected:hover,
+QListWidget#layerList::item:hover {
+    background: transparent;
+    color: {{colors.text_primary}};
+}
+
+QScrollArea#propertiesScroll {
+    background-color: transparent;
+    border: none;
+}
+
+QScrollArea#layersScroll {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+}
+
+QFrame#layerRow {
+    background-color: {{colors.bg_card}};
+    border: 1px solid transparent;
+    min-height: 22px;
+}
+
+QFrame#layerRow[selected="true"] {
+    border: 1px solid {{colors.text_primary}};
+}
+
+QLabel#layerIndex {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+    min-width: 12px;
+}
+
+QLabel#layerName {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_sm}};
+}
+
+QToolButton#layerEyeBtn {
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_sm}};
+    min-width: 18px;
+    max-width: 22px;
+}
+
+QToolButton#layerDeleteBtn {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+    min-width: 16px;
+    max-width: 18px;
+    padding: 0;
+}
+
+QToolButton#layerDeleteBtn:hover {
+    color: {{colors.accent_red}};
+    background-color: {{colors.bg_control_hover}};
+}
+
+QFrame#propertiesFrame {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+}
+
+QLabel#propTitle {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+}
+
+QLabel#propAxis {
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+}
+
+QLabel#mixerTimeLabel {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+    min-width: 28px;
+}
+
+QSlider#mixerSeek::groove:horizontal {
+    background: {{colors.bg_control}};
+    height: 4px;
+}
+
+QSlider#mixerSeek::handle:horizontal {
+    background: {{colors.text_primary}};
+    width: 10px;
+    margin: -4px 0;
+}
+
+QToolButton#mixerToolBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+    min-width: 22px;
+    min-height: 18px;
+    max-height: 20px;
+    padding: 0 4px;
+}
+
+QToolButton#mixerToolBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QToolButton#mixerFullscreenBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+    min-width: 88px;
+    min-height: 22px;
+    max-height: 24px;
+    padding: 2px 8px;
+}
+
+QToolButton#mixerFullscreenBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QPushButton#mixerExpandBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_md}};
+    font-weight: bold;
+    border: 1px solid {{colors.border}};
+    min-width: 18px;
+    max-width: 18px;
+    padding: 0;
+}
+
+QPushButton#mixerExpandBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QFrame#mixerCollapseHandle {
+    background-color: {{colors.bg_window}};
+    max-width: 18px;
+}
+
+QDoubleSpinBox#stepperSpin {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    border-radius: {{radius.lg}};
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+    padding: 0 {{spacing.xs}};
+}

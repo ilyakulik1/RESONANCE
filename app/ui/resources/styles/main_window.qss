@@ -1,0 +1,216 @@
+/* Main window layout widgets */
+
+QFrame#controlPanelSection {
+    background-color: {{colors.bg_primary}};
+}
+
+QFrame#trackInfoCard {
+    background-color: {{colors.bg_card}};
+    border-radius: {{radius.md}};
+}
+
+QLabel#trackInfo {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+    padding: 0;
+}
+
+QFrame#bpmCard {
+    background-color: {{colors.bg_card}};
+    border-radius: {{radius.md}};
+    min-width: 70px;
+    max-width: 70px;
+}
+
+QLabel#bpmTitle {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+    padding: 0;
+}
+
+QLabel#bpmValue {
+    color: {{colors.text_primary}};
+    font-size: 20px;
+    font-weight: bold;
+    padding: 0;
+}
+
+QFrame#timeBlock {
+    background-color: {{colors.bg_black}};
+    border-radius: {{radius.md}};
+    min-width: 200px;
+    max-width: 200px;
+}
+
+QWidget#timeModeGroup QPushButton#segmentButton {
+    min-height: {{sizes.button_min_height_sm}};
+    padding: {{spacing.xs}};
+    font-size: {{typography.size_sm}};
+}
+
+QLabel#timeDuration {
+    color: {{colors.accent_cyan}};
+    font-size: {{typography.size_lg}};
+}
+
+QLabel#timeLarge {
+    color: {{colors.text_primary}};
+    font-size: 34px;
+    font-weight: bold;
+}
+
+QLabel#timeCurrent,
+QLabel#timeSeparator,
+QLabel#timeTotal {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_lg}};
+}
+
+QLabel#timelineStart,
+QLabel#timelineEnd {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_lg}};
+}
+
+QLabel#playlistFooter {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_lg}};
+    font-weight: normal;
+}
+
+QLabel#fontSizeLabel {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+}
+
+QLabel#fadeLabel,
+QLabel#fadeMsLabel,
+QLabel#spaceAdvancesLabel {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+}
+
+QLabel#previewTrackInfo {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_md}};
+    padding: 0 0 2px 0;
+}
+
+QComboBox#airOutputCombo,
+QComboBox#previewOutputCombo {
+    min-height: {{sizes.button_min_height_sm}};
+    padding: {{spacing.xs}} {{spacing.sm}};
+    background-color: {{colors.bg_control}};
+    border-radius: {{radius.md}};
+    color: {{colors.text_primary}};
+}
+
+QFrame#timelineSection {
+    background-color: {{colors.bg_primary}};
+}
+
+QToolButton#fadeModeButton {
+    background-color: {{colors.bg_control}};
+    border-radius: {{radius.lg}};
+    min-width: {{sizes.stepper_value}};
+    min-height: {{sizes.stepper_value}};
+    max-width: {{sizes.stepper_value}};
+    max-height: {{sizes.stepper_value}};
+    padding: {{spacing.xs}};
+}
+
+QToolButton#fadeModeButton:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QPushButton#zoomResetButton,
+QPushButton#waveformToolButton {
+    min-height: {{sizes.button_min_height_sm}};
+    padding: {{spacing.xs}} {{spacing.sm}};
+    font-size: {{typography.size_sm}};
+}
+
+QPushButton#waveformToolButton:checked {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QPushButton#previewTextToolButton {
+    min-height: {{sizes.button_min_height_sm}};
+    padding: {{spacing.xs}} 3px;
+    font-size: {{typography.size_xs}};
+}
+
+QPushButton#previewAutoplayButton {
+    min-height: {{sizes.button_min_height_sm}};
+    padding: {{spacing.xs}} 2px;
+    font-size: 8px;
+}
+
+QPushButton#previewAutoplayButton:checked {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QPushButton#previewTextToolButton:checked {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QFrame#playlistSection {
+    background-color: {{colors.bg_primary}};
+}
+
+QFrame#playlistPanel {
+    background-color: {{colors.bg_primary}};
+}
+
+QLabel#columnsValue {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_xxl}};
+    font-weight: bold;
+    min-width: 20px;
+}
+
+QPushButton#columnsBtn {
+    min-width: {{sizes.stepper_btn}};
+    min-height: {{sizes.stepper_btn}};
+    max-width: {{sizes.stepper_btn}};
+    max-height: {{sizes.stepper_btn}};
+    padding: 0;
+    border-radius: {{radius.md}};
+}
+
+QFrame#playlistToolbarWrap {
+    background-color: transparent;
+}
+
+QStatusBar#analysisStatusBar {
+    background-color: {{colors.bg_secondary}};
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_sm}};
+}
+
+QLabel#analysisStatusLabel {
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_sm}};
+    padding-left: 6px;
+}
+
+QProgressBar#analysisProgressBar {
+    background-color: {{colors.bg_control}};
+    border: 1px solid {{colors.border}};
+    border-radius: {{radius.sm}};
+    text-align: center;
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_xs}};
+    min-height: 12px;
+    max-height: 14px;
+}
+
+QProgressBar#analysisProgressBar::chunk {
+    background-color: {{colors.accent}};
+    border-radius: {{radius.sm}};
+}
+

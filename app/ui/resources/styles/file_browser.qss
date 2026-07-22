@@ -1,0 +1,145 @@
+/* File browser panel */
+
+QWidget#fileBrowserPanel {
+    background-color: {{colors.bg_primary}};
+    min-width: 200px;
+}
+
+QListWidget#fileBrowserList {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    border: none;
+    outline: none;
+    padding: {{spacing.xs}} {{spacing.sm}};
+}
+
+QListWidget#fileBrowserList:focus {
+    outline: none;
+}
+
+QListWidget#fileBrowserList::item {
+    padding: 2px 4px;
+    border: none;
+}
+
+QListWidget#fileBrowserList::item:selected {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QListWidget#fileBrowserList::item:selected:hover {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QListWidget#fileBrowserList::item:hover:!selected {
+    background-color: {{colors.bg_item_hover}};
+}
+
+QFrame#fileBrowserListFrame {
+    background-color: {{colors.bg_surface}};
+    border-radius: {{radius.lg}};
+    border: 2px solid transparent;
+}
+
+QFrame#fileBrowserListFrame[browserActive="true"] {
+    border-color: {{colors.border_focus}};
+}
+
+QFrame#fileBrowserToolbar {
+    background-color: transparent;
+}
+
+QLabel#fileBrowserPath {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+    padding: 0 {{spacing.sm}};
+}
+
+QFrame#fileBrowserPreview {
+    background-color: {{colors.bg_primary}};
+}
+
+QLabel#browserTrackInfo {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+}
+
+QComboBox#browserOutputCombo {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    padding: 2px 6px;
+    min-height: {{sizes.button_min_height}};
+}
+
+QTabWidget#fileBrowserTabs::pane {
+    border: 1px solid {{colors.border}};
+    background-color: {{colors.bg_surface}};
+    top: -1px;
+}
+
+QTabWidget#fileBrowserTabs QTabBar::tab {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_xs}};
+    padding: 2px 8px;
+    margin-right: 1px;
+    border: 1px solid {{colors.border}};
+    border-bottom: none;
+}
+
+QTabWidget#fileBrowserTabs QTabBar::tab:selected {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+}
+
+QTabWidget#fileBrowserTabs QTabBar::tab:hover:!selected {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QToolButton#fileBrowserAddTab {
+    color: {{colors.text_primary}};
+    background-color: {{colors.bg_control}};
+    border: 1px solid {{colors.border}};
+    padding: 1px 6px;
+    font-size: {{typography.size_xs}};
+    font-weight: bold;
+}
+
+QToolButton#fileBrowserAddTab:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QToolButton#fileBrowserCollapseBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    border-radius: {{radius.sm}};
+    min-width: 18px;
+    max-width: 18px;
+    min-height: 18px;
+    max-height: 18px;
+    padding: 0;
+    font-weight: bold;
+}
+
+QToolButton#fileBrowserCollapseBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QPushButton#browserExpandBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_md}};
+    font-weight: bold;
+    border: 1px solid {{colors.border}};
+    min-width: 18px;
+    max-width: 18px;
+    padding: 0;
+}
+
+QPushButton#browserExpandBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}

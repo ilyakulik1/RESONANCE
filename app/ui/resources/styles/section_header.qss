@@ -1,0 +1,24 @@
+/* Section title bars — CONTROL PANEL, TIMELINE, PLAYLIST N */
+
+QFrame#sectionHeader {
+    background-color: {{colors.bg_control}};
+    border-radius: {{radius.md}};
+}
+
+QLabel#sectionHeaderTitle {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+}
+
+QLineEdit#sectionHeaderEditor {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.accent}};
+    border-radius: {{radius.sm}};
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+    padding: 0 4px;
+    min-height: 18px;
+    max-height: 18px;
+}

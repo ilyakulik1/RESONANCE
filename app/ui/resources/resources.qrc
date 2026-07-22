@@ -1,0 +1,29 @@
+<RCC>
+    <qresource prefix="/">
+        <file>styles/base.qss</file>
+        <file>styles/section_header.qss</file>
+        <file>styles/main_window.qss</file>
+        <file>styles/control_panel.qss</file>
+        <file>styles/playlist.qss</file>
+        <file>tokens.json</file>
+        <file>assets/icons/add.png</file>
+        <file>assets/icons/back_begin.png</file>
+        <file>assets/icons/bottom.png</file>
+        <file>assets/icons/bpm_all.png</file>
+        <file>assets/icons/bpm_one.png</file>
+        <file>assets/icons/clear.png</file>
+        <file>assets/icons/down.png</file>
+        <file>assets/icons/export.png</file>
+        <file>assets/icons/fade_mode_1.png</file>
+        <file>assets/icons/fade_mode_2.png</file>
+        <file>assets/icons/import.png</file>
+        <file>assets/icons/next.png</file>
+        <file>assets/icons/pause.png</file>
+        <file>assets/icons/play.png</file>
+        <file>assets/icons/previous.png</file>
+        <file>assets/icons/remove.png</file>
+        <file>assets/icons/stop.png</file>
+        <file>assets/icons/top.png</file>
+        <file>assets/icons/up.png</file>
+    </qresource>
+</RCC>

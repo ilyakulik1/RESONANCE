@@ -1,0 +1,7 @@
+PyQt6
+pydub
+numpy
+librosa
+mutagen
+av
+moderngl

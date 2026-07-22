@@ -1,0 +1,58 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+*.manifest
+*.spec.bak
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Packaging / PyInstaller
+*.app/
+*.dmg
+*.pkg
+
+# IDE / editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.cursor/
+
+# OS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+Desktop.ini
+
+# Local playlists & user data (absolute paths)
+playlist*.json
+*.playlist.json
+
+# Logs & temp
+*.log
+*.tmp
+*.temp
+.cache/
+*.wav.cache
+analysis_cache/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json
