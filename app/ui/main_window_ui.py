@@ -56,7 +56,31 @@ class MainWindowUi:
         window.control_panel_section = self._build_control_panel(window)
         window.timeline_section = self._build_timeline(window)
         window.playlist_section = self._build_playlists(window)
-        audio_layout.addWidget(window.control_panel_section)
+
+        from app.widgets.file_properties_panel import (
+            FilePropertiesPanel,
+            make_properties_expand_button,
+        )
+
+        window.file_properties_panel = FilePropertiesPanel(window)
+        window.file_properties_panel.collapseRequested.connect(
+            window.collapse_file_properties
+        )
+        window.file_properties_panel.eqChanged.connect(window._on_eq_changed)
+        window.properties_expand_btn = make_properties_expand_button(window)
+        window.properties_expand_btn.clicked.connect(window.expand_file_properties)
+
+        top_row = QWidget()
+        top_row.setObjectName("audioTopRow")
+        top_row_layout = QHBoxLayout(top_row)
+        top_row_layout.setContentsMargins(0, 0, 0, 0)
+        top_row_layout.setSpacing(6)
+        top_row_layout.addWidget(window.control_panel_section, 3)
+        top_row_layout.addWidget(window.properties_expand_btn, 0)
+        top_row_layout.addWidget(window.file_properties_panel, 2)
+        window.audio_top_row = top_row
+
+        audio_layout.addWidget(top_row)
         audio_layout.addWidget(window.timeline_section)
         audio_layout.addWidget(window.playlist_section, 1)
 

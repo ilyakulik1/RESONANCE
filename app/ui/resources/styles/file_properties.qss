@@ -1,0 +1,109 @@
+/* File properties + parametric EQ */
+
+QFrame#filePropertiesPanel {
+    background-color: {{colors.bg_primary}};
+    min-width: 160px;
+}
+
+QFrame#propertiesMetaFrame {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+}
+
+QLabel#propertiesMetaKey {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+}
+
+QLabel#propertiesMetaValue {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_xs}};
+}
+
+QLabel#propertiesEqTitle {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+    font-weight: bold;
+}
+
+QToolButton#propertiesCollapseBtn,
+QToolButton#eqSectionToggle {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    min-width: 22px;
+    max-width: 28px;
+    min-height: 18px;
+    max-height: 18px;
+    font-size: {{typography.size_xs}};
+    padding: 0 2px;
+}
+
+QToolButton#eqSectionToggle:checked {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QToolButton#propertiesCollapseBtn:hover,
+QToolButton#eqSectionToggle:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QPushButton#propertiesExpandBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    font-size: {{typography.size_sm}};
+    padding: 0;
+}
+
+QPushButton#propertiesExpandBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QWidget#eqCanvas {
+    background-color: #0a0a0a;
+    border: 1px solid {{colors.border}};
+}
+
+QWidget#parametricEqViewCompact QDoubleSpinBox {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    min-height: 16px;
+    max-height: 18px;
+    font-size: {{typography.size_xs}};
+    padding: 0 2px;
+}
+
+QPushButton#eqBypassBtn,
+QPushButton#eqResetBtn,
+QPushButton#eqDeleteBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    min-height: {{sizes.button_min_height}};
+    padding: 1px 5px;
+    font-size: {{typography.size_xs}};
+}
+
+QPushButton#eqBypassBtn:checked {
+    background-color: {{colors.accent_red}};
+    color: {{colors.text_on_accent}};
+}
+
+QPushButton#eqBypassBtn:hover,
+QPushButton#eqResetBtn:hover,
+QPushButton#eqDeleteBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QComboBox#eqTypeCombo {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    min-height: 16px;
+    max-height: 18px;
+    padding: 0 2px;
+    font-size: {{typography.size_xs}};
+}

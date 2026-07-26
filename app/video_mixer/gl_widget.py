@@ -187,7 +187,10 @@ class MainGLWidget(MixerCanvasWidget):
         self._hold_outgoing: bool = False
 
     def capture_current(self) -> QPixmap:
-        """Snapshot of current main scene at canvas resolution."""
+        """Full-widget snapshot for crossfade (same coords as paint target)."""
+        pix = self.grab()
+        if pix is not None and not pix.isNull():
+            return pix
         from app.video_mixer.scene_render import render_scene_image
 
         image = render_scene_image(
@@ -248,15 +251,15 @@ class MainGLWidget(MixerCanvasWidget):
         cw = self.model.canvas_width
         ch = self.model.canvas_height
         canvas_rect = QRectF(ox, oy, cw * scale, ch * scale)
-        painter.fillRect(canvas_rect, QColor("#101010"))
-        painter.setClipRect(canvas_rect)
 
-        # Outgoing
+        # Outgoing plate is a full-widget grab — draw 1:1 into the widget rect
+        # (not canvas_rect) so letterbox/HiDPI don't change scale.
         if not self._fade_from.isNull():
             painter.setOpacity(1.0 if self._hold_outgoing else max(0.0, 1.0 - self._fade_t))
-            painter.drawPixmap(canvas_rect.toRect(), self._fade_from)
+            painter.drawPixmap(self.rect(), self._fade_from)
 
         if not self._hold_outgoing:
+            painter.setClipRect(canvas_rect)
             painter.setOpacity(self._fade_t)
             painter.save()
             painter.translate(ox, oy)

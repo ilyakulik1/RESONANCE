@@ -1,6 +1,7 @@
 PyQt6
 pydub
 numpy
+scipy
 librosa
 mutagen
 av

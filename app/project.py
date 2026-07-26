@@ -192,6 +192,7 @@ class ProjectState:
     playlists: list[ProjectPlaylistState] = field(default_factory=list)
     playlist_columns: int = 2
     track_timelines: dict[str, dict] = field(default_factory=dict)
+    track_eq: dict[str, dict] = field(default_factory=dict)
     video_mixer: dict | None = None
 
 
@@ -321,6 +322,10 @@ class ProjectManager:
                 to_project_path(path, self.root): data
                 for path, data in state.track_timelines.items()
             },
+            "track_eq": {
+                to_project_path(path, self.root): data
+                for path, data in state.track_eq.items()
+            },
             "video_mixer": (
                 mixer_dict_for_storage(state.video_mixer, self.root)
                 if isinstance(state.video_mixer, dict)
@@ -389,6 +394,15 @@ class ProjectManager:
                 abs_path, _ = resolve_project_path(str(key), self.root)
                 timelines[abs_path] = value
 
+        track_eq: dict[str, dict] = {}
+        raw_eq = data.get("track_eq")
+        if isinstance(raw_eq, dict):
+            for key, value in raw_eq.items():
+                if not isinstance(value, dict):
+                    continue
+                abs_path, _ = resolve_project_path(str(key), self.root)
+                track_eq[abs_path] = value
+
         video_mixer = data.get("video_mixer")
         if not isinstance(video_mixer, dict):
             video_mixer = None
@@ -403,5 +417,6 @@ class ProjectManager:
             playlists=playlists,
             playlist_columns=columns,
             track_timelines=timelines,
+            track_eq=track_eq,
             video_mixer=video_mixer,
         )

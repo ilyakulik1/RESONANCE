@@ -85,6 +85,17 @@ class LayerMedia:
             return
         use_native_loop = layer.playback == "loop" and layer.loop_transition != "fade"
         self.decoder.set_loop(use_native_loop)
+        # During loop-fade: keep incoming in sync; don't revive a parked EOF primary.
+        if self._loop_fade_active:
+            if self._loop_decoder is not None:
+                self._loop_decoder.set_playing(bool(layer.playing))
+            if not self.decoder.at_eof:
+                self.decoder.set_playing(bool(layer.playing))
+            return
+        if layer.playback == "stop" and self.decoder.at_eof:
+            layer.playing = False
+            self.decoder.set_playing(False)
+            return
         self.decoder.set_playing(bool(layer.playing))
         if self._loop_decoder is not None:
             self._loop_decoder.set_playing(bool(layer.playing))
@@ -158,7 +169,12 @@ class LayerMedia:
                 layer.duration_ms = max(1, position_ms)
                 duration = layer.duration_ms
 
-        if layer.playback == "loop" and layer.playing:
+        if layer.playback == "stop":
+            # Freeze on last frame; clear playing so sync won't revive the decoder.
+            if self.decoder.at_eof and layer.playing:
+                layer.playing = False
+                self.decoder.set_playing(False)
+        elif layer.playback == "loop" and layer.playing:
             if layer.loop_transition == "fade":
                 if not self._loop_fade_active and frame is not None:
                     fade_ms = max(1, int(layer.loop_fade_ms))
@@ -166,11 +182,11 @@ class LayerMedia:
                     if near_end or self.decoder.at_eof:
                         self._start_loop_fade(layer)
             else:
-                # CUT: keep native loop alive; recover if decoder stalled at EOF.
-                self.decoder.set_loop(True)
+                # CUT: native worker loop; recover only if worker stalled at EOF.
                 if self.decoder.at_eof:
-                    self.decoder.seek(0)
+                    self.decoder.set_loop(True)
                     self.decoder.set_playing(True)
+                    self.decoder.seek(0)
                     frame, position_ms = self.decoder.get_frame()
 
         self.decoder.consume_loop_restart()
@@ -260,6 +276,9 @@ class MediaStore:
             if self._all_suspended:
                 media.decoder.set_playing(False)
             elif self._preview_suspended and layer_id in preview_ids:
+                media.decoder.set_playing(False)
+            elif layer.playback == "stop" and media.decoder.at_eof:
+                layer.playing = False
                 media.decoder.set_playing(False)
             else:
                 media.decoder.set_playing(bool(layer.playing))

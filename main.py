@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import multiprocessing
 import sys
 
 from PyQt6.QtWidgets import QApplication
@@ -20,4 +21,5 @@ def main():
 
 
 if __name__ == "__main__":
+    multiprocessing.freeze_support()
     main()

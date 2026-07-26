@@ -1,67 +1,59 @@
+"""Process-isolated video decoder facade (reuses warm pool workers)."""
+
 from __future__ import annotations
 
-import threading
-import time
 from pathlib import Path
 
 import numpy as np
 
-try:
-    import av
-except ImportError:  # pragma: no cover
-    av = None
+from app.video_mixer.decoder_pool import DecoderSlot, acquire_slot, ensure_pool, release_slot
+from app.video_mixer.decoder_worker import CMD_SEEK, CMD_SET_LOOP, CMD_SET_PLAYING
 
 
 class VideoDecoder:
-    """Decode video frames via PyAV on a background thread."""
+    """Decode video frames via a pooled child process (no spawn-on-start)."""
 
     def __init__(self, path: str | Path):
         self.path = str(path)
-        self._lock = threading.Lock()
-        self._frame: np.ndarray | None = None
+        self._duration_ms = 0
+        self._fps = 30.0
         self._width = 0
         self._height = 0
-        self._duration_ms = 0
-        self._position_ms = 0
-        self._fps = 30.0
+        self._error: str | None = None
         self._playing = True
         self._loop = True
-        self._seek_ms: int | None = None
-        self._loop_restarted = False
+        self._position_ms = 0
         self._at_eof = False
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._error: str | None = None
-
-        if av is None:
-            self._error = "PyAV (av) is not installed"
-            return
-
-        try:
-            with av.open(self.path) as container:
-                stream = container.streams.video[0]
-                if stream.duration is not None and stream.time_base is not None:
-                    self._duration_ms = int(float(stream.duration * stream.time_base) * 1000)
-                elif container.duration is not None:
-                    self._duration_ms = int(container.duration / 1000)
-                rate = stream.average_rate or stream.base_rate
-                if rate is not None and float(rate) > 0:
-                    self._fps = float(rate)
-                self._width = int(stream.width or 0)
-                self._height = int(stream.height or 0)
-        except Exception as exc:
-            self._error = str(exc)
+        self._frame: np.ndarray | None = None
+        self._frame_generation = -1
+        self._pending_seek_ms = 0
+        self._slot: DecoderSlot | None = None
+        # No av.open on the UI/air process — metadata comes from the worker on OPEN.
 
     @property
     def error(self) -> str | None:
-        return self._error
+        if self._error:
+            return self._error
+        slot = self._slot
+        if slot is None:
+            return None
+        with slot.error_buf.get_lock():
+            raw = bytes(bytearray(slot.error_buf[:]))
+        msg = raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+        return msg or None
 
     @property
     def duration_ms(self) -> int:
+        slot = self._slot
+        if slot is not None and slot.duration_v.value > 0:
+            self._duration_ms = int(slot.duration_v.value)
         return self._duration_ms
 
     @property
     def fps(self) -> float:
+        slot = self._slot
+        if slot is not None and slot.fps_v.value > 0:
+            self._fps = float(slot.fps_v.value) / 1000.0
         return self._fps
 
     @property
@@ -70,164 +62,140 @@ class VideoDecoder:
 
     @property
     def at_eof(self) -> bool:
+        slot = self._slot
+        if slot is not None:
+            return bool(slot.at_eof_v.value)
         return self._at_eof
 
     @property
     def is_playing(self) -> bool:
-        return bool(self._playing) and not self._at_eof
+        slot = self._slot
+        if slot is not None:
+            return bool(slot.playing_v.value) and not self.at_eof
+        return self._playing and not self._at_eof
 
     def start(self) -> None:
-        if self._error or self._thread is not None:
+        if self._slot is not None:
             return
-        self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._run, name=f"VideoDecoder:{Path(self.path).name}", daemon=True
+        ensure_pool()
+        slot = acquire_slot()
+        self._slot = slot
+        self._frame = None
+        self._frame_generation = -1
+        slot.open(
+            self.path,
+            playing=self._playing,
+            loop=self._loop,
+            seek_ms=self._pending_seek_ms or self._position_ms,
         )
-        self._thread.start()
 
     def stop(self) -> None:
-        self._stop.set()
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=1.5)
-        self._thread = None
+        slot = self._slot
+        self._slot = None
+        self._frame = None
+        self._frame_generation = -1
+        if slot is not None:
+            release_slot(slot)
 
     def set_playing(self, playing: bool) -> None:
+        playing = bool(playing)
+        slot = self._slot
+        if (
+            self._playing == playing
+            and slot is not None
+            and bool(slot.playing_v.value) == playing
+        ):
+            return
         self._playing = playing
+        if slot is None:
+            return
+        slot.playing_v.value = 1 if playing else 0
         if playing:
-            self._at_eof = False
+            slot.at_eof_v.value = 0
+        try:
+            slot.cmd_queue.put_nowait((CMD_SET_PLAYING, playing))
+        except Exception:
+            pass
 
     def set_loop(self, loop: bool) -> None:
+        loop = bool(loop)
+        slot = self._slot
+        if (
+            self._loop == loop
+            and slot is not None
+            and bool(slot.loop_v.value) == loop
+        ):
+            return
         self._loop = loop
+        if slot is None:
+            return
+        slot.loop_v.value = 1 if loop else 0
+        try:
+            slot.cmd_queue.put_nowait((CMD_SET_LOOP, loop))
+        except Exception:
+            pass
 
     def seek(self, position_ms: int) -> None:
-        with self._lock:
-            self._seek_ms = max(0, int(position_ms))
-            self._position_ms = max(0, int(position_ms))
-            self._at_eof = False
+        pos = max(0, int(position_ms))
+        self._position_ms = pos
+        self._pending_seek_ms = pos
+        self._at_eof = False
+        slot = self._slot
+        if slot is None:
+            return
+        slot.position_v.value = pos
+        slot.at_eof_v.value = 0
+        try:
+            slot.cmd_queue.put_nowait((CMD_SEEK, pos))
+        except Exception:
+            pass
 
     def consume_loop_restart(self) -> bool:
-        """True once after a seamless loop wrap (EOF → start)."""
-        with self._lock:
-            flag = self._loop_restarted
-            self._loop_restarted = False
-            return flag
+        slot = self._slot
+        if slot is None:
+            return False
+        with slot.loop_restarted_v.get_lock():
+            flag = bool(slot.loop_restarted_v.value)
+            slot.loop_restarted_v.value = 0
+        return flag
 
     def get_frame(self) -> tuple[np.ndarray | None, int]:
-        with self._lock:
+        slot = self._slot
+        if slot is None:
             return self._frame, self._position_ms
 
-    def _run(self) -> None:
-        assert av is not None
+        generation = int(slot.generation_v.value)
+        if generation == 0:
+            return self._frame, int(slot.position_v.value)
+
+        if generation != self._frame_generation:
+            active = int(slot.active_v.value)
+            w = int(slot.width_v.value)
+            h = int(slot.height_v.value)
+            pos = int(slot.position_v.value)
+            if w > 0 and h > 0:
+                plane = slot.max_w * slot.max_h * 4
+                offset = active * plane
+                src = np.ndarray(
+                    (slot.max_h, slot.max_w, 4),
+                    dtype=np.uint8,
+                    buffer=slot.shm.buf,
+                    offset=offset,
+                )
+                self._frame = np.ascontiguousarray(src[:h, :w, :])
+                self._width = w
+                self._height = h
+                self._position_ms = pos
+                self._frame_generation = generation
+            else:
+                self._position_ms = pos
+        else:
+            self._position_ms = int(slot.position_v.value)
+
+        return self._frame, self._position_ms
+
+    def __del__(self) -> None:
         try:
-            container = av.open(self.path)
-        except Exception as exc:
-            self._error = str(exc)
-            return
-
-        try:
-            stream = container.streams.video[0]
-            stream.thread_type = "AUTO"
-            frame_interval = 1.0 / max(1.0, self._fps)
-            next_time = time.perf_counter()
-
-            while not self._stop.is_set():
-                seek_ms = None
-                with self._lock:
-                    if self._seek_ms is not None:
-                        seek_ms = self._seek_ms
-                        self._seek_ms = None
-
-                if seek_ms is not None:
-                    self._do_seek(container, stream, seek_ms)
-                    next_time = time.perf_counter()
-
-                if not self._playing:
-                    time.sleep(0.02)
-                    continue
-
-                try:
-                    frame = next(container.decode(video=0))
-                except (StopIteration, av.EOFError, Exception):
-                    if self._loop:
-                        with self._lock:
-                            self._loop_restarted = True
-                            self._at_eof = False
-                        if not self._restart_from_start(container, stream):
-                            try:
-                                container.close()
-                            except Exception:
-                                pass
-                            try:
-                                container = av.open(self.path)
-                                stream = container.streams.video[0]
-                                stream.thread_type = "AUTO"
-                                self._do_seek(container, stream, 0)
-                            except Exception as exc:
-                                self._error = str(exc)
-                                return
-                        next_time = time.perf_counter()
-                        continue
-                    with self._lock:
-                        self._playing = False
-                        self._at_eof = True
-                    time.sleep(0.02)
-                    continue
-
-                array = frame.to_ndarray(format="rgba")
-                pts_ms = 0
-                if frame.pts is not None and stream.time_base is not None:
-                    pts_ms = int(float(frame.pts * stream.time_base) * 1000)
-
-                with self._lock:
-                    self._frame = array
-                    self._width = array.shape[1]
-                    self._height = array.shape[0]
-                    self._position_ms = pts_ms
-                    self._at_eof = False
-
-                next_time += frame_interval
-                delay = next_time - time.perf_counter()
-                if delay > 0:
-                    time.sleep(delay)
-                else:
-                    next_time = time.perf_counter()
-        finally:
-            try:
-                container.close()
-            except Exception:
-                pass
-
-    def _restart_from_start(self, container, stream) -> bool:
-        return self._do_seek(container, stream, 0)
-
-    def _do_seek(self, container, stream, seek_ms: int) -> bool:
-        """Seek by stream time_base; flush and pull one keyframe neighborhood."""
-        try:
-            ts = int((seek_ms / 1000.0) / float(stream.time_base))
-            container.seek(ts, stream=stream, any_frame=False, backward=True)
+            self.stop()
         except Exception:
-            try:
-                container.seek(int(seek_ms * 1000))  # microseconds fallback
-            except Exception:
-                return False
-        try:
-            for _ in range(8):
-                packet = next(container.demux(stream))
-                if packet.dts is None and packet.pts is None:
-                    continue
-                for frame in packet.decode():
-                    array = frame.to_ndarray(format="rgba")
-                    pts_ms = seek_ms
-                    if frame.pts is not None and stream.time_base is not None:
-                        pts_ms = int(float(frame.pts * stream.time_base) * 1000)
-                    with self._lock:
-                        self._frame = array
-                        self._width = array.shape[1]
-                        self._height = array.shape[0]
-                        self._position_ms = pts_ms
-                        self._at_eof = False
-                    return True
-        except Exception:
-            return False
-        return False
+            pass

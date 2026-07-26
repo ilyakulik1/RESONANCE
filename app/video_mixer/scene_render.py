@@ -13,13 +13,21 @@ if TYPE_CHECKING:
     from app.video_mixer.model import MixerModel, Scene
 
 
-def _frame_to_qimage(frame: np.ndarray) -> QImage | None:
+def _frame_to_qimage(frame: np.ndarray, *, max_edge: int | None = None) -> QImage | None:
     if frame is None or frame.ndim != 3:
         return None
     h, w, c = frame.shape
     if w <= 0 or h <= 0:
         return None
     arr = np.ascontiguousarray(frame)
+    if max_edge is not None and max(h, w) > max_edge:
+        scale = float(max_edge) / float(max(h, w))
+        nh = max(1, int(h * scale))
+        nw = max(1, int(w * scale))
+        ys = (np.linspace(0, h - 1, nh)).astype(np.int32)
+        xs = (np.linspace(0, w - 1, nw)).astype(np.int32)
+        arr = np.ascontiguousarray(arr[ys][:, xs])
+        h, w = nh, nw
     if c >= 4:
         img = QImage(arr.data, w, h, w * 4, QImage.Format.Format_RGBA8888)
     else:
@@ -34,6 +42,7 @@ def render_scene_image(
     *,
     width: int | None = None,
     height: int | None = None,
+    frame_max_edge: int | None = None,
 ) -> QImage:
     """Compose scene into a QImage at canvas (or given) resolution."""
     w = max(1, int(width or model.canvas_width))
@@ -45,7 +54,7 @@ def render_scene_image(
 
     painter = QPainter(image)
     painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
-    painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+    painter.setRenderHint(QPainter.RenderHint.Antialiasing, frame_max_edge is None)
     sx = w / float(max(1, model.canvas_width))
     sy = h / float(max(1, model.canvas_height))
     painter.scale(sx, sy)
@@ -65,9 +74,18 @@ def render_scene_image(
         if media.pixmap is not None and not media.pixmap.isNull():
             painter.drawPixmap(0, 0, media.pixmap)
         elif media.frame is not None:
-            frame_img = _frame_to_qimage(media.frame)
+            frame_img = _frame_to_qimage(media.frame, max_edge=frame_max_edge)
             if frame_img is not None:
-                painter.drawImage(0, 0, frame_img)
+                # If downsampled, stretch to layer pixel size
+                if frame_max_edge is not None and (
+                    frame_img.width() != media.width or frame_img.height() != media.height
+                ):
+                    painter.drawImage(
+                        QRectF(0, 0, media.width, media.height),
+                        frame_img,
+                    )
+                else:
+                    painter.drawImage(0, 0, frame_img)
         painter.restore()
     painter.end()
     return image
@@ -80,12 +98,13 @@ def render_scene_thumb(
     thumb_w: int = 128,
     thumb_h: int = 72,
 ) -> QPixmap:
-    full = render_scene_image(model, media_store, scene)
-    return QPixmap.fromImage(
-        full.scaled(
-            thumb_w,
-            thumb_h,
-            Qt.AspectRatioMode.KeepAspectRatio,
-            Qt.TransformationMode.SmoothTransformation,
-        )
+    # Small target + downsampled frames — must stay cheap on the UI thread.
+    image = render_scene_image(
+        model,
+        media_store,
+        scene,
+        width=max(1, thumb_w),
+        height=max(1, thumb_h),
+        frame_max_edge=max(thumb_w, thumb_h) * 2,
     )
+    return QPixmap.fromImage(image)

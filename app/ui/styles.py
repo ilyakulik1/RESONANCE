@@ -19,6 +19,7 @@ def load_application_theme() -> str:
         "section_header",
         "main_window",
         "control_panel",
+        "file_properties",
         "playlist",
         "file_browser",
         "video_mixer",

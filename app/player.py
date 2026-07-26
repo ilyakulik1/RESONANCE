@@ -23,6 +23,8 @@ from app.audio_utils import is_audio_file
 from app.bpm_detector import BpmDetector
 from app.config import get_config_path
 from app.constants import APP_NAME, MAX_PLAYLISTS
+from app.eq_state import EqState
+from app.pcm_air_player import PcmAirPlayer
 from app.ui.about_dialog import show_about_dialog
 from app.ui.main_window_ui import MainWindowUi
 from app.ui.tokens import get_token, get_token_int
@@ -72,11 +74,11 @@ def _peek_saved_project_root() -> Path:
 
 class AudioPlayer(QMainWindow):
     @property
-    def player(self) -> QMediaPlayer:
+    def player(self):
         return self._players[self._active_player_idx]
 
     @property
-    def audio_output(self) -> QAudioOutput:
+    def audio_output(self):
         return self._outputs[self._active_player_idx]
 
     def __init__(self):
@@ -87,10 +89,8 @@ class AudioPlayer(QMainWindow):
         self._current_file_path = None
         self._playback_volume = 0.7
         self._output_volume = 0.7
-        self._players = [QMediaPlayer(self), QMediaPlayer(self)]
-        self._outputs = [QAudioOutput(self), QAudioOutput(self)]
-        for idx in range(2):
-            self._players[idx].setAudioOutput(self._outputs[idx])
+        self._players = [PcmAirPlayer(self), PcmAirPlayer(self)]
+        self._outputs = [p.audioOutput() for p in self._players]
         self._active_player_idx = 0
         self._outputs[1].setVolume(0.0)
 
@@ -105,6 +105,9 @@ class AudioPlayer(QMainWindow):
         self._is_window_resizing = False
         self._stable_window_size = None
         self._track_timeline_state: dict[str, TimelineState] = {}
+        self._track_eq_state: dict[str, dict] = {}
+        self._eq_bound_path: str | None = None
+        self._eq_loading = False
         self._fade_out_started = False
         self._handling_range_end = False
         self._range_end_latched = False
@@ -174,10 +177,15 @@ class AudioPlayer(QMainWindow):
         self._browser_pending_playback_token = 0
         self._browser_collapsed = False
         self._browser_saved_splitter: list[int] | None = None
+        self._properties_collapsed = False
         self._retain_playlist_focus_num: int | None = None
         self._routing_playlist_nav_key = False
+        self._spectrum_enabled = True
+        self._spectrum_smooth = None
+        self._spectrum_timer: QTimer | None = None
 
         self.setup_ui()
+        self._setup_air_spectrum()
         self._setup_audio_output_devices()
         self._update_fade_mode_button()
         self.duration_prober = DurationProber(self)
@@ -480,6 +488,8 @@ class AudioPlayer(QMainWindow):
 
     def _reset_bpm_label(self) -> None:
         self.bpm_label.setText("—")
+        if hasattr(self, "file_properties_panel"):
+            self.file_properties_panel.set_bpm(None)
 
     def _set_bpm_label_detecting(self) -> None:
         self.bpm_label.setText("…")
@@ -536,6 +546,166 @@ class AudioPlayer(QMainWindow):
             self.bpm_label.setText(f"{int(bpm)}")
         else:
             self.bpm_label.setText(f"{bpm:.1f}")
+        if hasattr(self, "file_properties_panel"):
+            self.file_properties_panel.set_bpm(float(bpm))
+
+    def _setup_air_spectrum(self) -> None:
+        """Poll post-EQ spectrum bins from the PCM air player (no second PyAV reader)."""
+        for player in self._players:
+            player.set_spectrum_enabled(True)
+        self._spectrum_timer = QTimer(self)
+        self._spectrum_timer.setInterval(80)
+        self._spectrum_timer.timeout.connect(self._poll_air_spectrum)
+        self._spectrum_timer.start()
+
+    def _poll_air_spectrum(self) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        if self._properties_collapsed or not self.file_properties_panel.isVisible():
+            return
+        if self.file_properties_panel.is_eq_collapsed():
+            return
+        snap = self.player.spectrum_bins_snapshot()
+        if snap is None:
+            return
+        freqs, db = snap
+        try:
+            import numpy as np
+
+            if self._spectrum_smooth is None or self._spectrum_smooth.shape != db.shape:
+                self._spectrum_smooth = db
+            else:
+                rising = db > self._spectrum_smooth
+                alpha = np.where(rising, 0.45, 0.2)
+                self._spectrum_smooth = self._spectrum_smooth + alpha * (db - self._spectrum_smooth)
+            self.file_properties_panel.set_spectrum(freqs, self._spectrum_smooth)
+        except Exception:
+            pass
+
+    def _update_file_properties(self, file_path: str | None = None) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        path = file_path or self._current_file_path
+        bpm = None
+        if self.current_playing_item is not None:
+            bpm = get_item_bpm(self.current_playing_item)
+        self.file_properties_panel.set_file(path, bpm=bpm)
+        self._bind_eq_to_path(path)
+
+    def _eq_path_key(self, file_path: str | None = None) -> str | None:
+        path = file_path or self._current_file_path or self._displayed_track_path
+        if not path:
+            return None
+        return os.path.abspath(path)
+
+    def _save_eq_for_bound_path(self) -> None:
+        if not hasattr(self, "file_properties_panel") or self._eq_loading:
+            return
+        key = self._eq_bound_path
+        if not key:
+            return
+        data = self.file_properties_panel.eq_state().to_dict()
+        if not data.get("bands") and not data.get("bypass"):
+            self._track_eq_state.pop(key, None)
+        else:
+            self._track_eq_state[key] = data
+
+    def _bind_eq_to_path(self, file_path: str | None) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        new_key = self._eq_path_key(file_path) if file_path else None
+        if new_key == self._eq_bound_path and file_path:
+            return
+        self._save_eq_for_bound_path()
+        self._eq_bound_path = new_key
+        self._eq_loading = True
+        try:
+            if new_key and new_key in self._track_eq_state:
+                state = EqState.from_dict(self._track_eq_state[new_key])
+            else:
+                state = EqState()
+            self.file_properties_panel.set_eq_state(state)
+        finally:
+            self._eq_loading = False
+        self._apply_live_eq_to_air()
+
+    def _sync_spectrum_playback(self) -> None:
+        # Spectrum follows PCM air playback automatically; nothing to push.
+        return
+
+    def _eq_state_for_path(self, file_path: str | None) -> EqState:
+        if not file_path:
+            return EqState()
+        key = os.path.abspath(file_path)
+        data = self._track_eq_state.get(key)
+        return EqState.from_dict(data) if isinstance(data, dict) else EqState()
+
+    def _set_air_source(self, player_idx: int, file_path: str | None) -> None:
+        player = self._players[player_idx]
+        if not file_path:
+            player.setSource(QUrl())
+            return
+        player.set_eq_state(self._eq_state_for_path(file_path))
+        player.setSource(QUrl.fromLocalFile(file_path))
+
+    def _apply_live_eq_to_air(self) -> None:
+        """Push current EQ coefficients to matching air player(s) immediately."""
+        if not hasattr(self, "file_properties_panel"):
+            return
+        state = self.file_properties_panel.eq_state()
+        key = self._eq_bound_path
+        # Always refresh the active deck so BYP/RST/DEL are audible even if
+        # path matching fails (symlink / pending source).
+        try:
+            self.player.set_eq_state(state)
+        except Exception:
+            pass
+        if not key:
+            return
+        for idx, player in enumerate(self._players):
+            if idx == self._active_player_idx:
+                continue
+            src = player.source().toLocalFile()
+            if src and os.path.abspath(src) == key:
+                player.set_eq_state(state)
+
+    def _on_eq_changed(self) -> None:
+        if self._eq_loading:
+            return
+        self._save_eq_for_bound_path()
+        # Live DSP first — must be immediate, not debounced.
+        self._apply_live_eq_to_air()
+        if not hasattr(self, "_eq_save_timer"):
+            self._eq_save_timer = QTimer(self)
+            self._eq_save_timer.setSingleShot(True)
+            self._eq_save_timer.timeout.connect(self._persist_eq_changes)
+        self._eq_save_timer.start(400)
+
+    def _persist_eq_changes(self) -> None:
+        self._save_eq_for_bound_path()
+        self.save_config()
+
+    def collapse_file_properties(self) -> None:
+        if self._properties_collapsed:
+            return
+        self._properties_collapsed = True
+        self._apply_properties_collapsed_state(True)
+        self.save_config()
+
+    def expand_file_properties(self) -> None:
+        if not self._properties_collapsed:
+            return
+        self._properties_collapsed = False
+        self._apply_properties_collapsed_state(False)
+        self.save_config()
+
+    def _apply_properties_collapsed_state(self, collapsed: bool) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        self.file_properties_panel.setVisible(not collapsed)
+        if hasattr(self, "properties_expand_btn"):
+            self.properties_expand_btn.setVisible(collapsed)
+        self._sync_view_menu_actions()
 
     def _request_bpm_detection(self, file_path: str) -> None:
         item = self.current_playing_item
@@ -1055,7 +1225,7 @@ class AudioPlayer(QMainWindow):
         self._apply_player_volume(incoming_idx, 0.0)
         self._incoming_fader.sync_volume(0.0)
         if not self._air_player_has_loaded_source(incoming_idx, abs_path):
-            self._players[incoming_idx].setSource(QUrl.fromLocalFile(file_path))
+            self._set_air_source(incoming_idx, file_path)
 
         self._outgoing_fader.sync_volume(self._playback_volume)
         self._outgoing_fader.fade_to(
@@ -1122,6 +1292,7 @@ class AudioPlayer(QMainWindow):
         self._displayed_track_path = abs_path
         self._prepare_timeline_for_path(file_path)
         self.update_track_info_playing()
+        self._update_file_properties(file_path)
         if needs_waveform:
             QTimer.singleShot(0, lambda path=file_path: self._request_waveform(path))
         self._request_bpm_detection(file_path)
@@ -1489,6 +1660,11 @@ class AudioPlayer(QMainWindow):
         self._view_control_panel_act.toggled.connect(self._on_view_control_panel_toggled)
         menu.addAction(self._view_control_panel_act)
 
+        self._view_file_properties_act = QAction("File Properties", self)
+        self._view_file_properties_act.setCheckable(True)
+        self._view_file_properties_act.toggled.connect(self._on_view_file_properties_toggled)
+        menu.addAction(self._view_file_properties_act)
+
         self._view_timeline_act = QAction("Timeline", self)
         self._view_timeline_act.setCheckable(True)
         self._view_timeline_act.toggled.connect(self._on_view_timeline_toggled)
@@ -1516,6 +1692,7 @@ class AudioPlayer(QMainWindow):
         actions = (
             getattr(self, "_view_file_browser_act", None),
             getattr(self, "_view_control_panel_act", None),
+            getattr(self, "_view_file_properties_act", None),
             getattr(self, "_view_timeline_act", None),
             getattr(self, "_view_playlists_act", None),
             getattr(self, "_view_video_mixer_act", None),
@@ -1534,6 +1711,7 @@ class AudioPlayer(QMainWindow):
                 self._view_control_panel_act,
                 not self.control_panel_section.isHidden(),
             )
+        set_checked(self._view_file_properties_act, not self._properties_collapsed)
         if hasattr(self, "timeline_section"):
             set_checked(
                 self._view_timeline_act,
@@ -1559,6 +1737,12 @@ class AudioPlayer(QMainWindow):
         if hasattr(self, "control_panel_section"):
             self.control_panel_section.setVisible(checked)
             self.save_config()
+
+    def _on_view_file_properties_toggled(self, checked: bool) -> None:
+        if checked:
+            self.expand_file_properties()
+        else:
+            self.collapse_file_properties()
 
     def _on_view_timeline_toggled(self, checked: bool) -> None:
         if hasattr(self, "timeline_section"):
@@ -1604,6 +1788,10 @@ class AudioPlayer(QMainWindow):
 
         if old_abs in self._track_timeline_state:
             self._track_timeline_state[new_abs] = self._track_timeline_state.pop(old_abs)
+        if old_abs in self._track_eq_state:
+            self._track_eq_state[new_abs] = self._track_eq_state.pop(old_abs)
+        if self._eq_bound_path == old_abs:
+            self._eq_bound_path = new_abs
 
         if self._current_file_path and os.path.abspath(self._current_file_path) == old_abs:
             self._current_file_path = new_abs
@@ -1671,6 +1859,7 @@ class AudioPlayer(QMainWindow):
                 path: self._timeline_state_to_dict(state)
                 for path, state in self._track_timeline_state.items()
             },
+            track_eq=dict(self._track_eq_state),
             video_mixer=video_mixer,
         )
 
@@ -1693,6 +1882,26 @@ class AudioPlayer(QMainWindow):
         except Exception as exc:
             print(f"Error saving project: {exc}")
             QMessageBox.warning(self, "Project", f"Could not save project:\n{exc}")
+        finally:
+            self._saving_project = False
+
+    def save_video_mixer_only(self) -> None:
+        """Persist mixer state without playlist/analysis refresh (keeps air smooth)."""
+        if getattr(self, "_saving_project", False):
+            return
+        if not hasattr(self, "video_mixer") or self.video_mixer is None:
+            return
+        self._saving_project = True
+        try:
+            state = self.project.load_raw()
+            if state is None:
+                state = self._build_project_state()
+            else:
+                # Skip import_media_into_project here — can copy files and re-sync.
+                state.video_mixer = self.video_mixer.export_state()
+            self.project.save_raw(state)
+        except Exception as exc:
+            print(f"Error saving video mixer: {exc}")
         finally:
             self._saving_project = False
 
@@ -1804,6 +2013,13 @@ class AudioPlayer(QMainWindow):
             for path, data in state.track_timelines.items()
             if isinstance(data, dict)
         }
+        self._track_eq_state = {
+            path: dict(data)
+            for path, data in state.track_eq.items()
+            if isinstance(data, dict)
+        }
+        self._eq_bound_path = None
+        self._bind_eq_to_path(self._current_file_path)
 
         for i, pl_state in enumerate(state.playlists[:MAX_PLAYLISTS]):
             playlist = self.playlists[i]
@@ -2037,6 +2253,31 @@ class AudioPlayer(QMainWindow):
             self._browser_collapsed = bool(config.get("browser_collapsed", False))
             self._apply_browser_collapsed_state(self._browser_collapsed)
 
+            self._properties_collapsed = bool(config.get("properties_collapsed", False))
+            self._apply_properties_collapsed_state(self._properties_collapsed)
+            if hasattr(self, "file_properties_panel"):
+                track_eq = config.get("track_eq")
+                if isinstance(track_eq, dict):
+                    for key, value in track_eq.items():
+                        if isinstance(value, dict) and key:
+                            self._track_eq_state[os.path.abspath(str(key))] = dict(value)
+                # Legacy global EQ → apply only if no per-track data yet
+                legacy_eq = config.get("eq")
+                if (
+                    isinstance(legacy_eq, dict)
+                    and legacy_eq.get("bands")
+                    and not self._track_eq_state
+                    and self._current_file_path
+                ):
+                    self._track_eq_state[os.path.abspath(self._current_file_path)] = (
+                        dict(legacy_eq)
+                    )
+                self._eq_bound_path = None
+                self._bind_eq_to_path(self._current_file_path)
+                self.file_properties_panel.set_eq_collapsed(
+                    bool(config.get("eq_collapsed", False))
+                )
+
             if hasattr(self, "control_panel_section"):
                 self.control_panel_section.setVisible(
                     bool(config.get("view_control_panel", True))
@@ -2055,6 +2296,7 @@ class AudioPlayer(QMainWindow):
 
     def save_config(self):
         self._save_current_timeline_state()
+        self._save_eq_for_bound_path()
         geometry = self.geometry()
         config = {
             "project_path": str(self.project.root),
@@ -2068,6 +2310,13 @@ class AudioPlayer(QMainWindow):
             "preview_autoplay": self._preview_autoplay,
             "browser_autoplay": self._browser_autoplay,
             "browser_collapsed": self._browser_collapsed,
+            "properties_collapsed": self._properties_collapsed,
+            "eq_collapsed": (
+                self.file_properties_panel.is_eq_collapsed()
+                if hasattr(self, "file_properties_panel")
+                else False
+            ),
+            "track_eq": dict(self._track_eq_state),
             "view_control_panel": (
                 not self.control_panel_section.isHidden()
                 if hasattr(self, "control_panel_section")
@@ -2345,6 +2594,7 @@ class AudioPlayer(QMainWindow):
             self.waveform.set_waveform([])
             self.track_info.setText("No track selected")
             self._reset_bpm_label()
+            self._update_file_properties(None)
             self.update_time_display()
         self.refresh_playlist_footer(playlist)
 
@@ -3778,8 +4028,8 @@ class AudioPlayer(QMainWindow):
             if active.source().isValid():
                 active.stop()
             if same_source:
-                active.setSource(QUrl())
-            active.setSource(QUrl.fromLocalFile(file_path))
+                self._set_air_source(self._active_player_idx, None)
+            self._set_air_source(self._active_player_idx, file_path)
             self.update_track_info_playing()
             if needs_waveform:
                 QTimer.singleShot(0, lambda path=file_path: self._request_waveform(path))
@@ -3810,45 +4060,61 @@ class AudioPlayer(QMainWindow):
         if not visible:
             return False
 
-        if self.current_playing_playlist is None:
-            if visible[0].count() > 0:
-                visible[0].setCurrentRow(0)
-                self.current_playing_playlist = 1
-                self.current_playing_item = visible[0].item(0)
-                return True
+        if self.current_playing_playlist is None or self.current_playing_item is None:
+            for playlist in visible:
+                if playlist.count() > 0:
+                    playlist.setCurrentRow(0)
+                    self.current_playing_playlist = playlist.playlist_num
+                    self.current_playing_item = playlist.item(0)
+                    return True
             return False
 
-        current_idx = self._playlist_index(self.current_playing_playlist)
-        if current_idx >= len(visible):
-            current_idx = 0
+        current_playlist = None
+        current_visible_idx = -1
+        for idx, playlist in enumerate(visible):
+            if playlist.playlist_num == self.current_playing_playlist:
+                current_playlist = playlist
+                current_visible_idx = idx
+                break
+        if current_playlist is None:
+            current_playlist = visible[0]
+            current_visible_idx = 0
 
-        current_playlist = visible[current_idx]
-        current_num = current_idx + 1
-        current_row = current_playlist.currentRow()
+        # Advance from the playing item, not from the UI selection cursor.
+        current_row = -1
+        for row in range(current_playlist.count()):
+            if current_playlist.item(row) is self.current_playing_item:
+                current_row = row
+                break
         if current_row < 0:
-            current_row = 0
+            current_row = max(0, current_playlist.currentRow())
 
         if current_row < current_playlist.count() - 1:
             new_row = current_row + 1
             current_playlist.setCurrentRow(new_row)
-            self.current_playing_playlist = current_num
+            self.current_playing_playlist = current_playlist.playlist_num
             self.current_playing_item = current_playlist.item(new_row)
             return True
-        if current_idx < len(visible) - 1 and visible[current_idx + 1].count() > 0:
-            next_playlist = visible[current_idx + 1]
+
+        for idx in range(current_visible_idx + 1, len(visible)):
+            next_playlist = visible[idx]
+            if next_playlist.count() <= 0:
+                continue
             next_playlist.setCurrentRow(0)
-            self.current_playing_playlist = current_idx + 2
+            self.current_playing_playlist = next_playlist.playlist_num
             self.current_playing_item = next_playlist.item(0)
             return True
+
         if self.playback_mode == "next" and current_playlist.count() > 0:
             current_playlist.setCurrentRow(0)
-            self.current_playing_playlist = current_num
+            self.current_playing_playlist = current_playlist.playlist_num
             self.current_playing_item = current_playlist.item(0)
             return True
         return False
 
     def _auto_advance_to_next_track(self) -> None:
         if not self._play_next_playable_track():
+            self._range_end_latched = False
             self.stop()
 
     def _play_next_playable_track(self) -> bool:
@@ -3862,10 +4128,12 @@ class AudioPlayer(QMainWindow):
                 return False
             if self.current_playing_playlist is None or self.current_playing_item is None:
                 continue
-            if self.play_selected(
-                self.current_playing_playlist,
-                preserve_range_latch=True,
-            ):
+            path = get_item_file_path(self.current_playing_item)
+            if not path or not os.path.isfile(path):
+                continue
+            # Fresh start: do not keep end-latch; force reload after EOF/pause.
+            self._range_end_latched = False
+            if self.play_file(path, force_restart=True):
                 return True
         return False
 
@@ -4086,13 +4354,13 @@ class AudioPlayer(QMainWindow):
     def next_track(self):
         visible = self.get_visible_playlists()
         total_tracks = sum(playlist.count() for playlist in visible)
-        for _ in range(total_tracks):
+        for _ in range(max(1, total_tracks)):
             if not self._step_selection_forward():
                 return
-            if self.play_selected(
-                self.current_playing_playlist,
-                preserve_range_latch=True,
-            ):
+            path = get_item_file_path(self.current_playing_item)
+            if not path or not os.path.isfile(path):
+                continue
+            if self.play_file(path, force_restart=True):
                 return
 
     def previous_track(self):
@@ -4149,34 +4417,27 @@ class AudioPlayer(QMainWindow):
             self.update_time_display()
 
     def _handle_range_end(self) -> None:
-        if self._handling_range_end:
+        if self._handling_range_end or self._range_end_latched:
             return
         self._handling_range_end = True
         try:
             self.volume_fader.cancel()
-            self.player.pause()
-            self.player.setPosition(self._range_end_ms())
 
             if self.playback_mode == "loop":
-                def restart():
-                    self.player.setPosition(self._range_start_ms())
-                    self._fade_out_started = False
-                    self.player.play()
-                    self._apply_fade_in()
-
-                if self._fade_out_ms() > 0:
-                    restart()
-                else:
-                    self.player.setPosition(self._range_start_ms())
-                    self._fade_out_started = False
-                    self.player.play()
-                    self._apply_fade_in()
+                self._range_end_latched = False
+                self._fade_out_started = False
+                start_ms = self._range_start_ms()
+                self.waveform.set_position(start_ms)
+                self.player.setPosition(start_ms)
+                self.player.play()
+                self._apply_fade_in()
             elif self.playback_mode == "next":
                 if self._current_file_path:
                     self._save_timeline_for_path(self._current_file_path)
                 self._range_end_latched = True
                 QTimer.singleShot(0, self._auto_advance_to_next_track)
             else:
+                self._range_end_latched = True
                 self.stop()
         finally:
             self._handling_range_end = False
@@ -4235,6 +4496,7 @@ class AudioPlayer(QMainWindow):
             self.waveform.set_position(position)
         self._check_fade_out_and_range(position)
         self.update_time_display()
+        self._sync_spectrum_playback()
 
     def duration_changed(self, duration):
         if duration <= 0 and self._pending_playback_start:
@@ -4301,6 +4563,7 @@ class AudioPlayer(QMainWindow):
             return
         if state == QMediaPlayer.PlaybackState.PlayingState:
             self._reapply_output_volume()
+        self._sync_spectrum_playback()
 
     def _on_player_position_changed(self, player_idx: int, position: int) -> None:
         if self._is_incoming_crossfade_loading() and player_idx == self._crossfade_outgoing_idx:
@@ -4359,12 +4622,19 @@ class AudioPlayer(QMainWindow):
                 return
             if player_idx != self._active_player_idx:
                 return
+            # Range-end handler already advanced / looped — avoid double NEXT skip.
+            if self._range_end_latched or self._handling_range_end:
+                return
             if self.playback_mode == "next":
+                if self._current_file_path:
+                    self._save_timeline_for_path(self._current_file_path)
                 self._range_end_latched = True
                 QTimer.singleShot(0, self._auto_advance_to_next_track)
             elif self.playback_mode == "loop":
-                self.player.setPosition(self._range_start_ms())
                 self._fade_out_started = False
+                start_ms = self._range_start_ms()
+                self.waveform.set_position(start_ms)
+                self.player.setPosition(start_ms)
                 self.player.play()
                 self._apply_fade_in()
 
@@ -4377,6 +4647,7 @@ class AudioPlayer(QMainWindow):
             super().keyPressEvent(event)
 
     def closeEvent(self, event):
+        self._save_eq_for_bound_path()
         self._cancel_crossfade()
         self._res_waveform_timer.stop()
         self.timer.stop()
@@ -4394,6 +4665,8 @@ class AudioPlayer(QMainWindow):
         self.waveform_loader.shutdown()
         self.preview_waveform_loader.shutdown()
         self.browser_waveform_loader.shutdown()
+        if self._spectrum_timer is not None:
+            self._spectrum_timer.stop()
         if hasattr(self, "video_mixer") and self.video_mixer is not None:
             self.video_mixer.shutdown()
         self.save_project()

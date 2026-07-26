@@ -14,6 +14,7 @@ from app.video_mixer.model import MixerModel, Scene
 from app.video_mixer.output_window import OutputWindow
 from app.video_mixer.panel import VideoMixerPanel
 from app.video_mixer.scene_render import render_scene_thumb
+from app.video_mixer.decoder_pool import ensure_pool
 
 if TYPE_CHECKING:
     from app.player import AudioPlayer
@@ -27,6 +28,8 @@ class VideoMixerController(QObject):
         super().__init__(window)
         self.window = window
         self.model = MixerModel(self)
+        # Warm decode workers before any Take so video starts without spawn lag.
+        ensure_pool()
         self.media_store = MediaStore(self.model)
         self.layer_audio = LayerAudioStore(self.model)
         self.panel = VideoMixerPanel(self.model, self.media_store)
@@ -44,10 +47,11 @@ class VideoMixerController(QObject):
         self._thumb_timer.timeout.connect(self._capture_preview_thumb)
         self._applying_project = False
 
-        self.expand_btn = QPushButton("«")
+        self.expand_btn = QPushButton("»")
         self.expand_btn.setObjectName("mixerExpandBtn")
         self.expand_btn.setToolTip("Expand video mixer")
         self.expand_btn.setFixedWidth(18)
+        self.expand_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.expand_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
         self.expand_btn.hide()
         self.expand_btn.clicked.connect(self.expand_panel)
@@ -71,7 +75,7 @@ class VideoMixerController(QObject):
 
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
-        self._save_timer.setInterval(500)
+        self._save_timer.setInterval(900)
         self._save_timer.timeout.connect(self._save_to_project)
 
         self._screen_refresh_timer = QTimer(self)
@@ -157,7 +161,10 @@ class VideoMixerController(QObject):
             return
         if getattr(self.window, "_saving_project", False):
             return
-        if hasattr(self.window, "save_project"):
+        # Lightweight mixer-only save — full save_project stalls UI / clicks air.
+        if hasattr(self.window, "save_video_mixer_only"):
+            self.window.save_video_mixer_only()
+        elif hasattr(self.window, "save_project"):
             self.window.save_project()
 
     def attach_to_layout(self, parent_layout, left_column: QWidget, *, stretch: int = 1) -> None:
@@ -204,6 +211,8 @@ class VideoMixerController(QObject):
     def expand_panel(self) -> None:
         self.model.panel_collapsed = False
         self._apply_collapsed_state(False)
+        # setSizes after show often needs a layout pass
+        QTimer.singleShot(0, self._restore_panel_width)
         self._schedule_save()
 
     def clear_preview(self) -> None:
@@ -370,16 +379,42 @@ class VideoMixerController(QObject):
     def _schedule_thumb_capture(self) -> None:
         self._thumb_timer.start()
 
+    def _restore_panel_width(self) -> None:
+        """Ensure the mixer side has a usable width after expand/show."""
+        if self.main_splitter is None or self.model.panel_collapsed:
+            return
+        sizes = self.main_splitter.sizes()
+        total = sum(sizes) if sizes else 0
+        if total <= 0:
+            total = max(800, self.main_splitter.width())
+        mixer_w = max(280, int(self.model.panel_width or 360))
+        if self.model.splitter_main and len(self.model.splitter_main) == 2:
+            left, right = (int(self.model.splitter_main[0]), int(self.model.splitter_main[1]))
+            if right >= 280 and left + right > 0:
+                self.main_splitter.setSizes([left, right])
+                return
+        # Panel was hidden with ~0 width — rebuild from saved panel_width.
+        if len(sizes) >= 2 and sizes[1] >= 280:
+            return
+        left = max(200, total - mixer_w)
+        self.main_splitter.setSizes([left, mixer_w])
+
     def _apply_collapsed_state(self, collapsed: bool) -> None:
         if self.main_splitter is None:
             self.panel.setVisible(not collapsed)
             self.expand_btn.setVisible(collapsed)
             return
+        if collapsed:
+            # Capture width before hide — after hide splitter often reports 0.
+            if self.panel.isVisible() and self.panel.width() > 0:
+                self.model.panel_width = max(280, self.panel.width())
+            sizes = self.main_splitter.sizes()
+            if len(sizes) >= 2 and sizes[1] > 0:
+                self.model.splitter_main = sizes
+                self.model.panel_width = max(280, sizes[1])
         self.panel.setVisible(not collapsed)
         self.expand_btn.setVisible(collapsed)
         if collapsed:
-            self.model.panel_width = max(280, self.panel.width())
-            self.model.splitter_main = self.main_splitter.sizes()
             output_on = self.output_window.isVisible()
             if output_on:
                 self.media_store.set_render_suspended(preview=True, all_media=False)
@@ -394,6 +429,7 @@ class VideoMixerController(QObject):
             if not self._clock.isActive():
                 self._clock.start()
             self._views_dirty = True
+            self._restore_panel_width()
 
     def _on_main_splitter_moved(self, *_args) -> None:
         if self.main_splitter is None:
@@ -416,13 +452,24 @@ class VideoMixerController(QObject):
 
     def _on_transform_changed(self, _layer_id: str) -> None:
         self._views_dirty = True
+        # Debounced light save only — no thumb re-render on every nudge.
         self._schedule_save()
-        self._schedule_thumb_capture()
 
     def _on_playback_changed(self, layer_id: str) -> None:
         layer = self.model.find_layer(layer_id)
         if layer is not None:
-            self.media_store.seek_layer(layer_id, layer.position_ms)
+            media = self.media_store.get(layer_id)
+            pos = int(layer.position_ms)
+            # Switching into LOOP at EOF should wrap from the start.
+            if (
+                layer.playback == "loop"
+                and media is not None
+                and media.decoder is not None
+                and media.decoder.at_eof
+            ):
+                pos = 0
+                layer.position_ms = 0
+            self.media_store.seek_layer(layer_id, pos)
         self._views_dirty = True
 
     def _schedule_save(self) -> None:
@@ -434,11 +481,16 @@ class VideoMixerController(QObject):
         audible = self.layer_audio.sync()
         if not audible:
             return
+        # Video bed is audible — pause air so two programs don't fight the device.
+        # Only when output is truly open (not a zero-gate stub), to avoid air glitches.
         try:
             from PyQt6.QtMultimedia import QMediaPlayer
 
-            if self.window.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
-                self.window.pause()
+            if self.window.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                return
+            if not self.model.main_scene_has_audible_video():
+                return
+            self.window.pause()
         except Exception:
             pass
 
