@@ -22,7 +22,8 @@ from app.audio_devices import (
 from app.audio_utils import is_audio_file
 from app.bpm_detector import BpmDetector
 from app.config import get_config_path
-from app.constants import MAX_PLAYLISTS
+from app.constants import APP_NAME, MAX_PLAYLISTS
+from app.ui.about_dialog import show_about_dialog
 from app.ui.main_window_ui import MainWindowUi
 from app.ui.tokens import get_token, get_token_int
 from app.ui.icon_loader import icon_size, load_icon
@@ -39,7 +40,6 @@ from app.playlist_io import (
     set_item_duration,
 )
 from app.project import (
-    BrowserTabState,
     ProjectManager,
     ProjectPlaylistState,
     ProjectState,
@@ -108,6 +108,7 @@ class AudioPlayer(QMainWindow):
         self._fade_out_started = False
         self._handling_range_end = False
         self._range_end_latched = False
+        self._pending_space_restart: dict | None = None
         self._time_display_mode = "elapsed"
         self._pending_playback_start = False
         self._pending_start_ms: int | None = None
@@ -227,7 +228,7 @@ class AudioPlayer(QMainWindow):
             )
         self.setup_connections()
         self.setup_shortcuts()
-        self._setup_project_menu()
+        self._setup_menus()
         self.setWindowTitle(self._window_title())
         self.setMinimumSize(1100, 900)
         self.resize(1280, 1150)
@@ -405,7 +406,18 @@ class AudioPlayer(QMainWindow):
             and not self._is_editing_playlist()
         ):
             if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
+                if event.modifiers() & (
+                    Qt.KeyboardModifier.ControlModifier
+                    | Qt.KeyboardModifier.AltModifier
+                    | Qt.KeyboardModifier.MetaModifier
+                    | Qt.KeyboardModifier.ShiftModifier
+                ):
+                    return False
                 self.handle_space()
+                return True
+
+            if event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat():
+                self.stop()
                 return True
 
             # Even if Qt focus was stolen during preview load, keep ↑/↓ on the
@@ -1436,10 +1448,15 @@ class AudioPlayer(QMainWindow):
 
     def _window_title(self) -> str:
         name = getattr(self.project, "name", None) or "Project"
-        return f"KULIK Player — {name}"
+        return f"{APP_NAME} — {name}"
 
     def _update_window_title(self) -> None:
         self.setWindowTitle(self._window_title())
+
+    def _setup_menus(self) -> None:
+        self._setup_project_menu()
+        self._setup_view_menu()
+        self._setup_about_menu()
 
     def _setup_project_menu(self) -> None:
         menu = self.menuBar().addMenu("Project")
@@ -1457,6 +1474,112 @@ class AudioPlayer(QMainWindow):
         act_save_as = QAction("Save Project As…", self)
         act_save_as.triggered.connect(self.save_project_as)
         menu.addAction(act_save_as)
+
+    def _setup_view_menu(self) -> None:
+        menu = self.menuBar().addMenu("View")
+        menu.aboutToShow.connect(self._sync_view_menu_actions)
+
+        self._view_file_browser_act = QAction("File Browser", self)
+        self._view_file_browser_act.setCheckable(True)
+        self._view_file_browser_act.toggled.connect(self._on_view_file_browser_toggled)
+        menu.addAction(self._view_file_browser_act)
+
+        self._view_control_panel_act = QAction("Control Panel", self)
+        self._view_control_panel_act.setCheckable(True)
+        self._view_control_panel_act.toggled.connect(self._on_view_control_panel_toggled)
+        menu.addAction(self._view_control_panel_act)
+
+        self._view_timeline_act = QAction("Timeline", self)
+        self._view_timeline_act.setCheckable(True)
+        self._view_timeline_act.toggled.connect(self._on_view_timeline_toggled)
+        menu.addAction(self._view_timeline_act)
+
+        self._view_playlists_act = QAction("Playlists", self)
+        self._view_playlists_act.setCheckable(True)
+        self._view_playlists_act.toggled.connect(self._on_view_playlists_toggled)
+        menu.addAction(self._view_playlists_act)
+
+        self._view_video_mixer_act = QAction("Video Mixer", self)
+        self._view_video_mixer_act.setCheckable(True)
+        self._view_video_mixer_act.toggled.connect(self._on_view_video_mixer_toggled)
+        menu.addAction(self._view_video_mixer_act)
+
+        self._sync_view_menu_actions()
+
+    def _setup_about_menu(self) -> None:
+        menu = self.menuBar().addMenu("About")
+        act_about = QAction(f"About {APP_NAME}…", self)
+        act_about.triggered.connect(self._show_about_dialog)
+        menu.addAction(act_about)
+
+    def _sync_view_menu_actions(self) -> None:
+        actions = (
+            getattr(self, "_view_file_browser_act", None),
+            getattr(self, "_view_control_panel_act", None),
+            getattr(self, "_view_timeline_act", None),
+            getattr(self, "_view_playlists_act", None),
+            getattr(self, "_view_video_mixer_act", None),
+        )
+        if not all(actions):
+            return
+
+        def set_checked(action: QAction, checked: bool) -> None:
+            action.blockSignals(True)
+            action.setChecked(checked)
+            action.blockSignals(False)
+
+        set_checked(self._view_file_browser_act, not self._browser_collapsed)
+        if hasattr(self, "control_panel_section"):
+            set_checked(
+                self._view_control_panel_act,
+                not self.control_panel_section.isHidden(),
+            )
+        if hasattr(self, "timeline_section"):
+            set_checked(
+                self._view_timeline_act,
+                not self.timeline_section.isHidden(),
+            )
+        if hasattr(self, "playlist_section"):
+            set_checked(
+                self._view_playlists_act,
+                not self.playlist_section.isHidden(),
+            )
+        mixer_visible = True
+        if hasattr(self, "video_mixer"):
+            mixer_visible = not self.video_mixer.model.panel_collapsed
+        set_checked(self._view_video_mixer_act, mixer_visible)
+
+    def _on_view_file_browser_toggled(self, checked: bool) -> None:
+        if checked:
+            self.expand_file_browser()
+        else:
+            self.collapse_file_browser()
+
+    def _on_view_control_panel_toggled(self, checked: bool) -> None:
+        if hasattr(self, "control_panel_section"):
+            self.control_panel_section.setVisible(checked)
+            self.save_config()
+
+    def _on_view_timeline_toggled(self, checked: bool) -> None:
+        if hasattr(self, "timeline_section"):
+            self.timeline_section.setVisible(checked)
+            self.save_config()
+
+    def _on_view_playlists_toggled(self, checked: bool) -> None:
+        if hasattr(self, "playlist_section"):
+            self.playlist_section.setVisible(checked)
+            self.save_config()
+
+    def _on_view_video_mixer_toggled(self, checked: bool) -> None:
+        if not hasattr(self, "video_mixer"):
+            return
+        if checked:
+            self.video_mixer.expand_panel()
+        else:
+            self.video_mixer.collapse_panel()
+
+    def _show_about_dialog(self) -> None:
+        show_about_dialog(self)
 
     def _show_playlist_context_menu(self, playlist: PlaylistWidget, pos: QPoint) -> None:
         item = playlist.itemAt(pos)
@@ -1535,10 +1658,10 @@ class AudioPlayer(QMainWindow):
             if i < len(self.font_size_spins):
                 pl_state.font_size = self.font_size_spins[i].value()
 
-        browser_tabs: list[BrowserTabState] = []
-        if hasattr(self, "file_browser"):
-            for title, path in self.file_browser.user_tab_states():
-                browser_tabs.append(BrowserTabState(title=title, path=path))
+        video_mixer = None
+        if hasattr(self, "video_mixer") and self.video_mixer is not None:
+            self.video_mixer.import_media_into_project()
+            video_mixer = self.video_mixer.export_state()
 
         return ProjectState(
             name=self.project.name,
@@ -1548,10 +1671,13 @@ class AudioPlayer(QMainWindow):
                 path: self._timeline_state_to_dict(state)
                 for path, state in self._track_timeline_state.items()
             },
-            browser_tabs=browser_tabs,
+            video_mixer=video_mixer,
         )
 
     def save_project(self) -> None:
+        if getattr(self, "_saving_project", False):
+            return
+        self._saving_project = True
         try:
             state = self._build_project_state()
             self.project.save_raw(state)
@@ -1567,6 +1693,8 @@ class AudioPlayer(QMainWindow):
         except Exception as exc:
             print(f"Error saving project: {exc}")
             QMessageBox.warning(self, "Project", f"Could not save project:\n{exc}")
+        finally:
+            self._saving_project = False
 
     def save_project_as(self) -> None:
         start = str(self.project.root.parent)
@@ -1590,6 +1718,8 @@ class AudioPlayer(QMainWindow):
         self.project.open(target)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
+        if hasattr(self, "video_mixer") and self.video_mixer is not None:
+            self.video_mixer.bind_project_root(self.project.root)
         self.save_project()
         self.save_config()
 
@@ -1618,11 +1748,12 @@ class AudioPlayer(QMainWindow):
             ProjectState(
                 name=self.project.name,
                 playlists=[ProjectPlaylistState() for _ in range(MAX_PLAYLISTS)],
+                video_mixer=None,
             )
         )
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
-            self.file_browser.restore_user_tabs([])
+        self.save_project()
         self.save_config()
         self._update_window_title()
 
@@ -1662,9 +1793,6 @@ class AudioPlayer(QMainWindow):
         self._apply_project_state(state)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
-            self.file_browser.restore_user_tabs(
-                [(tab.title, tab.path) for tab in state.browser_tabs]
-            )
         self.save_config()
         self._update_window_title()
         self.refresh_playlist_display()
@@ -1704,6 +1832,9 @@ class AudioPlayer(QMainWindow):
             if hasattr(self, "columns_stepper"):
                 self.columns_stepper.set_value(state.playlist_columns)
 
+        if hasattr(self, "video_mixer") and self.video_mixer is not None:
+            self.video_mixer.apply_project_state(state.video_mixer)
+
     def load_project(self) -> None:
         state = self.project.load_raw()
         if state is None:
@@ -1713,14 +1844,39 @@ class AudioPlayer(QMainWindow):
                 self.save_project()
             if hasattr(self, "file_browser"):
                 self.file_browser.set_project_root(str(self.project.root), self.project.name)
+            self._migrate_legacy_video_mixer_if_needed()
             return
+
+        migrated_mixer = False
+        if state.video_mixer is None:
+            legacy = self._legacy_video_mixer_dict()
+            if legacy is not None:
+                state.video_mixer = legacy
+                migrated_mixer = True
 
         self._apply_project_state(state)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
-            self.file_browser.restore_user_tabs(
-                [(tab.title, tab.path) for tab in state.browser_tabs]
-            )
+        if migrated_mixer:
+            self.save_project()
+
+    def _legacy_video_mixer_dict(self) -> dict | None:
+        path = get_config_path("video_mixer.json")
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _migrate_legacy_video_mixer_if_needed(self) -> None:
+        if not hasattr(self, "video_mixer") or self.video_mixer is None:
+            return
+        legacy = self._legacy_video_mixer_dict()
+        self.video_mixer.apply_project_state(legacy)
+        if legacy is not None:
+            self.save_project()
 
     def load_config(self):
         if not self.config_path.exists():
@@ -1805,6 +1961,28 @@ class AudioPlayer(QMainWindow):
                 if hasattr(self, "btn_browser_autoplay"):
                     self.btn_browser_autoplay.setChecked(self._browser_autoplay)
 
+            raw_tabs = config.get("browser_tabs")
+            if not isinstance(raw_tabs, list) and self.project.project_file.is_file():
+                # One-time migrate tabs previously stored in project.json
+                try:
+                    with open(self.project.project_file, "r", encoding="utf-8") as pf:
+                        proj_data = json.load(pf)
+                    if isinstance(proj_data, dict):
+                        raw_tabs = proj_data.get("browser_tabs")
+                except (OSError, json.JSONDecodeError):
+                    raw_tabs = None
+            if isinstance(raw_tabs, list) and hasattr(self, "file_browser"):
+                tabs: list[tuple[str, str]] = []
+                for entry in raw_tabs:
+                    if not isinstance(entry, dict):
+                        continue
+                    tab_path = str(entry.get("path") or "").strip()
+                    if not tab_path or not os.path.isdir(tab_path):
+                        continue
+                    title = str(entry.get("title") or Path(tab_path).name).strip() or "Folder"
+                    tabs.append((title, tab_path))
+                self.file_browser.restore_user_tabs(tabs)
+
             dialog_dir = config.get("last_playlist_dialog_dir")
             if isinstance(dialog_dir, str) and os.path.isdir(dialog_dir):
                 self._last_playlist_dialog_dir = dialog_dir
@@ -1858,6 +2036,20 @@ class AudioPlayer(QMainWindow):
 
             self._browser_collapsed = bool(config.get("browser_collapsed", False))
             self._apply_browser_collapsed_state(self._browser_collapsed)
+
+            if hasattr(self, "control_panel_section"):
+                self.control_panel_section.setVisible(
+                    bool(config.get("view_control_panel", True))
+                )
+            if hasattr(self, "timeline_section"):
+                self.timeline_section.setVisible(
+                    bool(config.get("view_timeline", True))
+                )
+            if hasattr(self, "playlist_section"):
+                self.playlist_section.setVisible(
+                    bool(config.get("view_playlists", True))
+                )
+            self._sync_view_menu_actions()
         except Exception as e:
             print(f"Error loading config: {e}")
 
@@ -1876,6 +2068,21 @@ class AudioPlayer(QMainWindow):
             "preview_autoplay": self._preview_autoplay,
             "browser_autoplay": self._browser_autoplay,
             "browser_collapsed": self._browser_collapsed,
+            "view_control_panel": (
+                not self.control_panel_section.isHidden()
+                if hasattr(self, "control_panel_section")
+                else True
+            ),
+            "view_timeline": (
+                not self.timeline_section.isHidden()
+                if hasattr(self, "timeline_section")
+                else True
+            ),
+            "view_playlists": (
+                not self.playlist_section.isHidden()
+                if hasattr(self, "playlist_section")
+                else True
+            ),
             "window_geometry": [
                 geometry.x(),
                 geometry.y(),
@@ -1908,6 +2115,12 @@ class AudioPlayer(QMainWindow):
             custom = self._playlist_titles.get(i, "").strip()
             if custom and custom != self.default_playlist_title(i):
                 config[f"playlist{i}_title"] = custom
+
+        if hasattr(self, "file_browser"):
+            config["browser_tabs"] = [
+                {"title": title, "path": path}
+                for title, path in self.file_browser.user_tab_states()
+            ]
 
         try:
             with open(self.config_path, 'w', encoding='utf-8') as f:
@@ -2645,6 +2858,7 @@ class AudioPlayer(QMainWindow):
         self._update_preview_time_display()
 
     def take_preview_to_air(self, *, space_triggered: bool = False) -> bool:
+        self._pending_space_restart = None
         if not self._preview_file_path or not self._preview_item:
             return False
         if not os.path.isfile(self._preview_file_path):
@@ -3484,6 +3698,7 @@ class AudioPlayer(QMainWindow):
         if not file_path or not os.path.isfile(file_path):
             return False
 
+        self._pending_space_restart = None
         abs_path = os.path.abspath(file_path)
         if not preserve_range_latch:
             self._range_end_latched = False
@@ -3529,8 +3744,6 @@ class AudioPlayer(QMainWindow):
             self.waveform.reset_view()
             if is_new_track:
                 self.waveform.set_waveform([])
-                if self.player.source().isValid():
-                    self.player.stop()
             elif needs_waveform:
                 self.waveform.set_waveform([])
             self._displayed_track_path = abs_path
@@ -3539,7 +3752,34 @@ class AudioPlayer(QMainWindow):
                 start_ms if start_ms is not None else self._range_start_ms()
             )
             self.waveform.set_position(self._pending_start_ms)
-            self.player.setSource(QUrl.fromLocalFile(file_path))
+
+            active = self._players[self._active_player_idx]
+            current_src = active.source().toLocalFile()
+            same_source = bool(
+                current_src and os.path.abspath(current_src) == abs_path
+            )
+            # QMediaPlayer often ignores setSource(same URL); after Stop that
+            # leaves _pending_playback_start stuck and silence until another Space.
+            if force_restart and same_source and self._media_ready_for_seek(
+                self._active_player_idx
+            ):
+                play_at = self._pending_start_ms
+                self._pending_playback_start = False
+                self._pending_start_ms = None
+                self._start_playback_at(play_at, player_idx=self._active_player_idx)
+                self.update_track_info_playing()
+                if needs_waveform:
+                    QTimer.singleShot(0, lambda path=file_path: self._request_waveform(path))
+                self._request_bpm_detection(file_path)
+                self.update_time_display()
+                self._update_timeline_labels()
+                return
+
+            if active.source().isValid():
+                active.stop()
+            if same_source:
+                active.setSource(QUrl())
+            active.setSource(QUrl.fromLocalFile(file_path))
             self.update_track_info_playing()
             if needs_waveform:
                 QTimer.singleShot(0, lambda path=file_path: self._request_waveform(path))
@@ -3668,7 +3908,77 @@ class AudioPlayer(QMainWindow):
         else:
             self.track_info.setText("No track selected")
 
+    def _arm_space_restart_from_air(self) -> None:
+        """Remember the air track so the next Space can restart it after Stop/Escape."""
+        path = self._current_file_path
+        item = self.current_playing_item
+        playlist_num = self.current_playing_playlist
+        if (
+            not path
+            or not item
+            or playlist_num is None
+            or not os.path.isfile(path)
+        ):
+            return
+        if not self._is_playback_active() and not self.player.source().isValid():
+            return
+        preview_at_arm = None
+        if self._preview_file_path and os.path.isfile(self._preview_file_path):
+            preview_at_arm = os.path.abspath(self._preview_file_path)
+        self._pending_space_restart = {
+            "path": path,
+            "item": item,
+            "playlist_num": playlist_num,
+            "preview_path_at_arm": preview_at_arm,
+        }
+
+    def _restart_pending_air_track(self) -> bool:
+        target = self._pending_space_restart
+        self._pending_space_restart = None
+        if not target:
+            return False
+        path = target.get("path")
+        item = target.get("item")
+        playlist_num = target.get("playlist_num")
+        if not path or not item or playlist_num is None or not os.path.isfile(path):
+            return False
+
+        # Abort an in-progress stop fade so Space can restart immediately.
+        if self._crossfade_active:
+            self._cancel_crossfade()
+        self.volume_fader.cancel()
+        self._range_end_latched = False
+        self._fade_out_started = False
+        self.player.stop()
+        self._set_output_volume(self._playback_volume)
+
+        self.current_playing_playlist = playlist_num
+        self.current_playing_item = item
+        return self.play_file(path, force_restart=True)
+
+    def _should_consume_space_restart(self) -> bool:
+        """True when Escape-restart should win over the current preview."""
+        pending = self._pending_space_restart
+        if not pending or not pending.get("path"):
+            return False
+        if not self._preview_file_path or not self._preview_item:
+            return True
+        if not os.path.isfile(self._preview_file_path):
+            return True
+        preview_now = os.path.abspath(self._preview_file_path)
+        preview_at_arm = pending.get("preview_path_at_arm")
+        # User picked another preview after Escape → prefer that track.
+        if preview_at_arm and preview_now != preview_at_arm:
+            return False
+        return True
+
     def handle_space(self):
+        if self._should_consume_space_restart():
+            if self._restart_pending_air_track():
+                return
+        else:
+            self._pending_space_restart = None
+
         playlist_num, item = self.get_selected_track()
         preview_ready = (
             self._preview_file_path
@@ -3750,6 +4060,7 @@ class AudioPlayer(QMainWindow):
         self.update_track_info_ready()
 
     def stop(self):
+        self._arm_space_restart_from_air()
         if self._crossfade_active:
             self._cancel_crossfade()
         fade_ms = self._space_fade_duration_ms()

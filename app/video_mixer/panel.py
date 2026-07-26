@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.config import get_config_path
+from app.project import scene_thumbs_dir
 from app.ui.widgets.float_value_stepper import FloatValueStepper
 from app.ui.widgets.section_header import SectionHeader
 from app.ui.widgets.segment_button import SegmentButtonGroup
@@ -39,7 +40,9 @@ def _format_ms(ms: int) -> str:
     return f"{m}:{s:02d}"
 
 
-def _thumbs_dir() -> Path:
+def _thumbs_dir(model: MixerModel) -> Path:
+    if model.project_root is not None:
+        return scene_thumbs_dir(model.project_root)
     path = get_config_path("scene_thumbs")
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -513,17 +516,21 @@ class VideoMixerPanel(QWidget):
         self._restore_splitters()
 
     def _load_frozen_thumbs(self) -> None:
-        folder = _thumbs_dir()
+        folder = _thumbs_dir(self.model)
         for path in folder.glob("*.png"):
             pix = QPixmap(str(path))
             if not pix.isNull():
                 self._frozen_thumbs[path.stem] = pix
 
+    def reload_thumbs(self) -> None:
+        self._frozen_thumbs.clear()
+        self._load_frozen_thumbs()
+
     def store_frozen_thumb(self, scene_id: str, pixmap: QPixmap) -> None:
         if pixmap is None or pixmap.isNull():
             return
         self._frozen_thumbs[scene_id] = QPixmap(pixmap)
-        out = _thumbs_dir() / f"{scene_id}.png"
+        out = _thumbs_dir(self.model) / f"{scene_id}.png"
         try:
             pixmap.save(str(out), "PNG")
         except Exception:
@@ -735,7 +742,7 @@ class VideoMixerPanel(QWidget):
         sid = scene.id
         self.model.remove_scene(sid)
         self._frozen_thumbs.pop(sid, None)
-        thumb_path = _thumbs_dir() / f"{sid}.png"
+        thumb_path = _thumbs_dir(self.model) / f"{sid}.png"
         try:
             if thumb_path.exists():
                 thumb_path.unlink()

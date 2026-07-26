@@ -203,6 +203,8 @@ class MixerModel(QObject):
         self.splitter_main: list[int] | None = None
         self.splitter_panel: list[int] | None = None
         self.splitter_bottom: list[int] | None = None
+        # Set by VideoMixerController when a project is active.
+        self.project_root: Path | None = None
 
     @property
     def active_scene_id(self) -> str | None:

@@ -88,7 +88,8 @@ class AudioWaveform(QWidget):
             self.setToolTip("Click or drag to scrub.")
         else:
             self.setToolTip(
-                "Колёсико: масштаб. Shift+колёсико или перетаскивание вне диапазона: прокрутка."
+                "Колёсико / трекпад вверх-вниз: масштаб. "
+                "Трекпад влево-вправо, Shift+колёсико или перетаскивание: прокрутка."
             )
 
     @property
@@ -677,21 +678,44 @@ class AudioWaveform(QWidget):
         if self.duration <= 0 or not self.waveform_data or self._deferred_render:
             return
 
-        if event.modifiers() & Qt.KeyboardModifier.ShiftModifier:
+        pixel = event.pixelDelta()
+        angle = event.angleDelta()
+        shift = bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+
+        # Trackpad often reports pixelDelta; mouse wheels usually only angleDelta.
+        dx = pixel.x()
+        dy = pixel.y()
+        if dx == 0 and dy == 0:
+            dx = angle.x()
+            dy = angle.y()
+
+        # Horizontal-dominant gesture (trackpad left/right) → pan when zoomed.
+        if abs(dx) > abs(dy) and dx != 0:
             if not self.is_zoomed:
                 return
-            delta = event.angleDelta().y()
-            if delta == 0:
-                delta = event.angleDelta().x()
-            if delta == 0:
-                return
-            notches = delta / 120.0
-            self._pan_by_wheel_notches(notches)
+            if pixel.x() != 0:
+                self._pan_by_px(pixel.x())
+            else:
+                self._pan_by_wheel_notches(dx / 120.0)
             event.accept()
             return
 
-        delta = event.angleDelta().y()
-        if delta == 0:
+        # Shift + vertical scroll → pan (mouse wheel / trackpad).
+        if shift:
+            if not self.is_zoomed:
+                return
+            delta = dy if dy != 0 else dx
+            if delta == 0:
+                return
+            if pixel.y() != 0 or (pixel.x() != 0 and dy == 0):
+                self._pan_by_px(pixel.y() if pixel.y() != 0 else pixel.x())
+            else:
+                self._pan_by_wheel_notches(delta / 120.0)
+            event.accept()
+            return
+
+        # Vertical scroll → zoom around cursor.
+        if dy == 0:
             return
 
         width = self.width()
@@ -701,7 +725,7 @@ class AudioWaveform(QWidget):
         x = int(event.position().x())
         anchor_ms = self.x_to_ms(x)
         visible_duration = self.visible_duration_ms
-        zoom_in = delta > 0
+        zoom_in = dy > 0
         factor = self.ZOOM_FACTOR if zoom_in else 1.0 / self.ZOOM_FACTOR
         new_duration = int(visible_duration / factor)
         new_duration = max(

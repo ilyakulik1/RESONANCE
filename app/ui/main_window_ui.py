@@ -53,9 +53,12 @@ class MainWindowUi:
         audio_layout = QVBoxLayout(audio)
         audio_layout.setContentsMargins(0, 0, 0, 0)
         audio_layout.setSpacing(0)
-        audio_layout.addWidget(self._build_control_panel(window))
-        audio_layout.addWidget(self._build_timeline(window))
-        audio_layout.addWidget(self._build_playlists(window), 1)
+        window.control_panel_section = self._build_control_panel(window)
+        window.timeline_section = self._build_timeline(window)
+        window.playlist_section = self._build_playlists(window)
+        audio_layout.addWidget(window.control_panel_section)
+        audio_layout.addWidget(window.timeline_section)
+        audio_layout.addWidget(window.playlist_section, 1)
 
         project_root = getattr(window, "_pending_project_root", None)
         if project_root is None:

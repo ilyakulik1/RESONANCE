@@ -4,12 +4,14 @@ Layout::
 
     MyProject/
       project.json
-      media/          # audio files owned by the project
+      media/          # audio / video / image files owned by the project
       analysis/       # BPM + waveform NPZ cache
+      scene_thumbs/   # video mixer scene thumbnails
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
@@ -30,6 +32,7 @@ from app.widgets.audio_waveform import TimelineState
 PROJECT_FILENAME = "project.json"
 MEDIA_DIRNAME = "media"
 ANALYSIS_DIRNAME = "analysis"
+SCENE_THUMBS_DIRNAME = "scene_thumbs"
 PROJECT_VERSION = 1
 
 
@@ -44,6 +47,7 @@ def ensure_project_dirs(root: Path | str) -> Path:
     root_path.mkdir(parents=True, exist_ok=True)
     (root_path / MEDIA_DIRNAME).mkdir(exist_ok=True)
     (root_path / ANALYSIS_DIRNAME).mkdir(exist_ok=True)
+    (root_path / SCENE_THUMBS_DIRNAME).mkdir(exist_ok=True)
     return root_path
 
 
@@ -57,6 +61,12 @@ def media_dir(root: Path | str) -> Path:
 
 def analysis_dir(root: Path | str) -> Path:
     return Path(root) / ANALYSIS_DIRNAME
+
+
+def scene_thumbs_dir(root: Path | str) -> Path:
+    path = Path(root) / SCENE_THUMBS_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def is_under_project(file_path: str, root: Path | str) -> bool:
@@ -170,12 +180,6 @@ def import_track_into_project(
 
 
 @dataclass
-class BrowserTabState:
-    title: str
-    path: str
-
-
-@dataclass
 class ProjectPlaylistState:
     title: str = ""
     font_size: int = 13
@@ -188,7 +192,50 @@ class ProjectState:
     playlists: list[ProjectPlaylistState] = field(default_factory=list)
     playlist_columns: int = 2
     track_timelines: dict[str, dict] = field(default_factory=dict)
-    browser_tabs: list[BrowserTabState] = field(default_factory=list)
+    video_mixer: dict | None = None
+
+
+def mixer_dict_for_storage(data: dict, root: Path | str) -> dict:
+    """Deep-copy mixer state with layer paths relative to the project when possible."""
+    payload = copy.deepcopy(data)
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        return payload
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        layers = scene.get("layers")
+        if not isinstance(layers, list):
+            continue
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            path = layer.get("path")
+            if isinstance(path, str) and path.strip():
+                layer["path"] = to_project_path(path, root)
+    return payload
+
+
+def resolve_mixer_dict(data: dict, root: Path | str) -> dict:
+    """Deep-copy mixer state with layer paths resolved against the project root."""
+    payload = copy.deepcopy(data)
+    scenes = payload.get("scenes")
+    if not isinstance(scenes, list):
+        return payload
+    for scene in scenes:
+        if not isinstance(scene, dict):
+            continue
+        layers = scene.get("layers")
+        if not isinstance(layers, list):
+            continue
+        for layer in layers:
+            if not isinstance(layer, dict):
+                continue
+            path = layer.get("path")
+            if isinstance(path, str) and path.strip():
+                abs_path, _ = resolve_project_path(path, root)
+                layer["path"] = abs_path
+    return payload
 
 
 class ProjectManager:
@@ -274,9 +321,11 @@ class ProjectManager:
                 to_project_path(path, self.root): data
                 for path, data in state.track_timelines.items()
             },
-            "browser_tabs": [
-                {"title": tab.title, "path": tab.path} for tab in state.browser_tabs
-            ],
+            "video_mixer": (
+                mixer_dict_for_storage(state.video_mixer, self.root)
+                if isinstance(state.video_mixer, dict)
+                else None
+            ),
         }
         self.name = payload["name"]
         with open(self.project_file, "w", encoding="utf-8") as f:
@@ -340,17 +389,11 @@ class ProjectManager:
                 abs_path, _ = resolve_project_path(str(key), self.root)
                 timelines[abs_path] = value
 
-        browser_tabs: list[BrowserTabState] = []
-        raw_tabs = data.get("browser_tabs")
-        if isinstance(raw_tabs, list):
-            for tab in raw_tabs:
-                if not isinstance(tab, dict):
-                    continue
-                tab_path = str(tab.get("path") or "").strip()
-                if not tab_path or not os.path.isdir(tab_path):
-                    continue
-                title = str(tab.get("title") or Path(tab_path).name).strip() or "Folder"
-                browser_tabs.append(BrowserTabState(title=title, path=tab_path))
+        video_mixer = data.get("video_mixer")
+        if not isinstance(video_mixer, dict):
+            video_mixer = None
+        else:
+            video_mixer = resolve_mixer_dict(video_mixer, self.root)
 
         columns = int(data.get("playlist_columns") or 2)
         columns = max(1, min(MAX_PLAYLISTS, columns))
@@ -360,5 +403,5 @@ class ProjectManager:
             playlists=playlists,
             playlist_columns=columns,
             track_timelines=timelines,
-            browser_tabs=browser_tabs,
+            video_mixer=video_mixer,
         )

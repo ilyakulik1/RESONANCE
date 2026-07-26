@@ -8,6 +8,9 @@ from PyQt6.QtWidgets import QApplication, QStyle, QWidget
 
 _QT_RESOURCES_LOADED = False
 _ICON_DPR_VARIANTS = (1.0, 2.0)
+_ICON_CACHE: dict[tuple, QIcon] = {}
+# Cap source resolution before bbox/normalize — toolbar icons never need more.
+_MAX_SOURCE_EDGE = 256
 
 
 def _ensure_qt_resources() -> None:
@@ -35,29 +38,72 @@ def _screen_device_pixel_ratio(widget: QWidget | None) -> float:
     return 1.0
 
 
+def _prepare_source(image: QImage) -> QImage:
+    """Downscale huge assets once so bbox/normalize stay cheap."""
+    if image.isNull():
+        return image
+    w, h = image.width(), image.height()
+    edge = max(w, h)
+    if edge <= _MAX_SOURCE_EDGE:
+        return image
+    scale = _MAX_SOURCE_EDGE / edge
+    return image.scaled(
+        max(1, int(round(w * scale))),
+        max(1, int(round(h * scale))),
+        Qt.AspectRatioMode.KeepAspectRatio,
+        Qt.TransformationMode.SmoothTransformation,
+    )
+
+
 def _content_bbox(image: QImage) -> tuple[int, int, int, int] | None:
-    width = image.width()
-    height = image.height()
+    """Tight alpha bbox via raw ARGB bytes (not per-pixel QColor calls)."""
+    img = image.convertToFormat(QImage.Format.Format_ARGB32)
+    width = img.width()
+    height = img.height()
+    if width <= 0 or height <= 0:
+        return None
+
+    bits = img.constBits()
+    if bits is None:
+        return None
+    bits.setsize(img.sizeInBytes())
+    buf = bytes(bits)
+    stride = img.bytesPerLine()
+
     min_x, min_y = width, height
     max_x, max_y = -1, -1
 
     for y in range(height):
+        row = y * stride
         for x in range(width):
-            if image.pixelColor(x, y).alpha() > 16:
-                min_x = min(min_x, x)
-                min_y = min(min_y, y)
-                max_x = max(max_x, x)
-                max_y = max(max_y, y)
+            # ARGB32 little-endian: B, G, R, A
+            if buf[row + x * 4 + 3] > 16:
+                if x < min_x:
+                    min_x = x
+                if x > max_x:
+                    max_x = x
+                if y < min_y:
+                    min_y = y
+                if y > max_y:
+                    max_y = y
 
     if max_x < min_x:
         return None
     return min_x, min_y, max_x - min_x + 1, max_y - min_y + 1
 
 
-def _normalize_image(image: QImage, physical_size: int) -> QImage:
-    bbox = _content_bbox(image)
+def _normalize_image(
+    image: QImage,
+    physical_size: int,
+    bbox: tuple[int, int, int, int] | None,
+) -> QImage:
     if bbox is None:
-        return image
+        return image.scaled(
+            physical_size,
+            physical_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
 
     x, y, bw, bh = bbox
     cropped = image.copy(x, y, bw, bh)
@@ -82,9 +128,14 @@ def _normalize_image(image: QImage, physical_size: int) -> QImage:
     return canvas
 
 
-def _pixmap_for_dpr(image: QImage, logical_size: int, dpr: float) -> QPixmap:
+def _pixmap_for_dpr(
+    image: QImage,
+    logical_size: int,
+    dpr: float,
+    bbox: tuple[int, int, int, int] | None,
+) -> QPixmap:
     physical_size = max(1, int(round(logical_size * dpr)))
-    canvas = _normalize_image(image, physical_size)
+    canvas = _normalize_image(image, physical_size, bbox)
     pixmap = QPixmap.fromImage(canvas)
     pixmap.setDevicePixelRatio(dpr)
     return pixmap
@@ -113,11 +164,13 @@ def _icon_from_image(
     if image.isNull():
         return QIcon()
 
+    image = _prepare_source(image)
     image = _apply_opacity(image, opacity)
+    bbox = _content_bbox(image)
     icon = QIcon()
     ratios = sorted({*_ICON_DPR_VARIANTS, dpr})
     for ratio in ratios:
-        icon.addPixmap(_pixmap_for_dpr(image, logical_size, ratio))
+        icon.addPixmap(_pixmap_for_dpr(image, logical_size, ratio, bbox))
     return icon
 
 
@@ -143,11 +196,16 @@ def load_icon(
     from app.ui.assets import icon_path, icon_resource_path
 
     dpr = _screen_device_pixel_ratio(widget)
+    cache_key = (name, int(size), round(float(opacity), 3), round(dpr, 2))
+    cached = _ICON_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
 
     path = icon_path(name)
     if path.exists():
         icon = _icon_from_path(path, size, dpr, opacity=opacity)
         if not icon.isNull():
+            _ICON_CACHE[cache_key] = icon
             return icon
 
     _ensure_qt_resources()
@@ -160,7 +218,10 @@ def load_icon(
                 int(round(size * dpr)),
             ).toImage()
             if not image.isNull():
-                return _icon_from_image(image, size, dpr, opacity=opacity)
+                icon = _icon_from_image(image, size, dpr, opacity=opacity)
+                _ICON_CACHE[cache_key] = icon
+                return icon
+            _ICON_CACHE[cache_key] = resource_icon
             return resource_icon
 
     style = widget.style()
@@ -193,7 +254,9 @@ def load_icon(
     }
     std = mapping.get(name)
     if std is not None:
-        return style.standardIcon(std)
+        icon = style.standardIcon(std)
+        _ICON_CACHE[cache_key] = icon
+        return icon
 
     return QIcon()
 

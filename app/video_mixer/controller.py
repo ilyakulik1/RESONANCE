@@ -1,14 +1,16 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import QObject, QTimer, Qt
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton, QSizePolicy, QSplitter
 
+from app.project import import_track_into_project, is_under_project
 from app.video_mixer.layer_audio import LayerAudioStore
 from app.video_mixer.media_store import MediaStore
-from app.video_mixer.model import MixerModel
+from app.video_mixer.model import MixerModel, Scene
 from app.video_mixer.output_window import OutputWindow
 from app.video_mixer.panel import VideoMixerPanel
 from app.video_mixer.scene_render import render_scene_thumb
@@ -40,6 +42,7 @@ class VideoMixerController(QObject):
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.setInterval(180)
         self._thumb_timer.timeout.connect(self._capture_preview_thumb)
+        self._applying_project = False
 
         self.expand_btn = QPushButton("«")
         self.expand_btn.setObjectName("mixerExpandBtn")
@@ -69,15 +72,16 @@ class VideoMixerController(QObject):
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(500)
-        self._save_timer.timeout.connect(self.model.save)
+        self._save_timer.timeout.connect(self._save_to_project)
 
         self._screen_refresh_timer = QTimer(self)
         self._screen_refresh_timer.setInterval(3000)
         self._screen_refresh_timer.timeout.connect(self._maybe_refresh_screens)
         self._screen_refresh_timer.start()
 
-        self.model.load()
-        # Panel was built before load; re-apply saved splitter sizes now.
+        # Project state is applied later via apply_project_state() from AudioPlayer.
+        project = getattr(window, "project", None)
+        self.bind_project_root(getattr(project, "root", None))
         self.panel._restore_splitters()
         self.media_store.sync()
         self.refresh_output_screens()
@@ -86,6 +90,75 @@ class VideoMixerController(QObject):
 
         shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), window)
         shortcut.activated.connect(self.open_output_default)
+
+    def bind_project_root(self, root: Path | str | None) -> None:
+        self.model.project_root = Path(root) if root is not None else None
+
+    def apply_project_state(self, data: dict | None) -> None:
+        """Load mixer document from the active project (or reset to empty)."""
+        self._applying_project = True
+        try:
+            self.bind_project_root(self.window.project.root)
+            if isinstance(data, dict) and data:
+                self.model.load_dict(data)
+            else:
+                empty = Scene.create("Scene 1")
+                self.model.load_dict(
+                    {
+                        "scenes": [empty.to_dict()],
+                        "main_scene_id": empty.id,
+                        "preview_scene_id": empty.id,
+                        "selected_layer_id": None,
+                    }
+                )
+            self.panel.reload_thumbs()
+            self.panel._restore_splitters()
+            if self.main_splitter is not None:
+                self._restore_splitters_deferred()
+            self.media_store.sync()
+            self.layer_audio.sync()
+            self._apply_collapsed_state(self.model.panel_collapsed)
+            self._views_dirty = True
+            self.panel.refresh_all()
+        finally:
+            self._applying_project = False
+
+    def import_media_into_project(self) -> bool:
+        """Copy external layer media into project/media/. Returns True if paths changed."""
+        root = self.window.project.root
+        changed = False
+        for scene in self.model.scenes:
+            for layer in scene.layers:
+                path = (layer.path or "").strip()
+                if not path or not Path(path).is_file():
+                    continue
+                if is_under_project(path, root):
+                    continue
+                new_path = import_track_into_project(path, root, move=False)
+                if new_path and new_path != path:
+                    layer.path = new_path
+                    changed = True
+        if changed:
+            self.media_store.sync()
+            self.layer_audio.sync()
+            self._views_dirty = True
+        return changed
+
+    def export_state(self) -> dict:
+        if self.main_splitter is not None and not self.model.panel_collapsed:
+            self.model.splitter_main = self.main_splitter.sizes()
+        self.panel._persist_splitters()
+        if self.panel.width() > 0:
+            self.model.panel_width = max(280, self.panel.width())
+        return self.model.to_dict()
+
+    def _save_to_project(self) -> None:
+        if self._applying_project:
+            return
+        if getattr(self.window, "_saving_project", False):
+            return
+        if hasattr(self.window, "save_project"):
+            self.window.save_project()
 
     def attach_to_layout(self, parent_layout, left_column: QWidget, *, stretch: int = 1) -> None:
         self._left_column = left_column
@@ -353,6 +426,8 @@ class VideoMixerController(QObject):
         self._views_dirty = True
 
     def _schedule_save(self) -> None:
+        if self._applying_project:
+            return
         self._save_timer.start()
 
     def _sync_layer_audio(self) -> None:
@@ -412,14 +487,11 @@ class VideoMixerController(QObject):
     def shutdown(self) -> None:
         self._clock.stop()
         self._screen_refresh_timer.stop()
+        self._save_timer.stop()
         if self.main_splitter is not None:
             self.model.splitter_main = self.main_splitter.sizes()
         self.panel._persist_splitters()
         self.model.panel_width = max(280, self.panel.width()) if self.panel.width() > 0 else self.model.panel_width
-        try:
-            self.model.save()
-        except Exception as exc:
-            print(f"Error saving video mixer config: {exc}")
         try:
             self.panel.release_gl()
         except Exception:
