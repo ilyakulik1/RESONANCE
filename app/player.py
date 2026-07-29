@@ -3998,6 +3998,7 @@ class AudioPlayer(QMainWindow):
                 self.waveform.set_waveform([])
             self._displayed_track_path = abs_path
             self._prepare_timeline_for_path(file_path)
+            self._update_file_properties(file_path)
             self._pending_start_ms = (
                 start_ms if start_ms is not None else self._range_start_ms()
             )

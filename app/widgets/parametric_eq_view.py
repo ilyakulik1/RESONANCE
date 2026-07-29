@@ -81,8 +81,8 @@ class _EqCanvas(QWidget):
         self.update()
 
     def _plot_rect(self) -> QRectF:
-        # Leave a slim strip for freq labels
-        return QRectF(4, 4, max(1.0, self.width() - 8), max(1.0, self.height() - 14))
+        # Leave room under the plot so freq labels stay above the band inspector
+        return QRectF(4, 4, max(1.0, self.width() - 8), max(1.0, self.height() - 18))
 
     def _freq_to_x(self, freq: float, rect: QRectF) -> float:
         f = max(FREQ_MIN_HZ, min(FREQ_MAX_HZ, freq))
@@ -198,14 +198,15 @@ class _EqCanvas(QWidget):
                 painter.setPen(QPen(self._node_sel, 1.5))
                 painter.drawLine(QPointF(p.x() - wing, p.y()), QPointF(p.x() + wing, p.y()))
 
-        # Axis labels
+        # Axis labels (kept inside the canvas bottom strip, clear of band inspector)
         painter.setPen(self._label)
         font = QFont(self.font())
         font.setPixelSize(9)
         painter.setFont(font)
+        label_y = int(min(rect.bottom() + 12, self.height() - 3))
         for f, label in ((50, "50"), (200, "200"), (1000, "1k"), (5000, "5k"), (10000, "10k")):
             x = self._freq_to_x(f, rect)
-            painter.drawText(int(x - 10), int(rect.bottom() + 12), label)
+            painter.drawText(int(x - 10), label_y, label)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -325,8 +326,8 @@ class ParametricEqView(QWidget):
 
         self.canvas = _EqCanvas(self._state, self)
         if compact:
-            self.canvas.setMinimumHeight(72)
-            self.canvas.setMaximumHeight(96)
+            self.canvas.setMinimumHeight(78)
+            self.canvas.setMaximumHeight(100)
             self.canvas.setSizePolicy(
                 QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
             )
@@ -339,7 +340,8 @@ class ParametricEqView(QWidget):
 
         inspector = QHBoxLayout()
         inspector.setSpacing(3 if compact else 6)
-        inspector.setContentsMargins(0, 0, 0, 0)
+        # Keep band controls clear of canvas freq labels
+        inspector.setContentsMargins(0, 2 if compact else 0, 0, 0)
 
         self.type_combo = QComboBox()
         for key in BAND_TYPES:

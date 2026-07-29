@@ -112,8 +112,8 @@ class FilePropertiesPanel(QFrame):
         eq_body_layout.addWidget(eq_title)
 
         self.eq_view = ParametricEqView(EqState(), self, compact=True)
-        self.eq_view.setMinimumHeight(130)
-        self.eq_view.setMaximumHeight(168)
+        self.eq_view.setMinimumHeight(140)
+        self.eq_view.setMaximumHeight(180)
         self.eq_view.bandsChanged.connect(self.eqChanged.emit)
         self.eq_view.bypassChanged.connect(lambda _c: self.eqChanged.emit())
         eq_body_layout.addWidget(self.eq_view, 1)
@@ -137,7 +137,6 @@ class FilePropertiesPanel(QFrame):
             info["bpm"] = f"{bpm:.1f}".rstrip("0").rstrip(".") if isinstance(bpm, float) else str(bpm)
         for key, label in self._meta_labels.items():
             label.setText(info.get(key, "—"))
-            label.setToolTip(info.get(key, ""))
 
     def set_bpm(self, bpm: float | None) -> None:
         if bpm is None or bpm <= 0:
