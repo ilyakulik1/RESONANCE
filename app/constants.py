@@ -1,6 +1,6 @@
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".flac", ".aac")
 MAX_PLAYLISTS = 3
-APP_NAME = "KULIK Player"
+APP_NAME = "Decibel Player"
 
 try:
     from pydub import AudioSegment

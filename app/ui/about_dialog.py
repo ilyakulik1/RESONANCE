@@ -21,12 +21,12 @@ class AboutInfo:
     """Контент окна About — редактируйте здесь."""
 
     # Заголовок окна и крупное название в диалоге
-    window_title = "About KULIK Player"
-    app_name = "KULIK Player"
+    window_title = "About Decibel Player"
+    app_name = "Decibel Player"
     version = "1.0.0"
 
     # Короткий слоган под названием (можно оставить "")
-    tagline = "Creadted by Ilya Kulik, Curcor AI. In App use UI by Qt6"
+    tagline = ""
 
     # Основной текст. Несколько абзацев — через пустую строку.
     description = """
@@ -34,21 +34,27 @@ Media server for live / broadcast use.
 """.strip()
 
     # Автор / команда (можно оставить "")
-    author = ""
+    author = "Ilya Kulik"
 
     # Копирайт, например: "© 2026 Your Name"
-    copyright = ""
+    copyright = "© 2026 Ilya Kulik"
 
     # Сайт или email (можно оставить "")
     contact = ""
 
     # Дополнительные строки: (заголовок, текст). Пустой список = ничего не показывать.
-    # Пример:
-    # extras = [
-    #     ("License", "MIT"),
-    #     ("Credits", "Icons by …"),
-    # ]
-    extras: list[tuple[str, str]] = []
+    extras: list[tuple[str, str]] = [
+        (
+            "License",
+            "GNU General Public License v3.0 — required by PyQt6 (GPL-3.0) "
+            "and compatible with mutagen (GPL-2.0+).",
+        ),
+        (
+            "Third-party",
+            "PyQt6 (GPL-3.0), mutagen (GPL-2.0+), pydub / moderngl (MIT), "
+            "numpy / scipy / PyAV (BSD), librosa (ISC). Qt is used under LGPL.",
+        ),
+    ]
 
 
 class AboutDialog(QDialog):

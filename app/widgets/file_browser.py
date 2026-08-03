@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
     QPushButton,
@@ -36,6 +37,9 @@ from app.widgets.audio_waveform import AudioWaveform
 ENTRY_PATH_ROLE = Qt.ItemDataRole.UserRole
 ENTRY_IS_DIR_ROLE = Qt.ItemDataRole.UserRole + 1
 
+SORT_NAME = "name"
+SORT_DATE = "date"
+
 
 class FileBrowserList(QListWidget):
     """Folder listing with drag-out of audio files (and folders as URLs)."""
@@ -51,6 +55,8 @@ class FileBrowserList(QListWidget):
         self._root_limit: str | None = None
         self._drag_start_pos: QPoint | None = None
         self._icon_provider = QFileIconProvider()
+        self._sort_mode = SORT_NAME
+        self._filter_text = ""
         self.setObjectName("fileBrowserList")
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDragEnabled(True)
@@ -110,6 +116,32 @@ class FileBrowserList(QListWidget):
         if self._current_path:
             self._reload()
 
+    def sort_mode(self) -> str:
+        return self._sort_mode
+
+    def set_sort_mode(self, mode: str) -> None:
+        if mode not in (SORT_NAME, SORT_DATE) or mode == self._sort_mode:
+            return
+        self._sort_mode = mode
+        self._reload()
+
+    def filter_text(self) -> str:
+        return self._filter_text
+
+    def set_filter_text(self, text: str) -> None:
+        normalized = text.strip().lower()
+        if normalized == self._filter_text:
+            return
+        self._filter_text = normalized
+        self._reload()
+
+    def _entry_sort_key(self, entry: tuple[str, str, float]):
+        name, _full, mtime = entry
+        if self._sort_mode == SORT_DATE:
+            # Newest first within each group (dirs / files).
+            return (-mtime, name.lower())
+        return name.lower()
+
     def _reload(self) -> None:
         self.clear()
         path = self._current_path
@@ -121,21 +153,30 @@ class FileBrowserList(QListWidget):
         except OSError:
             return
 
-        dirs: list[str] = []
-        files: list[str] = []
+        dirs: list[tuple[str, str, float]] = []
+        files: list[tuple[str, str, float]] = []
+        needle = self._filter_text
         for name in names:
             if name.startswith("."):
                 continue
+            if needle and needle not in name.lower():
+                continue
             full = os.path.join(path, name)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                mtime = 0.0
             if os.path.isdir(full):
-                dirs.append(name)
+                dirs.append((name, full, mtime))
             elif os.path.isfile(full):
-                files.append(name)
+                files.append((name, full, mtime))
 
-        for name in sorted(dirs, key=str.lower):
-            self._add_entry(os.path.join(path, name), name, is_dir=True)
-        for name in sorted(files, key=str.lower):
-            full = os.path.join(path, name)
+        dirs.sort(key=self._entry_sort_key)
+        files.sort(key=self._entry_sort_key)
+
+        for name, full, _mtime in dirs:
+            self._add_entry(full, name, is_dir=True)
+        for name, full, _mtime in files:
             self._add_entry(full, name, is_dir=False)
 
     def _add_entry(self, full_path: str, name: str, *, is_dir: bool) -> None:
@@ -296,6 +337,30 @@ class FileBrowserTabPage(QWidget):
         tb.addWidget(self.path_label, 1)
         layout.addWidget(toolbar)
 
+        filter_row = QFrame()
+        filter_row.setObjectName("fileBrowserFilterRow")
+        fr = QHBoxLayout(filter_row)
+        fr.setContentsMargins(0, 0, 0, 0)
+        fr.setSpacing(4)
+
+        self.search_edit = QLineEdit()
+        self.search_edit.setObjectName("fileBrowserSearch")
+        self.search_edit.setPlaceholderText("Search…")
+        self.search_edit.setClearButtonEnabled(True)
+        self.search_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        self.search_edit.textChanged.connect(self._on_search_changed)
+        fr.addWidget(self.search_edit, 1)
+
+        self.sort_combo = QComboBox()
+        self.sort_combo.setObjectName("fileBrowserSortCombo")
+        self.sort_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.sort_combo.setToolTip("Sort folder contents")
+        self.sort_combo.addItem("Name", SORT_NAME)
+        self.sort_combo.addItem("Date", SORT_DATE)
+        self.sort_combo.currentIndexChanged.connect(self._on_sort_changed)
+        fr.addWidget(self.sort_combo)
+        layout.addWidget(filter_row)
+
         self.list_frame = QFrame()
         self.list_frame.setObjectName("fileBrowserListFrame")
         list_layout = QVBoxLayout(self.list_frame)
@@ -310,6 +375,14 @@ class FileBrowserTabPage(QWidget):
         self.list.audioSelected.connect(self.audioSelected)
         list_layout.addWidget(self.list)
         layout.addWidget(self.list_frame, 1)
+
+        find_shortcut = QShortcut(QKeySequence("Ctrl+F"), self)
+        find_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        find_shortcut.activated.connect(self.focus_search)
+
+        escape_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Escape), self.search_edit)
+        escape_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        escape_shortcut.activated.connect(self._clear_or_blur_search)
 
         start = initial_path
         if self._root_limit and (
@@ -347,6 +420,10 @@ class FileBrowserTabPage(QWidget):
     def refresh(self) -> None:
         self.list.refresh()
 
+    def focus_search(self) -> None:
+        self.search_edit.setFocus(Qt.FocusReason.ShortcutFocusReason)
+        self.search_edit.selectAll()
+
     def _go_up(self) -> None:
         self.list.go_up()
 
@@ -364,6 +441,20 @@ class FileBrowserTabPage(QWidget):
         chosen = QFileDialog.getExistingDirectory(self, "Open Folder", start)
         if chosen:
             self.list.navigate_to(chosen)
+
+    def _on_search_changed(self, text: str) -> None:
+        self.list.set_filter_text(text)
+
+    def _on_sort_changed(self, _index: int) -> None:
+        mode = self.sort_combo.currentData()
+        if isinstance(mode, str):
+            self.list.set_sort_mode(mode)
+
+    def _clear_or_blur_search(self) -> None:
+        if self.search_edit.text():
+            self.search_edit.clear()
+        else:
+            self.list.setFocus(Qt.FocusReason.OtherFocusReason)
 
     def _on_navigated(self, path: str) -> None:
         display = path

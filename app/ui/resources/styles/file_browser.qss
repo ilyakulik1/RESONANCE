@@ -50,10 +50,58 @@ QFrame#fileBrowserToolbar {
     background-color: transparent;
 }
 
+QFrame#fileBrowserFilterRow {
+    background-color: transparent;
+}
+
 QLabel#fileBrowserPath {
     color: {{colors.text_muted}};
     font-size: {{typography.size_sm}};
     padding: 0 {{spacing.sm}};
+}
+
+QLineEdit#fileBrowserSearch {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    border-radius: {{radius.sm}};
+    padding: 2px 6px;
+    font-size: {{typography.size_sm}};
+    min-height: {{sizes.button_min_height}};
+    selection-background-color: {{colors.accent_blue}};
+    selection-color: {{colors.text_on_accent}};
+}
+
+QLineEdit#fileBrowserSearch:focus {
+    border-color: {{colors.border_focus}};
+}
+
+QComboBox#fileBrowserSortCombo {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    border-radius: {{radius.sm}};
+    padding: 2px 6px;
+    font-size: {{typography.size_sm}};
+    min-height: {{sizes.button_min_height}};
+    max-width: 72px;
+}
+
+QComboBox#fileBrowserSortCombo:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QComboBox#fileBrowserSortCombo::drop-down {
+    border: none;
+    width: 14px;
+}
+
+QComboBox#fileBrowserSortCombo QAbstractItemView {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    selection-background-color: {{colors.accent_blue}};
+    selection-color: {{colors.text_on_accent}};
 }
 
 QFrame#fileBrowserPreview {
