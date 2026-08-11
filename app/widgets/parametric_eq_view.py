@@ -453,9 +453,20 @@ class ParametricEqView(QWidget):
     def set_spectrum(self, freqs, db) -> None:
         self.canvas.set_spectrum(freqs, db)
 
+    def set_bypass(self, bypassed: bool) -> None:
+        checked = bool(bypassed)
+        if self._state.bypass == checked and self.btn_bypass.isChecked() == checked:
+            return
+        self.btn_bypass.blockSignals(True)
+        self.btn_bypass.setChecked(checked)
+        self.btn_bypass.blockSignals(False)
+        self._state.bypass = checked
+        self.canvas.update()
+        self.bypassChanged.emit(checked)
+        self._emit_changed()
+
     def _emit_changed(self) -> None:
         self.bandsChanged.emit()
-
     def _on_canvas_edited(self) -> None:
         self._sync_inspector()
         self._emit_changed()

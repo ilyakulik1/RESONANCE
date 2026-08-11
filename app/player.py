@@ -18,6 +18,7 @@ from app.audio_devices import (
     find_audio_output,
     is_no_output_device,
     populate_audio_output_combo,
+    refresh_audio_output_combos,
 )
 from app.audio_utils import is_audio_file
 from app.bpm_detector import BpmDetector
@@ -32,13 +33,16 @@ from app.ui.icon_loader import icon_size, load_icon
 from app.duration_prober import DurationProber
 from app.volume_fader import VolumeFader
 from app.playlist_io import (
+    TRACK_COLOR_PRESETS,
     get_item_bpm,
+    get_item_color,
     get_item_duration,
     get_item_file_path,
     load_playlist_from_entries,
     load_playlist_from_file,
     save_playlist_to_file,
     set_item_bpm,
+    set_item_color,
     set_item_duration,
 )
 from app.project import (
@@ -111,6 +115,8 @@ class AudioPlayer(QMainWindow):
         self._fade_out_started = False
         self._handling_range_end = False
         self._range_end_latched = False
+        # Ignore EOF/range-end while Space (or other) takeover is in progress.
+        self._suppress_range_end = False
         self._pending_space_restart: dict | None = None
         self._time_display_mode = "elapsed"
         self._pending_playback_start = False
@@ -308,6 +314,23 @@ class AudioPlayer(QMainWindow):
         self._apply_preview_output_from_id(combo_selected_device_id(self.preview_output_combo))
         self._apply_browser_output_from_id(combo_selected_device_id(self.browser_output_combo))
 
+    def refresh_audio_output_devices(self) -> None:
+        """Re-scan system audio outputs and refresh all device combos."""
+        combos = []
+        for name in ("air_output_combo", "preview_output_combo", "browser_output_combo"):
+            combo = getattr(self, name, None)
+            if combo is not None:
+                combos.append(combo)
+        if not combos:
+            return
+        refresh_audio_output_combos(*combos)
+        self._air_output_device_id = combo_selected_device_id(self.air_output_combo)
+        self._preview_output_device_id = combo_selected_device_id(self.preview_output_combo)
+        self._browser_output_device_id = combo_selected_device_id(self.browser_output_combo)
+        self._apply_air_output_from_id(self._air_output_device_id)
+        self._apply_preview_output_from_id(self._preview_output_device_id)
+        self._apply_browser_output_from_id(self._browser_output_device_id)
+
     def _apply_air_output_from_id(self, device_id: bytes | None) -> None:
         self._air_no_output = is_no_output_device(device_id)
         if self._air_no_output:
@@ -488,8 +511,6 @@ class AudioPlayer(QMainWindow):
 
     def _reset_bpm_label(self) -> None:
         self.bpm_label.setText("—")
-        if hasattr(self, "file_properties_panel"):
-            self.file_properties_panel.set_bpm(None)
 
     def _set_bpm_label_detecting(self) -> None:
         self.bpm_label.setText("…")
@@ -546,8 +567,6 @@ class AudioPlayer(QMainWindow):
             self.bpm_label.setText(f"{int(bpm)}")
         else:
             self.bpm_label.setText(f"{bpm:.1f}")
-        if hasattr(self, "file_properties_panel"):
-            self.file_properties_panel.set_bpm(float(bpm))
 
     def _setup_air_spectrum(self) -> None:
         """Poll post-EQ spectrum bins from the PCM air player (no second PyAV reader)."""
@@ -561,9 +580,9 @@ class AudioPlayer(QMainWindow):
     def _poll_air_spectrum(self) -> None:
         if not hasattr(self, "file_properties_panel"):
             return
-        if self._properties_collapsed or not self.file_properties_panel.isVisible():
+        if not self.file_properties_panel.isVisible():
             return
-        if self.file_properties_panel.is_eq_collapsed():
+        if self.file_properties_panel.is_bypassed():
             return
         snap = self.player.spectrum_bins_snapshot()
         if snap is None:
@@ -583,14 +602,18 @@ class AudioPlayer(QMainWindow):
             pass
 
     def _update_file_properties(self, file_path: str | None = None) -> None:
-        if not hasattr(self, "file_properties_panel"):
-            return
+        """Bind air EQ to the current on-air track (metadata lives on preview)."""
         path = file_path or self._current_file_path
-        bpm = None
-        if self.current_playing_item is not None:
-            bpm = get_item_bpm(self.current_playing_item)
-        self.file_properties_panel.set_file(path, bpm=bpm)
         self._bind_eq_to_path(path)
+
+    def _update_preview_properties(self, file_path: str | None = None) -> None:
+        if not hasattr(self, "preview_properties_panel"):
+            return
+        path = self._preview_file_path if file_path is None else file_path
+        bpm = None
+        if self._preview_item is not None:
+            bpm = get_item_bpm(self._preview_item)
+        self.preview_properties_panel.set_file(path, bpm=bpm)
 
     def _eq_path_key(self, file_path: str | None = None) -> str | None:
         path = file_path or self._current_file_path or self._displayed_track_path
@@ -649,25 +672,46 @@ class AudioPlayer(QMainWindow):
         player.setSource(QUrl.fromLocalFile(file_path))
 
     def _apply_live_eq_to_air(self) -> None:
-        """Push current EQ coefficients to matching air player(s) immediately."""
+        """Push current EQ coefficients to air player(s) that play the bound track.
+
+        Never stomp the still-fading outgoing deck when the UI has already
+        switched to the incoming track's EQ during a Space/crossfade takeover.
+        """
         if not hasattr(self, "file_properties_panel"):
             return
         state = self.file_properties_panel.eq_state()
         key = self._eq_bound_path
-        # Always refresh the active deck so BYP/RST/DEL are audible even if
-        # path matching fails (symlink / pending source).
+        applied = False
+        for idx, player in enumerate(self._players):
+            try:
+                src = player.source().toLocalFile()
+            except Exception:
+                continue
+            if not src:
+                continue
+            src_abs = os.path.abspath(src)
+            if key is not None:
+                if src_abs == key:
+                    player.set_eq_state(state)
+                    applied = True
+            elif idx == self._active_player_idx:
+                player.set_eq_state(state)
+                applied = True
+        if applied:
+            return
+        # Bound path not loaded yet. During takeover the active deck may still
+        # be the previous track — leave its EQ alone; incoming gets EQ via
+        # _set_air_source when the source is set.
+        if (
+            self._crossfade_active
+            or self._suppress_range_end
+            or self._pending_playback_start
+        ):
+            return
         try:
             self.player.set_eq_state(state)
         except Exception:
             pass
-        if not key:
-            return
-        for idx, player in enumerate(self._players):
-            if idx == self._active_player_idx:
-                continue
-            src = player.source().toLocalFile()
-            if src and os.path.abspath(src) == key:
-                player.set_eq_state(state)
 
     def _on_eq_changed(self) -> None:
         if self._eq_loading:
@@ -700,11 +744,9 @@ class AudioPlayer(QMainWindow):
         self.save_config()
 
     def _apply_properties_collapsed_state(self, collapsed: bool) -> None:
-        if not hasattr(self, "file_properties_panel"):
+        if not hasattr(self, "preview_properties_panel"):
             return
-        self.file_properties_panel.setVisible(not collapsed)
-        if hasattr(self, "properties_expand_btn"):
-            self.properties_expand_btn.setVisible(collapsed)
+        self.preview_properties_panel.setVisible(not collapsed)
         self._sync_view_menu_actions()
 
     def _request_bpm_detection(self, file_path: str) -> None:
@@ -1196,6 +1238,8 @@ class AudioPlayer(QMainWindow):
         self._crossfade_active = False
         self._crossfade_fade_in_ms = 0
         self._crossfade_incoming_ready_to_play = False
+        self._suppress_range_end = False
+        self._pending_transition_fade_ms = 0
 
     def _start_crossfade_transition(
         self,
@@ -1226,6 +1270,9 @@ class AudioPlayer(QMainWindow):
         self._incoming_fader.sync_volume(0.0)
         if not self._air_player_has_loaded_source(incoming_idx, abs_path):
             self._set_air_source(incoming_idx, file_path)
+        else:
+            # Reused deck: still refresh EQ for the incoming path.
+            self._players[incoming_idx].set_eq_state(self._eq_state_for_path(file_path))
 
         self._outgoing_fader.sync_volume(self._playback_volume)
         self._outgoing_fader.fade_to(
@@ -1660,7 +1707,7 @@ class AudioPlayer(QMainWindow):
         self._view_control_panel_act.toggled.connect(self._on_view_control_panel_toggled)
         menu.addAction(self._view_control_panel_act)
 
-        self._view_file_properties_act = QAction("File Properties", self)
+        self._view_file_properties_act = QAction("Preview Properties", self)
         self._view_file_properties_act.setCheckable(True)
         self._view_file_properties_act.toggled.connect(self._on_view_file_properties_toggled)
         menu.addAction(self._view_file_properties_act)
@@ -1776,9 +1823,29 @@ class AudioPlayer(QMainWindow):
         if path and self.project.is_path_in_project(path):
             move_act.setEnabled(False)
             move_act.setText("Already in project")
+
+        color_menu = menu.addMenu("Mark color")
+        current_color = get_item_color(item)
+        clear_act = color_menu.addAction("None")
+        clear_act.setCheckable(True)
+        clear_act.setChecked(current_color is None)
+        color_actions: list[tuple[object, str | None]] = [(clear_act, None)]
+        for label, hex_color in TRACK_COLOR_PRESETS:
+            act = color_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(current_color == hex_color)
+            color_actions.append((act, hex_color))
+
         chosen = menu.exec(playlist.mapToGlobal(pos))
         if chosen is move_act and move_act.isEnabled():
             self.move_selected_track_to_project(playlist)
+            return
+        for act, hex_color in color_actions:
+            if chosen is act:
+                set_item_color(item, hex_color)
+                playlist.viewport().update()
+                self.save_project()
+                return
 
     def _retarget_path_references(self, old_path: str, new_path: str) -> None:
         old_abs = os.path.abspath(old_path)
@@ -2274,9 +2341,6 @@ class AudioPlayer(QMainWindow):
                     )
                 self._eq_bound_path = None
                 self._bind_eq_to_path(self._current_file_path)
-                self.file_properties_panel.set_eq_collapsed(
-                    bool(config.get("eq_collapsed", False))
-                )
 
             if hasattr(self, "control_panel_section"):
                 self.control_panel_section.setVisible(
@@ -2311,11 +2375,6 @@ class AudioPlayer(QMainWindow):
             "browser_autoplay": self._browser_autoplay,
             "browser_collapsed": self._browser_collapsed,
             "properties_collapsed": self._properties_collapsed,
-            "eq_collapsed": (
-                self.file_properties_panel.is_eq_collapsed()
-                if hasattr(self, "file_properties_panel")
-                else False
-            ),
             "track_eq": dict(self._track_eq_state),
             "view_control_panel": (
                 not self.control_panel_section.isHidden()
@@ -2645,6 +2704,13 @@ class AudioPlayer(QMainWindow):
     ) -> None:
         key = os.path.abspath(file_path)
         wf = waveform or self.waveform
+        # Never write another track's on-screen markers onto this path.
+        if wf is self.waveform and self._displayed_track_path:
+            if os.path.abspath(self._displayed_track_path) != key:
+                return
+        if wf is self.preview_waveform and self._preview_displayed_track_path:
+            if os.path.abspath(self._preview_displayed_track_path) != key:
+                return
         state = wf.get_timeline_state()
         self._track_timeline_state[key] = TimelineState(
             range_start_ms=state.range_start_ms,
@@ -2768,6 +2834,7 @@ class AudioPlayer(QMainWindow):
             self._preview_item = item
             self._preview_file_path = file_path
             self.preview_track_info.setText(self.get_track_display_name(item, file_path))
+            self._update_preview_properties(file_path)
             self._clear_preview_playback()
             self.preview_waveform.set_waveform([])
             self.preview_waveform.set_duration(0)
@@ -2797,6 +2864,7 @@ class AudioPlayer(QMainWindow):
             self.preview_waveform.set_waveform([])
         self._prepare_preview_timeline_for_path(file_path)
         self._update_preview_track_info(file_path)
+        self._update_preview_properties(file_path)
         width = self.preview_waveform.width()
         if width > 0 and self._try_apply_cached_waveform(
             self.preview_waveform,
@@ -2892,6 +2960,7 @@ class AudioPlayer(QMainWindow):
         self.preview_waveform.set_duration(0)
         self.preview_waveform.set_position(0)
         self.preview_track_info.setText("No track selected")
+        self._update_preview_properties(None)
         self._update_preview_time_display()
 
     def clear_browser_preview(self) -> None:
@@ -3873,6 +3942,7 @@ class AudioPlayer(QMainWindow):
             self._fade_out_started = False
             self._pending_transition_fade_ms = 0
             self._pending_playback_player_idx = None
+            self._suppress_range_end = False
             self.update_time_display()
             return
 
@@ -3887,6 +3957,7 @@ class AudioPlayer(QMainWindow):
         self._apply_fade_in()
         self._pending_transition_fade_ms = 0
         self._pending_playback_player_idx = None
+        self._suppress_range_end = False
         self.update_time_display()
 
     def _try_begin_pending_playback(self) -> None:
@@ -3975,7 +4046,15 @@ class AudioPlayer(QMainWindow):
 
         fade_ms = self._transition_fade_ms(space_triggered)
         self._pending_transition_fade_ms = fade_ms if switching_track else 0
+        # Block EOF/range-end of the dying track from cancelling this takeover
+        # (common when Space is pressed in the last ~0.5s).
+        if switching_track:
+            self._suppress_range_end = True
         self._cancel_crossfade()
+        if switching_track:
+            # _cancel_crossfade clears suppress; restore for this takeover.
+            self._suppress_range_end = True
+            self._pending_transition_fade_ms = fade_ms
 
         def begin_playback():
             self.volume_fader.cancel()
@@ -4217,6 +4296,8 @@ class AudioPlayer(QMainWindow):
             self._cancel_crossfade()
         self.volume_fader.cancel()
         self._range_end_latched = False
+        self._suppress_range_end = False
+        self._pending_transition_fade_ms = 0
         self._fade_out_started = False
         self.player.stop()
         self._set_output_volume(self._playback_volume)
@@ -4338,6 +4419,8 @@ class AudioPlayer(QMainWindow):
         def finish_stop():
             self.volume_fader.cancel()
             self._range_end_latched = False
+            self._suppress_range_end = False
+            self._pending_transition_fade_ms = 0
             self.player.stop()
             self._set_output_volume(self._playback_volume)
             self._fade_out_started = False
@@ -4417,8 +4500,18 @@ class AudioPlayer(QMainWindow):
                     self._set_output_volume(self._playback_volume)
             self.update_time_display()
 
+    def _should_ignore_range_end(self) -> bool:
+        """True while a track takeover / crossfade must not be interrupted by EOF."""
+        return bool(
+            self._suppress_range_end
+            or self._crossfade_active
+            or self._pending_playback_start
+            or self._handling_range_end
+            or self._range_end_latched
+        )
+
     def _handle_range_end(self) -> None:
-        if self._handling_range_end or self._range_end_latched:
+        if self._should_ignore_range_end():
             return
         self._handling_range_end = True
         try:
@@ -4444,7 +4537,7 @@ class AudioPlayer(QMainWindow):
             self._handling_range_end = False
 
     def _check_fade_out_and_range(self, position: int) -> None:
-        if self._range_end_latched:
+        if self._should_ignore_range_end():
             return
 
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
@@ -4624,7 +4717,8 @@ class AudioPlayer(QMainWindow):
             if player_idx != self._active_player_idx:
                 return
             # Range-end handler already advanced / looped — avoid double NEXT skip.
-            if self._range_end_latched or self._handling_range_end:
+            # Also ignore EOF while Space takeover fade/crossfade is in flight.
+            if self._should_ignore_range_end():
                 return
             if self.playback_mode == "next":
                 if self._current_file_path:

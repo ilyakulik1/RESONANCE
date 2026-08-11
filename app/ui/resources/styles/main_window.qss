@@ -97,6 +97,22 @@ QLabel#previewTrackInfo {
     padding: 0 0 2px 0;
 }
 
+QPushButton#deviceRefreshButton {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    font-size: {{typography.size_md}};
+    padding: 0;
+    min-width: 22px;
+    max-width: 22px;
+    min-height: 18px;
+    max-height: 18px;
+}
+
+QPushButton#deviceRefreshButton:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
 QComboBox#airOutputCombo,
 QComboBox#previewOutputCombo {
     min-height: {{sizes.button_min_height_sm}};

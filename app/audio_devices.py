@@ -68,6 +68,15 @@ def populate_audio_output_combo(combo: QComboBox, *, saved_device_id: bytes | No
     combo.blockSignals(False)
 
 
+def refresh_audio_output_combos(*combos: QComboBox) -> None:
+    """Re-enumerate system outputs, preserving each combo's current selection."""
+    for combo in combos:
+        if combo is None:
+            continue
+        saved = combo_selected_device_id(combo)
+        populate_audio_output_combo(combo, saved_device_id=saved)
+
+
 def combo_selected_device_id(combo: QComboBox) -> bytes | None:
     data = combo.currentData()
     if isinstance(data, (bytes, bytearray)):

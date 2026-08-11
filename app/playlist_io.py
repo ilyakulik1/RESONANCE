@@ -11,6 +11,19 @@ FILE_PATH_ROLE = Qt.ItemDataRole.UserRole
 DURATION_ROLE = Qt.ItemDataRole.UserRole + 1
 BPM_ROLE = Qt.ItemDataRole.UserRole + 2
 FILE_MISSING_ROLE = Qt.ItemDataRole.UserRole + 3
+COLOR_ROLE = Qt.ItemDataRole.UserRole + 4
+
+# Preset mark colors for playlist tracks (stored as #RRGGBB).
+TRACK_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
+    ("Red", "#e45656"),
+    ("Orange", "#e67e22"),
+    ("Yellow", "#f1c40f"),
+    ("Green", "#2ecc71"),
+    ("Teal", "#1abc9c"),
+    ("Blue", "#3897fd"),
+    ("Purple", "#9b59b6"),
+    ("Pink", "#e91e63"),
+)
 
 
 def set_item_file_path(item: QListWidgetItem, file_path: str) -> None:
@@ -99,6 +112,36 @@ def get_item_bpm(item: QListWidgetItem | None) -> float | None:
     return bpm
 
 
+def _normalize_color(value: str | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if not text.startswith("#"):
+        text = f"#{text}"
+    if len(text) == 4:
+        # #RGB → #RRGGBB
+        text = f"#{text[1]*2}{text[2]*2}{text[3]*2}"
+    if len(text) != 7:
+        return None
+    try:
+        int(text[1:], 16)
+    except ValueError:
+        return None
+    return text.lower()
+
+
+def set_item_color(item: QListWidgetItem, color: str | None) -> None:
+    item.setData(COLOR_ROLE, _normalize_color(color))
+
+
+def get_item_color(item: QListWidgetItem | None) -> str | None:
+    if item is None:
+        return None
+    return _normalize_color(item.data(COLOR_ROLE))
+
+
 def _duration_from_entry(entry: dict) -> int | None:
     if "duration_ms" not in entry:
         return None
@@ -150,19 +193,25 @@ def _timeline_to_entry(state: TimelineState) -> dict:
     }
 
 
+def _color_from_entry(entry: dict) -> str | None:
+    if "color" not in entry:
+        return None
+    return _normalize_color(entry.get("color"))
+
+
 def _parse_playlist_entry(
     entry,
-) -> tuple[str | None, str | None, TimelineState | None, float | None, int | None]:
+) -> tuple[str | None, str | None, TimelineState | None, float | None, int | None, str | None]:
     if isinstance(entry, str):
         path = entry.strip()
-        return (path or None), None, None, None, None
+        return (path or None), None, None, None, None, None
 
     if not isinstance(entry, dict):
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     raw_path = entry.get("path") or entry.get("file")
     if not raw_path:
-        return None, None, None, None, None
+        return None, None, None, None, None, None
 
     path = str(raw_path).strip() or None
     name = entry.get("name")
@@ -175,6 +224,7 @@ def _parse_playlist_entry(
         _timeline_from_entry(entry),
         _bpm_from_entry(entry),
         _duration_from_entry(entry),
+        _color_from_entry(entry),
     )
 
 
@@ -203,22 +253,29 @@ def _resolve_file_path(path: str) -> tuple[str, bool]:
 
 def _parse_playlist_file(
     path: str,
-) -> tuple[list[tuple[str, str | None, TimelineState | None, float | None, int | None, bool]], int]:
+) -> tuple[
+    list[tuple[str, str | None, TimelineState | None, float | None, int | None, bool, str | None]],
+    int,
+]:
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
 
     if not isinstance(data, list):
         raise ValueError("Playlist file must contain a JSON array")
 
-    parsed: list[tuple[str, str | None, TimelineState | None, float | None, int | None, bool]] = []
+    parsed: list[
+        tuple[str, str | None, TimelineState | None, float | None, int | None, bool, str | None]
+    ] = []
     skipped = 0
     for entry in data:
-        file_path, display_name, timeline, bpm, duration_ms = _parse_playlist_entry(entry)
+        file_path, display_name, timeline, bpm, duration_ms, color = _parse_playlist_entry(entry)
         if not file_path:
             skipped += 1
             continue
         resolved_path, exists = _resolve_file_path(file_path)
-        parsed.append((resolved_path, display_name, timeline, bpm, duration_ms, exists))
+        parsed.append(
+            (resolved_path, display_name, timeline, bpm, duration_ms, exists, color)
+        )
     return parsed, skipped
 
 
@@ -245,6 +302,9 @@ def _playlist_item_to_entry(
     bpm = get_item_bpm(item)
     if bpm is not None:
         entry["bpm"] = _bpm_to_entry(bpm)
+    color = get_item_color(item)
+    if color is not None:
+        entry["color"] = color
     return entry
 
 
@@ -294,6 +354,7 @@ def _add_playlist_entry(
     timeline_states: dict[str, TimelineState] | None,
     bpm: float | None = None,
     duration_ms: int | None = None,
+    color: str | None = None,
     *,
     file_exists: bool | None = None,
 ) -> None:
@@ -320,6 +381,8 @@ def _add_playlist_entry(
             set_item_duration(item, duration_ms)
         if bpm is not None:
             set_item_bpm(item, bpm)
+        if color is not None:
+            set_item_color(item, color)
 
     if timeline_states is not None and timeline is not None:
         timeline_states[os.path.abspath(file_path)] = timeline
@@ -341,7 +404,7 @@ def load_playlist_from_file(
 
     added = 0
     missing = 0
-    for file_path, display_name, timeline, bpm, duration_ms, exists in parsed:
+    for file_path, display_name, timeline, bpm, duration_ms, exists, color in parsed:
         _add_playlist_entry(
             playlist_widget,
             file_path,
@@ -350,6 +413,7 @@ def load_playlist_from_file(
             timeline_states,
             bpm=bpm,
             duration_ms=duration_ms,
+            color=color,
             file_exists=exists,
         )
         added += 1
@@ -376,7 +440,7 @@ def load_playlist_from_entries(
         if not isinstance(entry, dict):
             skipped += 1
             continue
-        file_path, display_name, timeline, bpm, duration_ms = _parse_playlist_entry(entry)
+        file_path, display_name, timeline, bpm, duration_ms, color = _parse_playlist_entry(entry)
         if not file_path:
             skipped += 1
             continue
@@ -394,6 +458,7 @@ def load_playlist_from_entries(
             timeline_states,
             bpm=bpm,
             duration_ms=duration_ms,
+            color=color,
             file_exists=exists,
         )
         added += 1

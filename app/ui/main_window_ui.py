@@ -54,21 +54,19 @@ class MainWindowUi:
         audio_layout.setContentsMargins(0, 0, 0, 0)
         audio_layout.setSpacing(0)
         window.control_panel_section = self._build_control_panel(window)
-        window.timeline_section = self._build_timeline(window)
         window.playlist_section = self._build_playlists(window)
 
         from app.widgets.file_properties_panel import (
             FilePropertiesPanel,
-            make_properties_expand_button,
+            PreviewPropertiesPanel,
         )
 
         window.file_properties_panel = FilePropertiesPanel(window)
-        window.file_properties_panel.collapseRequested.connect(
-            window.collapse_file_properties
-        )
         window.file_properties_panel.eqChanged.connect(window._on_eq_changed)
-        window.properties_expand_btn = make_properties_expand_button(window)
-        window.properties_expand_btn.clicked.connect(window.expand_file_properties)
+
+        window.preview_properties_panel = PreviewPropertiesPanel(window)
+
+        window.timeline_section = self._build_timeline(window)
 
         top_row = QWidget()
         top_row.setObjectName("audioTopRow")
@@ -76,7 +74,6 @@ class MainWindowUi:
         top_row_layout.setContentsMargins(0, 0, 0, 0)
         top_row_layout.setSpacing(6)
         top_row_layout.addWidget(window.control_panel_section, 3)
-        top_row_layout.addWidget(window.properties_expand_btn, 0)
         top_row_layout.addWidget(window.file_properties_panel, 2)
         window.audio_top_row = top_row
 
@@ -410,36 +407,51 @@ class MainWindowUi:
         return section
 
     def _build_timeline(self, window: AudioPlayer) -> QWidget:
-        """Таймлайн: эфир и предпросмотр с отдельными waveform и устройствами вывода."""
+        """Одна линия: air waveform | preview waveform (+ inline properties)."""
         section = QFrame()
         section.setObjectName("timelineSection")
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 8)
         layout.setSpacing(4)
 
-        layout.addWidget(SectionHeader("TIMELINE"))
+        header_row = QHBoxLayout()
+        header_row.setContentsMargins(0, 0, 0, 0)
+        header_row.setSpacing(6)
+        header_row.addWidget(SectionHeader("TIMELINE"), 1)
+        window.btn_refresh_devices = QPushButton("↻")
+        window.btn_refresh_devices.setObjectName("deviceRefreshButton")
+        window.btn_refresh_devices.setToolTip("Refresh audio output device list")
+        window.btn_refresh_devices.setFixedSize(22, 18)
+        window.btn_refresh_devices.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        window.btn_refresh_devices.setAutoDefault(False)
+        window.btn_refresh_devices.setDefault(False)
+        window.btn_refresh_devices.clicked.connect(window.refresh_audio_output_devices)
+        header_row.addWidget(window.btn_refresh_devices, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addLayout(header_row)
 
-        device_row = QHBoxLayout()
-        device_row.setSpacing(12)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+
+        # --- Air column ---
+        air_col = QFrame()
+        air_col.setObjectName("airWaveformColumn")
+        air_layout = QVBoxLayout(air_col)
+        air_layout.setContentsMargins(0, 0, 0, 0)
+        air_layout.setSpacing(4)
+        air_layout.addWidget(SectionHeader("ON AIR"))
+
+        air_device_row = QHBoxLayout()
+        air_device_row.setSpacing(6)
         air_device_label = QLabel("AIR OUTPUT")
         air_device_label.setObjectName("sectionLabel")
         window.air_output_combo = QComboBox()
         window.air_output_combo.setObjectName("airOutputCombo")
         window.air_output_combo.setToolTip("Audio output device for on-air playback")
-        preview_device_label = QLabel("PREVIEW OUTPUT")
-        preview_device_label.setObjectName("sectionLabel")
-        window.preview_output_combo = QComboBox()
-        window.preview_output_combo.setObjectName("previewOutputCombo")
-        window.preview_output_combo.setToolTip("Audio output device for preview / PFL")
-        device_row.addWidget(air_device_label)
-        device_row.addWidget(window.air_output_combo, 1)
-        device_row.addSpacing(8)
-        device_row.addWidget(preview_device_label)
-        device_row.addWidget(window.preview_output_combo, 1)
-        layout.addLayout(device_row)
-
-        layout.addWidget(SectionHeader("ON AIR"))
-        layout.addLayout(self._build_waveform_row(
+        air_device_row.addWidget(air_device_label)
+        air_device_row.addWidget(window.air_output_combo, 1)
+        air_layout.addLayout(air_device_row)
+        air_layout.addLayout(self._build_waveform_row(
             window,
             waveform_attr="waveform",
             zoom_reset_attr="btn_zoom_reset",
@@ -451,15 +463,40 @@ class MainWindowUi:
             rewind_slot=window.rewind_to_start,
             res_slot=window.on_waveform_res_toggled,
         ))
+        row.addWidget(air_col, 1)
 
-        layout.addWidget(SectionHeader("PREVIEW"))
-        preview_track_row = QHBoxLayout()
+        # --- Preview column ---
+        preview_col = QFrame()
+        preview_col.setObjectName("previewWaveformColumn")
+        preview_layout = QVBoxLayout(preview_col)
+        preview_layout.setContentsMargins(0, 0, 0, 0)
+        preview_layout.setSpacing(4)
+        preview_layout.addWidget(SectionHeader("PREVIEW"))
+
+        preview_device_row = QHBoxLayout()
+        preview_device_row.setSpacing(6)
+        preview_device_label = QLabel("PREVIEW OUTPUT")
+        preview_device_label.setObjectName("sectionLabel")
+        window.preview_output_combo = QComboBox()
+        window.preview_output_combo.setObjectName("previewOutputCombo")
+        window.preview_output_combo.setToolTip("Audio output device for preview / PFL")
+        preview_device_row.addWidget(preview_device_label)
+        preview_device_row.addWidget(window.preview_output_combo, 1)
+        preview_layout.addLayout(preview_device_row)
+
+        track_meta_row = QHBoxLayout()
+        track_meta_row.setContentsMargins(0, 0, 0, 0)
+        track_meta_row.setSpacing(8)
         window.preview_track_info = QLabel("No track selected")
         window.preview_track_info.setObjectName("previewTrackInfo")
         window.preview_track_info.setWordWrap(True)
-        preview_track_row.addWidget(window.preview_track_info, 1)
-        layout.addLayout(preview_track_row)
-        layout.addLayout(self._build_waveform_row(
+        track_meta_row.addWidget(window.preview_track_info, 1)
+        track_meta_row.addWidget(
+            window.preview_properties_panel, 0, Qt.AlignmentFlag.AlignRight
+        )
+        preview_layout.addLayout(track_meta_row)
+
+        preview_layout.addLayout(self._build_waveform_row(
             window,
             waveform_attr="preview_waveform",
             zoom_reset_attr="btn_preview_zoom_reset",
@@ -476,7 +513,9 @@ class MainWindowUi:
             stop_slot=window.preview_stop,
             autoplay_slot=window.on_preview_autoplay_toggled,
         ))
+        row.addWidget(preview_col, 1)
 
+        layout.addLayout(row)
         return section
 
     @staticmethod

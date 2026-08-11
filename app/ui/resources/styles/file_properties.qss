@@ -1,13 +1,18 @@
-/* File properties + parametric EQ */
+/* Equalizer + preview properties */
 
 QFrame#filePropertiesPanel {
     background-color: {{colors.bg_primary}};
-    min-width: 160px;
+    min-width: 80px;
 }
 
-QFrame#propertiesMetaFrame {
+QFrame#previewPropertiesPanel {
+    background-color: transparent;
+}
+
+QFrame#previewMetaChip {
     background-color: {{colors.bg_surface}};
     border: 1px solid {{colors.border}};
+    border-radius: 3px;
 }
 
 QLabel#propertiesMetaKey {
@@ -18,47 +23,6 @@ QLabel#propertiesMetaKey {
 QLabel#propertiesMetaValue {
     color: {{colors.text_primary}};
     font-size: {{typography.size_xs}};
-}
-
-QLabel#propertiesEqTitle {
-    color: {{colors.text_muted}};
-    font-size: {{typography.size_xs}};
-    font-weight: bold;
-}
-
-QToolButton#propertiesCollapseBtn,
-QToolButton#eqSectionToggle {
-    background-color: {{colors.bg_control}};
-    color: {{colors.text_primary}};
-    border: none;
-    min-width: 22px;
-    max-width: 28px;
-    min-height: 18px;
-    max-height: 18px;
-    font-size: {{typography.size_xs}};
-    padding: 0 2px;
-}
-
-QToolButton#eqSectionToggle:checked {
-    background-color: {{colors.accent_blue}};
-    color: {{colors.text_on_accent}};
-}
-
-QToolButton#propertiesCollapseBtn:hover,
-QToolButton#eqSectionToggle:hover {
-    background-color: {{colors.bg_control_hover}};
-}
-
-QPushButton#propertiesExpandBtn {
-    background-color: {{colors.bg_control}};
-    color: {{colors.text_primary}};
-    border: none;
-    font-size: {{typography.size_sm}};
-    padding: 0;
-}
-
-QPushButton#propertiesExpandBtn:hover {
-    background-color: {{colors.bg_control_hover}};
 }
 
 QWidget#eqCanvas {

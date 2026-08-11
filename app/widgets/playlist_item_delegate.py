@@ -6,7 +6,7 @@ from PyQt6.QtCore import Qt, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QPainter
 from PyQt6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionViewItem
 
-from app.playlist_io import BPM_ROLE, DURATION_ROLE, is_item_file_missing
+from app.playlist_io import BPM_ROLE, COLOR_ROLE, DURATION_ROLE, is_item_file_missing
 from app.time_utils import format_time_ms
 from app.ui.tokens import get_token
 
@@ -32,6 +32,17 @@ def _bpm_from_index(index) -> float | None:
     if bpm <= 0:
         return None
     return bpm
+
+
+def _color_from_index(index) -> QColor | None:
+    value = index.data(COLOR_ROLE)
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    color = QColor(text)
+    return color if color.isValid() else None
 
 
 def _format_bpm(bpm: float) -> str:
@@ -107,14 +118,23 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         *,
         selected: bool,
         hovered: bool,
+        mark: QColor | None = None,
     ) -> QColor:
         if selected:
             return self._color("accent_blue", "#3897fd")
         if hovered:
-            return self._color("bg_item_hover", "#333333")
-        if row % 2 == 0:
-            return self._color("bg_surface", "#262626")
-        return self._color("playlist_row_alt", "#2c2c2c")
+            base = self._color("bg_item_hover", "#333333")
+        elif row % 2 == 0:
+            base = self._color("bg_surface", "#262626")
+        else:
+            base = self._color("playlist_row_alt", "#2c2c2c")
+        if mark is None or not mark.isValid():
+            return base
+        tinted = QColor(base)
+        tinted.setRed(min(255, (tinted.red() * 2 + mark.red()) // 3))
+        tinted.setGreen(min(255, (tinted.green() * 2 + mark.green()) // 3))
+        tinted.setBlue(min(255, (tinted.blue() * 2 + mark.blue()) // 3))
+        return tinted
 
     def _badge_colors(self, *, selected: bool) -> tuple[QColor, QColor]:
         if selected:
@@ -156,7 +176,14 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(option.rect, self._row_background(row, selected=selected, hovered=hovered))
+        mark = _color_from_index(index)
+        painter.fillRect(
+            option.rect,
+            self._row_background(row, selected=selected, hovered=hovered, mark=mark),
+        )
+        if mark is not None and mark.isValid() and not selected:
+            strip = QRect(option.rect.left(), option.rect.top(), 3, option.rect.height())
+            painter.fillRect(strip, mark)
 
         badge_bg, badge_fg = self._badge_colors(selected=selected)
         index_text = str(row + 1)
