@@ -22,7 +22,6 @@ def load_application_theme() -> str:
         "file_properties",
         "playlist",
         "file_browser",
-        "video_mixer",
     )
     return "\n\n".join(load_stylesheet(part) for part in parts)
 

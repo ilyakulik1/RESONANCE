@@ -37,7 +37,7 @@ class MainWindowUi:
     """Создаёт виджеты и layout'ы, привязывает их к окну-плееру."""
 
     def setup_ui(self, window: AudioPlayer) -> None:
-        """Корневой layout: файловый браузер | аудио-UI | Video Mixer."""
+        """Корневой layout: файловый браузер | аудио-UI с плейлистами."""
         central = QWidget()
         central.setObjectName("centralWidget")
         window.setCentralWidget(central)
@@ -130,11 +130,7 @@ class MainWindowUi:
         left_wrap_layout.setSpacing(0)
         left_wrap_layout.addWidget(browser_expand)
         left_wrap_layout.addWidget(left_splitter, 1)
-
-        from app.video_mixer.controller import VideoMixerController
-
-        window.video_mixer = VideoMixerController(window)
-        window.video_mixer.attach_to_layout(root, left_wrap, stretch=1)
+        root.addWidget(left_wrap, 1)
 
         window.audio_output.setVolume(window._playback_volume)
         window.setFocusPolicy(Qt.FocusPolicy.NoFocus)

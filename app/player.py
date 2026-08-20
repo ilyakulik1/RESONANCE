@@ -104,6 +104,7 @@ class AudioPlayer(QMainWindow):
         ]
         self.project = ProjectManager(_peek_saved_project_root())
         self._pending_project_root = str(self.project.root)
+        self._project_video_mixer: dict | None = None
 
         self.last_selected_playlist = None
         self._is_window_resizing = False
@@ -118,6 +119,11 @@ class AudioPlayer(QMainWindow):
         # Ignore EOF/range-end while Space (or other) takeover is in progress.
         self._suppress_range_end = False
         self._pending_space_restart: dict | None = None
+        self._stop_fade_active = False
+        self._stop_fade_path: str | None = None
+        self._stop_fade_item = None
+        self._stop_fade_playlist_num: int | None = None
+        self._queued_after_stop_fade: dict | None = None
         self._time_display_mode = "elapsed"
         self._pending_playback_start = False
         self._pending_start_ms: int | None = None
@@ -1722,11 +1728,6 @@ class AudioPlayer(QMainWindow):
         self._view_playlists_act.toggled.connect(self._on_view_playlists_toggled)
         menu.addAction(self._view_playlists_act)
 
-        self._view_video_mixer_act = QAction("Video Mixer", self)
-        self._view_video_mixer_act.setCheckable(True)
-        self._view_video_mixer_act.toggled.connect(self._on_view_video_mixer_toggled)
-        menu.addAction(self._view_video_mixer_act)
-
         self._sync_view_menu_actions()
 
     def _setup_about_menu(self) -> None:
@@ -1742,7 +1743,6 @@ class AudioPlayer(QMainWindow):
             getattr(self, "_view_file_properties_act", None),
             getattr(self, "_view_timeline_act", None),
             getattr(self, "_view_playlists_act", None),
-            getattr(self, "_view_video_mixer_act", None),
         )
         if not all(actions):
             return
@@ -1769,10 +1769,6 @@ class AudioPlayer(QMainWindow):
                 self._view_playlists_act,
                 not self.playlist_section.isHidden(),
             )
-        mixer_visible = True
-        if hasattr(self, "video_mixer"):
-            mixer_visible = not self.video_mixer.model.panel_collapsed
-        set_checked(self._view_video_mixer_act, mixer_visible)
 
     def _on_view_file_browser_toggled(self, checked: bool) -> None:
         if checked:
@@ -1800,14 +1796,6 @@ class AudioPlayer(QMainWindow):
         if hasattr(self, "playlist_section"):
             self.playlist_section.setVisible(checked)
             self.save_config()
-
-    def _on_view_video_mixer_toggled(self, checked: bool) -> None:
-        if not hasattr(self, "video_mixer"):
-            return
-        if checked:
-            self.video_mixer.expand_panel()
-        else:
-            self.video_mixer.collapse_panel()
 
     def _show_about_dialog(self) -> None:
         show_about_dialog(self)
@@ -1913,11 +1901,6 @@ class AudioPlayer(QMainWindow):
             if i < len(self.font_size_spins):
                 pl_state.font_size = self.font_size_spins[i].value()
 
-        video_mixer = None
-        if hasattr(self, "video_mixer") and self.video_mixer is not None:
-            self.video_mixer.import_media_into_project()
-            video_mixer = self.video_mixer.export_state()
-
         return ProjectState(
             name=self.project.name,
             playlists=playlists,
@@ -1927,7 +1910,7 @@ class AudioPlayer(QMainWindow):
                 for path, state in self._track_timeline_state.items()
             },
             track_eq=dict(self._track_eq_state),
-            video_mixer=video_mixer,
+            video_mixer=self._project_video_mixer,
         )
 
     def save_project(self) -> None:
@@ -1949,26 +1932,6 @@ class AudioPlayer(QMainWindow):
         except Exception as exc:
             print(f"Error saving project: {exc}")
             QMessageBox.warning(self, "Project", f"Could not save project:\n{exc}")
-        finally:
-            self._saving_project = False
-
-    def save_video_mixer_only(self) -> None:
-        """Persist mixer state without playlist/analysis refresh (keeps air smooth)."""
-        if getattr(self, "_saving_project", False):
-            return
-        if not hasattr(self, "video_mixer") or self.video_mixer is None:
-            return
-        self._saving_project = True
-        try:
-            state = self.project.load_raw()
-            if state is None:
-                state = self._build_project_state()
-            else:
-                # Skip import_media_into_project here — can copy files and re-sync.
-                state.video_mixer = self.video_mixer.export_state()
-            self.project.save_raw(state)
-        except Exception as exc:
-            print(f"Error saving video mixer: {exc}")
         finally:
             self._saving_project = False
 
@@ -1994,8 +1957,6 @@ class AudioPlayer(QMainWindow):
         self.project.open(target)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
-        if hasattr(self, "video_mixer") and self.video_mixer is not None:
-            self.video_mixer.bind_project_root(self.project.root)
         self.save_project()
         self.save_config()
 
@@ -2020,6 +1981,7 @@ class AudioPlayer(QMainWindow):
             return
         target = Path(chosen)
         self.project.create_new(target)
+        self._project_video_mixer = None
         self._apply_project_state(
             ProjectState(
                 name=self.project.name,
@@ -2115,8 +2077,7 @@ class AudioPlayer(QMainWindow):
             if hasattr(self, "columns_stepper"):
                 self.columns_stepper.set_value(state.playlist_columns)
 
-        if hasattr(self, "video_mixer") and self.video_mixer is not None:
-            self.video_mixer.apply_project_state(state.video_mixer)
+        self._project_video_mixer = state.video_mixer
 
     def load_project(self) -> None:
         state = self.project.load_raw()
@@ -2127,39 +2088,11 @@ class AudioPlayer(QMainWindow):
                 self.save_project()
             if hasattr(self, "file_browser"):
                 self.file_browser.set_project_root(str(self.project.root), self.project.name)
-            self._migrate_legacy_video_mixer_if_needed()
             return
-
-        migrated_mixer = False
-        if state.video_mixer is None:
-            legacy = self._legacy_video_mixer_dict()
-            if legacy is not None:
-                state.video_mixer = legacy
-                migrated_mixer = True
 
         self._apply_project_state(state)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
-        if migrated_mixer:
-            self.save_project()
-
-    def _legacy_video_mixer_dict(self) -> dict | None:
-        path = get_config_path("video_mixer.json")
-        if not path.is_file():
-            return None
-        try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            return None
-        return data if isinstance(data, dict) else None
-
-    def _migrate_legacy_video_mixer_if_needed(self) -> None:
-        if not hasattr(self, "video_mixer") or self.video_mixer is None:
-            return
-        legacy = self._legacy_video_mixer_dict()
-        self.video_mixer.apply_project_state(legacy)
-        if legacy is not None:
-            self.save_project()
 
     def load_config(self):
         if not self.config_path.exists():
@@ -4018,6 +3951,14 @@ class AudioPlayer(QMainWindow):
     ) -> bool:
         if not file_path or not os.path.isfile(file_path):
             return False
+        if self._queue_play_after_stop_fade(
+            file_path,
+            space_triggered=space_triggered,
+            preserve_range_latch=preserve_range_latch,
+            start_ms=start_ms,
+            force_restart=force_restart,
+        ):
+            return True
 
         self._pending_space_restart = None
         abs_path = os.path.abspath(file_path)
@@ -4270,14 +4211,10 @@ class AudioPlayer(QMainWindow):
             return
         if not self._is_playback_active() and not self.player.source().isValid():
             return
-        preview_at_arm = None
-        if self._preview_file_path and os.path.isfile(self._preview_file_path):
-            preview_at_arm = os.path.abspath(self._preview_file_path)
         self._pending_space_restart = {
             "path": path,
             "item": item,
             "playlist_num": playlist_num,
-            "preview_path_at_arm": preview_at_arm,
         }
 
     def _restart_pending_air_track(self) -> bool:
@@ -4291,7 +4228,12 @@ class AudioPlayer(QMainWindow):
         if not path or not item or playlist_num is None or not os.path.isfile(path):
             return False
 
-        # Abort an in-progress stop fade so Space can restart immediately.
+        # Abort an in-progress stop fade so Space can restart the same track.
+        self._stop_fade_active = False
+        self._queued_after_stop_fade = None
+        self._stop_fade_path = None
+        self._stop_fade_item = None
+        self._stop_fade_playlist_num = None
         if self._crossfade_active:
             self._cancel_crossfade()
         self.volume_fader.cancel()
@@ -4306,19 +4248,38 @@ class AudioPlayer(QMainWindow):
         self.current_playing_item = item
         return self.play_file(path, force_restart=True)
 
+    def _preview_differs_from_track(self, path: str | None, item=None) -> bool:
+        """True if preview/selection is a different playable track than path/item."""
+        if self._preview_file_path and self._preview_item and os.path.isfile(
+            self._preview_file_path
+        ):
+            preview_path = os.path.abspath(self._preview_file_path)
+            if path and preview_path != os.path.abspath(path):
+                return True
+            if item is not None and self._preview_item is not item:
+                return True
+            return False
+
+        _playlist_num, selected = self.get_selected_track()
+        if selected is None:
+            return False
+        selected_path = get_item_file_path(selected)
+        if not selected_path or not os.path.isfile(selected_path):
+            return False
+        if path and os.path.abspath(selected_path) != os.path.abspath(path):
+            return True
+        if item is not None and selected is not item:
+            return True
+        return False
+
     def _should_consume_space_restart(self) -> bool:
-        """True when Escape-restart should win over the current preview."""
+        """Restart the stopped air track only if that same track is still selected."""
         pending = self._pending_space_restart
         if not pending or not pending.get("path"):
             return False
-        if not self._preview_file_path or not self._preview_item:
-            return True
-        if not os.path.isfile(self._preview_file_path):
-            return True
-        preview_now = os.path.abspath(self._preview_file_path)
-        preview_at_arm = pending.get("preview_path_at_arm")
-        # User picked another preview after Escape → prefer that track.
-        if preview_at_arm and preview_now != preview_at_arm:
+        # Another selected/preview track must go to air, even if it was
+        # already chosen before Escape/Stop (e.g. advance-on-space).
+        if self._preview_differs_from_track(pending.get("path"), pending.get("item")):
             return False
         return True
 
@@ -4393,23 +4354,65 @@ class AudioPlayer(QMainWindow):
     def toggle_play(self):
         if self._crossfade_active:
             self._cancel_crossfade()
+        if self._stop_fade_active:
+            if self._preview_differs_from_track(
+                self._stop_fade_path or self._current_file_path,
+                self._stop_fade_item or self.current_playing_item,
+            ):
+                self._pending_space_restart = None
+                if self._preview_file_path and self._preview_item:
+                    self.take_preview_to_air()
+                    return
+                playlist_num, item = self.get_selected_track()
+                if playlist_num and item:
+                    self.load_preview_track(playlist_num, item)
+                    self.take_preview_to_air()
+            return
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.volume_fader.cancel()
             self._set_output_volume(self._playback_volume)
             self.player.pause()
             self.update_track_info_ready()
-        elif self.player.source().isValid():
+            return
+        if (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.StoppedState
+            and self._preview_differs_from_track(
+                self._current_file_path,
+                self.current_playing_item,
+            )
+        ):
+            self._pending_space_restart = None
+            if self._preview_file_path and self._preview_item:
+                self.take_preview_to_air()
+                return
+            playlist_num, item = self.get_selected_track()
+            if playlist_num and item:
+                self.load_preview_track(playlist_num, item)
+                self.take_preview_to_air()
+                return
+        if self.player.source().isValid():
             self._resume_with_fade()
 
     def pause(self):
         if self._crossfade_active:
             self._cancel_crossfade()
+        if self._stop_fade_active:
+            self._stop_fade_active = False
+            self._queued_after_stop_fade = None
+            self._stop_fade_path = None
+            self._stop_fade_item = None
+            self._stop_fade_playlist_num = None
         self.volume_fader.cancel()
         self._set_output_volume(self._playback_volume)
         self.player.pause()
         self.update_track_info_ready()
 
     def stop(self):
+        if self._stop_fade_active:
+            # Second Stop cancels a queued next track but keeps the fade-out.
+            self._clear_queued_after_stop_fade(restore_air_identity=True)
+            return
+
         self._arm_space_restart_from_air()
         if self._crossfade_active:
             self._cancel_crossfade()
@@ -4417,6 +4420,12 @@ class AudioPlayer(QMainWindow):
         is_active = self._is_playback_active()
 
         def finish_stop():
+            queued = self._queued_after_stop_fade
+            self._stop_fade_active = False
+            self._stop_fade_path = None
+            self._stop_fade_item = None
+            self._stop_fade_playlist_num = None
+            self._queued_after_stop_fade = None
             self.volume_fader.cancel()
             self._range_end_latched = False
             self._suppress_range_end = False
@@ -4424,13 +4433,79 @@ class AudioPlayer(QMainWindow):
             self.player.stop()
             self._set_output_volume(self._playback_volume)
             self._fade_out_started = False
+            if queued:
+                self._start_queued_after_stop_fade(queued)
+                return
             self.update_track_info_ready()
             self.update_time_display()
 
         if fade_ms > 0 and is_active:
+            self._stop_fade_active = True
+            self._stop_fade_path = (
+                os.path.abspath(self._current_file_path)
+                if self._current_file_path
+                else None
+            )
+            self._stop_fade_item = self.current_playing_item
+            self._stop_fade_playlist_num = self.current_playing_playlist
+            self._suppress_range_end = True
             self._apply_fade_out(finish_stop, use_spinbox=True)
         else:
             finish_stop()
+
+    def _queue_play_after_stop_fade(
+        self,
+        file_path: str,
+        *,
+        space_triggered: bool = False,
+        preserve_range_latch: bool = False,
+        start_ms: int | None = None,
+        force_restart: bool = False,
+    ) -> bool:
+        """Hold a next-track start until Stop fade-out finishes."""
+        if not self._stop_fade_active:
+            return False
+        if not self.volume_fader.is_active:
+            self._stop_fade_active = False
+            return False
+        fading = self._stop_fade_path
+        if fading and os.path.abspath(file_path) == fading:
+            return False
+        self._queued_after_stop_fade = {
+            "file_path": file_path,
+            "space_triggered": space_triggered,
+            "preserve_range_latch": preserve_range_latch,
+            "start_ms": start_ms,
+            "force_restart": force_restart,
+            "playlist_num": self.current_playing_playlist,
+            "item": self.current_playing_item,
+        }
+        return True
+
+    def _clear_queued_after_stop_fade(self, *, restore_air_identity: bool = False) -> None:
+        queued = self._queued_after_stop_fade
+        self._queued_after_stop_fade = None
+        if not restore_air_identity or not queued:
+            return
+        if self._stop_fade_playlist_num is not None:
+            self.current_playing_playlist = self._stop_fade_playlist_num
+        if self._stop_fade_item is not None:
+            self.current_playing_item = self._stop_fade_item
+
+    def _start_queued_after_stop_fade(self, queued: dict) -> None:
+        playlist_num = queued.get("playlist_num")
+        item = queued.get("item")
+        if playlist_num is not None:
+            self.current_playing_playlist = playlist_num
+        if item is not None:
+            self.current_playing_item = item
+        self.play_file(
+            queued["file_path"],
+            space_triggered=bool(queued.get("space_triggered")),
+            preserve_range_latch=bool(queued.get("preserve_range_latch")),
+            start_ms=queued.get("start_ms"),
+            force_restart=bool(queued.get("force_restart", True)),
+        )
 
     def _playlist_index(self, playlist_num: int) -> int:
         return playlist_num - 1
@@ -4504,6 +4579,7 @@ class AudioPlayer(QMainWindow):
         """True while a track takeover / crossfade must not be interrupted by EOF."""
         return bool(
             self._suppress_range_end
+            or self._stop_fade_active
             or self._crossfade_active
             or self._pending_playback_start
             or self._handling_range_end
@@ -4762,8 +4838,6 @@ class AudioPlayer(QMainWindow):
         self.browser_waveform_loader.shutdown()
         if self._spectrum_timer is not None:
             self._spectrum_timer.stop()
-        if hasattr(self, "video_mixer") and self.video_mixer is not None:
-            self.video_mixer.shutdown()
         self.save_project()
         self.save_config()
         event.accept()
