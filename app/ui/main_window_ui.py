@@ -68,17 +68,26 @@ class MainWindowUi:
 
         window.timeline_section = self._build_timeline(window)
 
-        top_row = QWidget()
-        top_row.setObjectName("audioTopRow")
-        top_row_layout = QHBoxLayout(top_row)
-        top_row_layout.setContentsMargins(0, 0, 0, 0)
-        top_row_layout.setSpacing(6)
-        top_row_layout.addWidget(window.control_panel_section, 3)
-        top_row_layout.addWidget(window.file_properties_panel, 2)
-        window.audio_top_row = top_row
+        # Left stack: Control → ON AIR → PREVIEW; EQ to the right
+        left_stack = QWidget()
+        left_stack.setObjectName("audioLeftStack")
+        left_stack_layout = QVBoxLayout(left_stack)
+        left_stack_layout.setContentsMargins(0, 0, 0, 0)
+        left_stack_layout.setSpacing(4)
+        left_stack_layout.addWidget(window.control_panel_section, 0)
+        left_stack_layout.addWidget(window.timeline_section, 0)
 
-        audio_layout.addWidget(top_row)
-        audio_layout.addWidget(window.timeline_section)
+        main_row = QWidget()
+        main_row.setObjectName("audioMainRow")
+        main_row_layout = QHBoxLayout(main_row)
+        main_row_layout.setContentsMargins(0, 0, 0, 0)
+        main_row_layout.setSpacing(6)
+        main_row_layout.addWidget(left_stack, 3)
+        main_row_layout.addWidget(window.file_properties_panel, 2)
+        window.audio_top_row = main_row
+        window.audio_left_stack = left_stack
+
+        audio_layout.addWidget(main_row)
         audio_layout.addWidget(window.playlist_section, 1)
 
         project_root = getattr(window, "_pending_project_root", None)
@@ -137,209 +146,82 @@ class MainWindowUi:
         window.set_playlist_columns(2)
 
     def _build_control_panel(self, window: AudioPlayer) -> QWidget:
-        """Верхняя секция: слева трек/BPM и управление, справа блок времени."""
+        """Две линии: подписи сверху, виджеты снизу; время справа."""
         section = QFrame()
         section.setObjectName("controlPanelSection")
         layout = QVBoxLayout(section)
-        layout.setContentsMargins(0, 0, 0, 8)
-        layout.setSpacing(6)
+        layout.setContentsMargins(0, 0, 0, 2)
+        layout.setSpacing(2)
 
-        layout.addWidget(SectionHeader("CONTROL PANEL"))
+        control_row_height = get_token_int("sizes.stepper_value", 26)
 
-        # --- Основная строка: [левая колонка | блок времени] ---
-        main_row = QHBoxLayout()
-        main_row.setSpacing(8)
+        window.btn_previous = None
+        window.btn_next = None
+        window.btn_play = None
+        window.btn_pause = None
+        window.btn_stop = None
 
-        card_height = 50
-        bpm_width = 70
-        time_width = 200
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(12)
+        grid.setVerticalSpacing(2)
+        col = 0
 
-        left_col = QVBoxLayout()
-        left_col.setSpacing(6)
+        def add_labeled(label_text: str, widget: QWidget) -> None:
+            nonlocal col
+            lbl = QLabel(label_text)
+            lbl.setObjectName("sectionLabel")
+            lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+            grid.addWidget(lbl, 0, col, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+            grid.addWidget(
+                widget, 1, col, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
+            )
+            col += 1
 
-        # Строка: название трека + BPM
-        track_bpm_row = QHBoxLayout()
-        track_bpm_row.setSpacing(8)
-
-        track_card = QFrame()
-        track_card.setObjectName("trackInfoCard")
-        track_card.setFixedHeight(card_height)
-        track_card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        track_layout = QVBoxLayout(track_card)
-        track_layout.setContentsMargins(8, 8, 8, 8)
-        window.track_info = QLabel("No track selected")
-        window.track_info.setObjectName("trackInfo")
-        window.track_info.setWordWrap(True)
-        window.track_info.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        track_layout.addWidget(window.track_info)
-        track_bpm_row.addWidget(track_card, 1)
-
-        bpm_card = QFrame()
-        bpm_card.setObjectName("bpmCard")
-        bpm_card.setFixedSize(bpm_width, card_height)
-        bpm_card.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        bpm_layout = QVBoxLayout(bpm_card)
-        bpm_layout.setContentsMargins(8, 8, 8, 8)
-        bpm_layout.setSpacing(0)
-        bpm_title = QLabel("BPM")
-        bpm_title.setObjectName("bpmTitle")
-        window.bpm_value_label = QLabel("—")
-        window.bpm_value_label.setObjectName("bpmValue")
-        window.bpm_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        window.bpm_label = window.bpm_value_label  # устаревший алиас, используется в player.py
-        bpm_layout.addWidget(bpm_title)
-        bpm_layout.addWidget(window.bpm_value_label, 1)
-        track_bpm_row.addWidget(bpm_card)
-        left_col.addLayout(track_bpm_row)
-
-        # Блок воспроизведения: кнопки | режим | колонки плейлистов
-        controls = QFrame()
-        controls.setObjectName("controlRow")
-        controls_layout = QHBoxLayout(controls)
-        controls_layout.setContentsMargins(0, 0, 0, 0)
-        controls_layout.setSpacing(16)
-        controls_layout.setSizeConstraint(QLayout.SizeConstraint.SetFixedSize)
-
-        playback_col = QVBoxLayout()
-        playback_col.setSpacing(4)
-        playback_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        playback_label = QLabel("PLAYBACK CONTROL")
-        playback_label.setObjectName("sectionLabel")
-        playback_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        playback_col.addWidget(playback_label)
-
-        playback_btns = QHBoxLayout()
-        playback_btns.setSpacing(4)
-        window.btn_previous = self._icon_button(window, "previous", window.previous_track)
-        window.btn_play = self._icon_button(window, "play", window.toggle_play)
-        window.btn_pause = self._icon_button(window, "pause", window.pause)
-        window.btn_stop = self._icon_button(window, "stop", window.stop)
-        window.btn_next = self._icon_button(window, "next", window.next_track)
-        window.btn_space = QPushButton("SPACE")
-        window.btn_space.setObjectName("accentButton")
+        window.btn_space = QPushButton("ON AIR")
+        window.btn_space.setObjectName("accentButtonSpace")
         window.btn_space.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         window.btn_space.setAutoDefault(False)
         window.btn_space.setDefault(False)
         window.btn_space.setToolTip("Load preview to air (same as Space key)")
+        window.btn_space.setMinimumWidth(108)
+        window.btn_space.setSizePolicy(
+            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
+        )
         window.btn_space.clicked.connect(window.handle_space)
-        for btn in (
-            window.btn_previous,
-            window.btn_play,
-            window.btn_pause,
-            window.btn_stop,
-            window.btn_next,
-        ):
-            playback_btns.addWidget(btn)
-        playback_btns.addWidget(window.btn_space)
-        playback_col.addLayout(playback_btns)
+        # Без подписи сверху — на всю высоту панели (обе строки сетки)
+        grid.addWidget(
+            window.btn_space,
+            0,
+            col,
+            2,
+            1,
+            Qt.AlignmentFlag.AlignVCenter,
+        )
+        col += 1
 
-        mode_col = QVBoxLayout()
-        mode_col.setSpacing(4)
-        mode_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        mode_label = QLabel("PLAYBACK MODE")
-        mode_label.setObjectName("sectionLabel")
-        mode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        mode_col.addWidget(mode_label)
         window.playback_mode_group = SegmentButtonGroup(
             [("loop", "LOOP"), ("next", "NEXT"), ("stop", "STOP")],
         )
         window.playback_mode_group.set_value("next")
         window.playback_mode_group.valueChanged.connect(window.on_playback_mode_changed)
-        mode_col.addWidget(window.playback_mode_group)
+        add_labeled("PLAYBACK MODE", window.playback_mode_group)
         window.radio_next = None
         window.radio_stop = None
         window.radio_loop = None
 
-        columns_col = QVBoxLayout()
-        columns_col.setSpacing(4)
-        columns_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        columns_label = QLabel("PLAYLISTS")
-        columns_label.setObjectName("sectionLabel")
-        columns_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        columns_col.addWidget(columns_label)
-        window.columns_stepper = ValueStepper(window, 1, MAX_PLAYLISTS, 2)
-        window.columns_spin = window.columns_stepper.spin_box()
-        window.columns_value_label = window.columns_stepper._value_label
-        window.columns_spin.valueChanged.connect(window.set_playlist_columns)
-        columns_col.addWidget(window.columns_stepper)
-        window.btn_columns_up = None
-        window.btn_columns_down = None
-
-        controls_layout.addLayout(playback_col)
-        controls_layout.addLayout(mode_col)
-
-        fade_mode_col = QVBoxLayout()
-        fade_mode_col.setSpacing(4)
-        fade_mode_col.setAlignment(Qt.AlignmentFlag.AlignHCenter)
-        fade_mode_label = QLabel("FADE MODE")
-        fade_mode_label.setObjectName("sectionLabel")
-        fade_mode_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        fade_mode_label.setWordWrap(False)
-        fade_mode_col.addWidget(fade_mode_label)
-        fade_controls = QWidget()
-        control_row_height = get_token_int("sizes.stepper_value", 26)
-        fade_controls.setFixedHeight(control_row_height)
-        fade_controls_layout = QHBoxLayout(fade_controls)
-        fade_controls_layout.setContentsMargins(0, 0, 0, 0)
-        fade_controls_layout.addStretch()
         window.btn_fade_mode = self._fade_mode_button(
             window,
             window.toggle_fade_mode,
             tooltip="Sequential: fade out completes before the next track fades in",
         )
-        fade_controls_layout.addWidget(window.btn_fade_mode)
-        fade_controls_layout.addStretch()
-        fade_mode_col.addWidget(fade_controls)
-        controls_layout.addLayout(fade_mode_col)
+        add_labeled("FADE MODE", window.btn_fade_mode)
 
-        controls_layout.addLayout(columns_col)
-        controls.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-
-        controls_center_row = QHBoxLayout()
-        controls_center_row.setContentsMargins(0, 0, 0, 0)
-        controls_center_row.addStretch(1)
-        controls_center_row.addWidget(controls)
-        controls_center_row.addStretch(1)
-        left_col.addLayout(controls_center_row)
-
-        # Блок времени: режим → время → fade → advance selection
-        time_block = QFrame()
-        time_block.setObjectName("timeBlock")
-        time_block.setFixedWidth(time_width)
-        time_block.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Preferred)
-        time_layout = QVBoxLayout(time_block)
-        time_layout.setContentsMargins(8, 6, 8, 6)
-        time_layout.setSpacing(6)
-
-        # 1. Elapsed / Remaining
-        window.time_mode_group = SegmentButtonGroup(
-            [("elapsed", "Elapsed"), ("remaining", "Remaining")],
-        )
-        window.time_mode_group.setObjectName("timeModeGroup")
-        window.time_mode_group.set_value("elapsed")
-        window.time_mode_group.valueChanged.connect(window.on_time_mode_changed)
-        time_layout.addWidget(window.time_mode_group)
-
-        # 2. Основное время (elapsed/remaining) + общая длительность
-        time_values_row = QHBoxLayout()
-        time_values_row.setSpacing(8)
-        window.time_large_label = QLabel("--:--")
-        window.time_large_label.setObjectName("timeLarge")
-        window.time_large_label.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        window.time_duration_label = QLabel("--:--")
-        window.time_duration_label.setObjectName("timeDuration")
-        window.time_duration_label.setAlignment(
-            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
-        )
-        time_values_row.addWidget(window.time_large_label, 1)
-        time_values_row.addWidget(window.time_duration_label)
-        time_layout.addLayout(time_values_row)
-
-        # 3. Fade
-        fade_row = QHBoxLayout()
-        fade_row.setSpacing(8)
-        fade_label = QLabel("FADE")
-        fade_label.setObjectName("fadeLabel")
+        fade_ms_wrap = QWidget()
+        fade_ms_wrap.setFixedHeight(control_row_height)
+        fade_ms_layout = QHBoxLayout(fade_ms_wrap)
+        fade_ms_layout.setContentsMargins(0, 0, 0, 0)
+        fade_ms_layout.setSpacing(4)
         window.fade_duration_stepper = ValueStepper(
             window,
             0,
@@ -353,26 +235,31 @@ class MainWindowUi:
         window.fade_duration_spin.setToolTip(
             "Fade out on Space/Stop; crossfade/sequential track transition duration"
         )
-        fade_ms_label = QLabel("MS")
-        fade_ms_label.setObjectName("fadeMsLabel")
-        fade_row.addWidget(fade_label)
-        fade_row.addWidget(window.fade_duration_stepper)
-        fade_row.addWidget(fade_ms_label)
-        fade_row.addStretch()
-        time_layout.addLayout(fade_row)
+        fade_ms_unit = QLabel("MS")
+        fade_ms_unit.setObjectName("fadeMsLabel")
+        fade_ms_layout.addWidget(window.fade_duration_stepper)
+        fade_ms_layout.addWidget(fade_ms_unit)
+        add_labeled("FADE", fade_ms_wrap)
 
-        # 4. Advance selection on Space — индикатор и текст отдельно, без растягивания QCheckBox
-        advance_row = QHBoxLayout()
-        advance_row.setContentsMargins(0, 0, 0, 0)
+        window.columns_stepper = ValueStepper(window, 1, MAX_PLAYLISTS, 2)
+        window.columns_spin = window.columns_stepper.spin_box()
+        window.columns_value_label = window.columns_stepper._value_label
+        window.columns_spin.valueChanged.connect(window.set_playlist_columns)
+        add_labeled("PLAYLISTS", window.columns_stepper)
+        window.btn_columns_up = None
+        window.btn_columns_down = None
+
         advance_group = QWidget()
+        advance_group.setFixedHeight(control_row_height)
         advance_group_layout = QHBoxLayout(advance_group)
         advance_group_layout.setContentsMargins(0, 0, 0, 0)
         advance_group_layout.setSpacing(2)
         window.space_advances_checkbox = SquareCheckBox()
         window.space_advances_checkbox.setObjectName("spaceAdvancesCheckbox")
-        advance_label = QLabel("ADVANCE SELECTION ON SPACE")
+        advance_label = QLabel("ADVANCE")
         advance_label.setObjectName("spaceAdvancesLabel")
         advance_label.setCursor(Qt.CursorShape.PointingHandCursor)
+        advance_label.setToolTip("Advance selection on Space")
         self._bind_checkbox_label(window.space_advances_checkbox, advance_label)
         advance_group_layout.addWidget(
             window.space_advances_checkbox,
@@ -382,13 +269,53 @@ class MainWindowUi:
             advance_label,
             alignment=Qt.AlignmentFlag.AlignVCenter,
         )
-        advance_group.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
-        advance_row.addStretch(1)
-        advance_row.addWidget(advance_group)
-        advance_row.addStretch(1)
-        time_layout.addLayout(advance_row)
+        add_labeled("ON SPACE", advance_group)
 
-        # Алиасы для совместимости со старыми путями кода в player.py
+        window.bpm_value_label = QLabel("—")
+        window.bpm_value_label.setObjectName("bpmValue")
+        window.bpm_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        window.bpm_value_label.setFixedHeight(control_row_height)
+        window.bpm_label = window.bpm_value_label
+        add_labeled("BPM", window.bpm_value_label)
+
+        grid.setColumnStretch(col, 1)
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        grid.addWidget(spacer, 0, col, 2, 1)
+        col += 1
+
+        # Время справа: Elapsed/Remaining + крупные цифры (без FADE)
+        time_wrap = QWidget()
+        time_layout = QVBoxLayout(time_wrap)
+        time_layout.setContentsMargins(0, 0, 0, 0)
+        time_layout.setSpacing(2)
+
+        window.time_mode_group = SegmentButtonGroup(
+            [("elapsed", "Elapsed"), ("remaining", "Remaining")],
+        )
+        window.time_mode_group.setObjectName("timeModeGroup")
+        window.time_mode_group.set_value("elapsed")
+        window.time_mode_group.valueChanged.connect(window.on_time_mode_changed)
+        time_layout.addWidget(window.time_mode_group, 0, Qt.AlignmentFlag.AlignRight)
+
+        time_values = QHBoxLayout()
+        time_values.setSpacing(8)
+        window.time_large_label = QLabel("--:--")
+        window.time_large_label.setObjectName("timeLarge")
+        window.time_large_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        window.time_duration_label = QLabel("--:--")
+        window.time_duration_label.setObjectName("timeDuration")
+        window.time_duration_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        time_values.addWidget(window.time_large_label)
+        time_values.addWidget(window.time_duration_label)
+        time_layout.addLayout(time_values)
+
+        grid.addWidget(time_wrap, 0, col, 2, 1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+
         window.time_current_label = window.time_large_label
         window.time_total_label = window.time_duration_label
         window.time_small_label = window.time_duration_label
@@ -396,24 +323,28 @@ class MainWindowUi:
         window.radio_time_elapsed = None
         window.radio_time_remaining = None
 
-        main_row.addLayout(left_col, 1)
-        main_row.addWidget(time_block, 0, Qt.AlignmentFlag.AlignTop)
-        layout.addLayout(main_row)
-
+        layout.addLayout(grid)
         return section
 
     def _build_timeline(self, window: AudioPlayer) -> QWidget:
-        """Одна линия: air waveform | preview waveform (+ inline properties)."""
+        """Стек: ON AIR сверху, PREVIEW снизу (без заголовка TIMELINE)."""
         section = QFrame()
         section.setObjectName("timelineSection")
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 8)
-        layout.setSpacing(4)
+        layout.setSpacing(6)
 
-        header_row = QHBoxLayout()
-        header_row.setContentsMargins(0, 0, 0, 0)
-        header_row.setSpacing(6)
-        header_row.addWidget(SectionHeader("TIMELINE"), 1)
+        # --- Air ---
+        air_col = QFrame()
+        air_col.setObjectName("airWaveformColumn")
+        air_layout = QVBoxLayout(air_col)
+        air_layout.setContentsMargins(0, 0, 0, 0)
+        air_layout.setSpacing(4)
+
+        air_header = QHBoxLayout()
+        air_header.setContentsMargins(0, 0, 0, 0)
+        air_header.setSpacing(6)
+        air_header.addWidget(SectionHeader("ON AIR"), 1)
         window.btn_refresh_devices = QPushButton("↻")
         window.btn_refresh_devices.setObjectName("deviceRefreshButton")
         window.btn_refresh_devices.setToolTip("Refresh audio output device list")
@@ -422,20 +353,8 @@ class MainWindowUi:
         window.btn_refresh_devices.setAutoDefault(False)
         window.btn_refresh_devices.setDefault(False)
         window.btn_refresh_devices.clicked.connect(window.refresh_audio_output_devices)
-        header_row.addWidget(window.btn_refresh_devices, 0, Qt.AlignmentFlag.AlignRight)
-        layout.addLayout(header_row)
-
-        row = QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(6)
-
-        # --- Air column ---
-        air_col = QFrame()
-        air_col.setObjectName("airWaveformColumn")
-        air_layout = QVBoxLayout(air_col)
-        air_layout.setContentsMargins(0, 0, 0, 0)
-        air_layout.setSpacing(4)
-        air_layout.addWidget(SectionHeader("ON AIR"))
+        air_header.addWidget(window.btn_refresh_devices, 0, Qt.AlignmentFlag.AlignRight)
+        air_layout.addLayout(air_header)
 
         air_device_row = QHBoxLayout()
         air_device_row.setSpacing(6)
@@ -447,6 +366,15 @@ class MainWindowUi:
         air_device_row.addWidget(air_device_label)
         air_device_row.addWidget(window.air_output_combo, 1)
         air_layout.addLayout(air_device_row)
+
+        window.track_info = QLabel("No track selected")
+        window.track_info.setObjectName("previewTrackInfo")
+        window.track_info.setWordWrap(True)
+        window.track_info.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        air_layout.addWidget(window.track_info)
+
         air_layout.addLayout(self._build_waveform_row(
             window,
             waveform_attr="waveform",
@@ -458,10 +386,13 @@ class MainWindowUi:
             zoom_reset_slot=window.reset_waveform_zoom,
             rewind_slot=window.rewind_to_start,
             res_slot=window.on_waveform_res_toggled,
+            play_slot=window.toggle_play,
+            pause_slot=window.pause,
+            stop_slot=window.stop,
         ))
-        row.addWidget(air_col, 1)
+        layout.addWidget(air_col)
 
-        # --- Preview column ---
+        # --- Preview ---
         preview_col = QFrame()
         preview_col.setObjectName("previewWaveformColumn")
         preview_layout = QVBoxLayout(preview_col)
@@ -509,9 +440,8 @@ class MainWindowUi:
             stop_slot=window.preview_stop,
             autoplay_slot=window.on_preview_autoplay_toggled,
         ))
-        row.addWidget(preview_col, 1)
+        layout.addWidget(preview_col)
 
-        layout.addLayout(row)
         return section
 
     @staticmethod
@@ -542,16 +472,14 @@ class MainWindowUi:
         autoplay_slot=None,
     ) -> QVBoxLayout:
         block = QVBoxLayout()
-        block.setSpacing(4)
+        block.setSpacing(2)
 
         wave_row = QHBoxLayout()
         wave_row.setSpacing(6)
+        wave_height = get_token_int("sizes.preview_waveform_height", 72)
+        waveform = AudioWaveform(bar_area_height=wave_height)
         if preview:
-            preview_height = get_token_int("sizes.preview_waveform_height", 72)
-            waveform = AudioWaveform(bar_area_height=preview_height)
             waveform.setObjectName("previewWaveform")
-        else:
-            waveform = AudioWaveform()
         setattr(window, waveform_attr, waveform)
 
         tool_px = get_token_int("sizes.tool_button", 18)
@@ -559,154 +487,114 @@ class MainWindowUi:
         btn_h = tool_px
         btn_w = tool_px * 2
 
-        if preview and play_slot and pause_slot and stop_slot:
-            wave_tools = QGridLayout()
-            wave_tools.setSpacing(4)
-            wave_tools.setContentsMargins(0, 0, 0, 0)
+        # Сетка 2 колонки, как раньше
+        wave_tools = QGridLayout()
+        wave_tools.setSpacing(4)
+        wave_tools.setContentsMargins(0, 0, 0, 0)
 
-            btn_play = QPushButton()
-            btn_play.setObjectName("waveformToolButton")
-            btn_play.setToolTip("Preview play")
-            btn_play.setIcon(load_icon(window, "play", icon_px))
-            btn_play.setIconSize(icon_size(icon_px))
-            btn_play.setFixedSize(btn_w, btn_h)
-            btn_play.clicked.connect(play_slot)
-            self._transport_button(btn_play)
-            window.btn_preview_play = btn_play
+        def make_icon_btn(name: str, tip: str, slot) -> QPushButton:
+            btn = QPushButton()
+            btn.setObjectName("waveformToolButton")
+            btn.setToolTip(tip)
+            btn.setIcon(load_icon(window, name, icon_px))
+            btn.setIconSize(icon_size(icon_px))
+            btn.setFixedSize(btn_w, btn_h)
+            btn.clicked.connect(slot)
+            self._transport_button(btn)
+            return btn
 
-            btn_pause = QPushButton()
-            btn_pause.setObjectName("waveformToolButton")
-            btn_pause.setToolTip("Preview pause")
-            btn_pause.setIcon(load_icon(window, "pause", icon_px))
-            btn_pause.setIconSize(icon_size(icon_px))
-            btn_pause.setFixedSize(btn_w, btn_h)
-            btn_pause.clicked.connect(pause_slot)
-            self._transport_button(btn_pause)
-            window.btn_preview_pause = btn_pause
+        def make_text_btn(text: str, tip: str, *, checkable: bool = False) -> QPushButton:
+            btn = QPushButton(text)
+            btn.setObjectName(
+                "previewTextToolButton" if preview else "waveformToolButton"
+            )
+            btn.setToolTip(tip)
+            btn.setFixedSize(btn_w, btn_h)
+            if checkable:
+                btn.setCheckable(True)
+            self._transport_button(btn)
+            return btn
 
-            btn_stop = QPushButton()
-            btn_stop.setObjectName("waveformToolButton")
-            btn_stop.setToolTip("Preview stop")
-            btn_stop.setIcon(load_icon(window, "stop", icon_px))
-            btn_stop.setIconSize(icon_size(icon_px))
-            btn_stop.setFixedSize(btn_w, btn_h)
-            btn_stop.clicked.connect(stop_slot)
-            self._transport_button(btn_stop)
-            window.btn_preview_stop = btn_stop
+        row_i = 0
+        if play_slot and pause_slot and stop_slot:
+            btn_play = make_icon_btn("play", "Play" if not preview else "Preview play", play_slot)
+            btn_pause = make_icon_btn(
+                "pause", "Pause" if not preview else "Preview pause", pause_slot
+            )
+            btn_stop = make_icon_btn(
+                "stop", "Stop" if not preview else "Preview stop", stop_slot
+            )
+            if preview:
+                window.btn_preview_play = btn_play
+                window.btn_preview_pause = btn_pause
+                window.btn_preview_stop = btn_stop
+            else:
+                window.btn_play = btn_play
+                window.btn_pause = btn_pause
+                window.btn_stop = btn_stop
 
-            btn_autoplay = None
-            if autoplay_slot is not None:
-                btn_autoplay = QPushButton("AUTO")
+            wave_tools.addWidget(btn_play, row_i, 0)
+            wave_tools.addWidget(btn_pause, row_i, 1)
+            row_i += 1
+            wave_tools.addWidget(btn_stop, row_i, 0)
+            if preview and autoplay_slot is not None:
+                btn_autoplay = make_text_btn(
+                    "AUTO", "Auto-play preview when selecting a track", checkable=True
+                )
                 btn_autoplay.setObjectName("previewAutoplayButton")
-                btn_autoplay.setCheckable(True)
                 btn_autoplay.setChecked(True)
-                btn_autoplay.setToolTip("Auto-play preview when selecting a track")
-                btn_autoplay.setFixedSize(btn_w, btn_h)
                 btn_autoplay.toggled.connect(autoplay_slot)
-                self._transport_button(btn_autoplay)
                 window.btn_preview_autoplay = btn_autoplay
+                wave_tools.addWidget(btn_autoplay, row_i, 1)
+            row_i += 1
 
-            btn_zoom_reset = QPushButton("1:1")
-            btn_zoom_reset.setObjectName("previewTextToolButton")
-            btn_zoom_reset.setToolTip("Reset waveform zoom")
-            btn_zoom_reset.setFixedSize(btn_w, btn_h)
-            btn_zoom_reset.setEnabled(False)
-            btn_zoom_reset.clicked.connect(zoom_reset_slot)
-            self._transport_button(btn_zoom_reset)
-            setattr(window, zoom_reset_attr, btn_zoom_reset)
+        btn_zoom_reset = make_text_btn("1:1", "Reset waveform zoom")
+        btn_zoom_reset.setEnabled(False)
+        btn_zoom_reset.clicked.connect(zoom_reset_slot)
+        setattr(window, zoom_reset_attr, btn_zoom_reset)
 
-            btn_rewind_start = QPushButton()
-            btn_rewind_start.setObjectName("waveformToolButton")
-            btn_rewind_start.setToolTip("Rewind to start")
-            btn_rewind_start.setIcon(load_icon(window, "back_begin", icon_px))
-            btn_rewind_start.setIconSize(icon_size(icon_px))
-            btn_rewind_start.setFixedSize(btn_w, btn_h)
-            btn_rewind_start.clicked.connect(rewind_slot)
-            self._transport_button(btn_rewind_start)
-            setattr(window, rewind_attr, btn_rewind_start)
+        btn_rewind_start = make_icon_btn("back_begin", "Rewind to start", rewind_slot)
+        setattr(window, rewind_attr, btn_rewind_start)
 
-            btn_eject = QPushButton()
-            btn_eject.setObjectName("waveformToolButton")
+        wave_tools.addWidget(btn_zoom_reset, row_i, 0)
+        wave_tools.addWidget(btn_rewind_start, row_i, 1)
+        row_i += 1
+
+        btn_waveform_res = make_text_btn(
+            "RES", "Higher waveform resolution when zoomed", checkable=True
+        )
+        btn_waveform_res.setEnabled(False)
+        btn_waveform_res.toggled.connect(res_slot)
+        setattr(window, res_attr, btn_waveform_res)
+        wave_tools.addWidget(btn_waveform_res, row_i, 0)
+
+        btn_eject = QPushButton()
+        btn_eject.setObjectName("waveformToolButton")
+        btn_eject.setIcon(load_icon(window, "eject", icon_px))
+        btn_eject.setIconSize(icon_size(icon_px))
+        btn_eject.setFixedSize(btn_w, btn_h)
+        self._transport_button(btn_eject)
+        if preview:
             btn_eject.setToolTip("Eject / clear preview")
-            btn_eject.setIcon(load_icon(window, "eject", icon_px))
-            btn_eject.setIconSize(icon_size(icon_px))
-            btn_eject.setFixedSize(btn_w, btn_h)
-            self._transport_button(btn_eject)
             window.btn_preview_eject = btn_eject
-
-            btn_waveform_res = QPushButton("RES")
-            btn_waveform_res.setObjectName("previewTextToolButton")
-            btn_waveform_res.setCheckable(True)
-            btn_waveform_res.setToolTip("Higher waveform resolution when zoomed")
-            btn_waveform_res.setFixedSize(btn_w, btn_h)
-            btn_waveform_res.setEnabled(False)
-            btn_waveform_res.toggled.connect(res_slot)
-            self._transport_button(btn_waveform_res)
-            setattr(window, res_attr, btn_waveform_res)
-
-            wave_tools.addWidget(btn_play, 0, 0)
-            wave_tools.addWidget(btn_pause, 0, 1)
-            wave_tools.addWidget(btn_stop, 1, 0)
-            if btn_autoplay is not None:
-                wave_tools.addWidget(btn_autoplay, 1, 1)
-            wave_tools.addWidget(btn_zoom_reset, 2, 0)
-            wave_tools.addWidget(btn_rewind_start, 2, 1)
-            wave_tools.addWidget(btn_waveform_res, 3, 0)
-            wave_tools.addWidget(btn_eject, 3, 1)
         else:
-            wave_tools = QVBoxLayout()
-            wave_tools.setSpacing(4)
-            wave_tools.setContentsMargins(0, 0, 0, 0)
-
-            btn_zoom_reset = QPushButton("1:1")
-            btn_zoom_reset.setObjectName("waveformToolButton")
-            btn_zoom_reset.setToolTip("Reset waveform zoom")
-            btn_zoom_reset.setFixedSize(btn_w, btn_h)
-            btn_zoom_reset.setEnabled(False)
-            btn_zoom_reset.clicked.connect(zoom_reset_slot)
-            self._transport_button(btn_zoom_reset)
-            setattr(window, zoom_reset_attr, btn_zoom_reset)
-            wave_tools.addWidget(btn_zoom_reset, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-            btn_rewind_start = QPushButton()
-            btn_rewind_start.setObjectName("waveformToolButton")
-            btn_rewind_start.setToolTip("Rewind to start")
-            btn_rewind_start.setIcon(load_icon(window, "back_begin", icon_px))
-            btn_rewind_start.setIconSize(icon_size(icon_px))
-            btn_rewind_start.setFixedSize(btn_w, btn_h)
-            btn_rewind_start.clicked.connect(rewind_slot)
-            self._transport_button(btn_rewind_start)
-            setattr(window, rewind_attr, btn_rewind_start)
-            wave_tools.addWidget(btn_rewind_start, alignment=Qt.AlignmentFlag.AlignHCenter)
-
-            btn_waveform_res = QPushButton("RES")
-            btn_waveform_res.setObjectName("waveformToolButton")
-            btn_waveform_res.setCheckable(True)
-            btn_waveform_res.setToolTip("Higher waveform resolution when zoomed")
-            btn_waveform_res.setFixedSize(btn_w, btn_h)
-            btn_waveform_res.setEnabled(False)
-            btn_waveform_res.toggled.connect(res_slot)
-            self._transport_button(btn_waveform_res)
-            setattr(window, res_attr, btn_waveform_res)
-            wave_tools.addWidget(btn_waveform_res, alignment=Qt.AlignmentFlag.AlignHCenter)
-            wave_tools.addStretch()
+            btn_eject.setToolTip("Eject / clear on-air")
+            window.btn_air_eject = btn_eject
+        wave_tools.addWidget(btn_eject, row_i, 1)
 
         wave_row.addWidget(waveform, 1)
         wave_row.addLayout(wave_tools)
         block.addLayout(wave_row)
 
-        time_row = QHBoxLayout()
+        # Сохраняем для player.py, но не показываем
         start_label = QLabel("0:00")
         start_label.setObjectName("timelineStart")
         end_label = QLabel("0:00")
         end_label.setObjectName("timelineEnd")
-        end_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        start_label.hide()
+        end_label.hide()
         setattr(window, start_label_attr, start_label)
         setattr(window, end_label_attr, end_label)
-        time_row.addWidget(start_label)
-        time_row.addStretch()
-        time_row.addWidget(end_label)
-        block.addLayout(time_row)
 
         return block
 
@@ -790,6 +678,11 @@ class MainWindowUi:
             "to_project",
             "Move selected track into project folder",
             lambda checked=False, pl=playlist: window.move_selected_track_to_project(pl),
+        )
+        add_tool(
+            "copy_to_project",
+            "Copy all tracks into project folder",
+            lambda checked=False, pl=playlist: window.copy_playlist_tracks_to_project(pl),
         )
         # Анализ файла (BPM + аудиоволна → кеш)
         add_tool(

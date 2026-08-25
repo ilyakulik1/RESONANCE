@@ -19,8 +19,6 @@ QLabel#trackInfo {
 QFrame#bpmCard {
     background-color: {{colors.bg_card}};
     border-radius: {{radius.md}};
-    min-width: 70px;
-    max-width: 70px;
 }
 
 QLabel#bpmTitle {
@@ -51,12 +49,13 @@ QWidget#timeModeGroup QPushButton#segmentButton {
 
 QLabel#timeDuration {
     color: {{colors.accent_cyan}};
-    font-size: {{typography.size_lg}};
+    font-size: {{typography.size_display_sm}};
+    font-weight: bold;
 }
 
 QLabel#timeLarge {
     color: {{colors.text_primary}};
-    font-size: 34px;
+    font-size: {{typography.size_display_sm}};
     font-weight: bold;
 }
 

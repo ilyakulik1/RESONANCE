@@ -36,6 +36,11 @@ SCENE_THUMBS_DIRNAME = "scene_thumbs"
 PROJECT_VERSION = 1
 
 
+def untitled_project_root() -> Path:
+    """Working folder for a project that has not been saved to a user path yet."""
+    return get_config_path("untitled_project")
+
+
 def default_project_root() -> Path:
     root = get_config_path("default_project")
     ensure_project_dirs(root)
@@ -267,6 +272,58 @@ class ProjectManager:
         self.save_raw(
             ProjectState(name=self.name, playlists=[ProjectPlaylistState() for _ in range(MAX_PLAYLISTS)])
         )
+
+    def create_untitled(self) -> None:
+        """Start a fresh unnamed project in the app config directory."""
+        root = untitled_project_root()
+        if root.exists():
+            for child in root.iterdir():
+                if child.is_dir():
+                    shutil.rmtree(child, ignore_errors=True)
+                else:
+                    try:
+                        child.unlink()
+                    except OSError:
+                        pass
+        self.root = ensure_project_dirs(root)
+        self.name = "Untitled"
+        self._activate_analysis_cache()
+        self.save_raw(
+            ProjectState(
+                name=self.name,
+                playlists=[ProjectPlaylistState() for _ in range(MAX_PLAYLISTS)],
+            )
+        )
+
+    def is_untitled(self) -> bool:
+        try:
+            return self.root.resolve() == untitled_project_root().resolve()
+        except OSError:
+            return False
+
+    def relocate_to(self, target: Path | str, *, name: str | None = None) -> None:
+        """Move project working files into ``target`` (used by Save As from Untitled)."""
+        old = self.root.resolve()
+        dest = ensure_project_dirs(target).resolve()
+        if old == dest:
+            self.name = (name or dest.name).strip() or self.name
+            return
+        for dirname in (MEDIA_DIRNAME, ANALYSIS_DIRNAME, SCENE_THUMBS_DIRNAME):
+            src = old / dirname
+            dst = dest / dirname
+            if not src.exists():
+                continue
+            if dst.exists():
+                shutil.rmtree(dst, ignore_errors=True)
+            try:
+                shutil.copytree(src, dst)
+            except OSError:
+                ensure_project_dirs(dest)
+                if src.exists():
+                    shutil.copytree(src, dst, dirs_exist_ok=True)
+        self.root = dest
+        self.name = (name or dest.name).strip() or "Project"
+        self._activate_analysis_cache()
 
     def is_path_in_project(self, file_path: str) -> bool:
         return is_under_project(file_path, self.root)

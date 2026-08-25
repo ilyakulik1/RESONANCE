@@ -583,12 +583,21 @@ class AudioPlayer(QMainWindow):
         self._spectrum_timer.timeout.connect(self._poll_air_spectrum)
         self._spectrum_timer.start()
 
+    def _clear_air_spectrum(self) -> None:
+        self._spectrum_smooth = None
+        if hasattr(self, "file_properties_panel"):
+            self.file_properties_panel.set_spectrum(None, None)
+
     def _poll_air_spectrum(self) -> None:
         if not hasattr(self, "file_properties_panel"):
             return
         if not self.file_properties_panel.isVisible():
             return
         if self.file_properties_panel.is_bypassed():
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
+            if self._spectrum_smooth is not None:
+                self._clear_air_spectrum()
             return
         snap = self.player.spectrum_bins_snapshot()
         if snap is None:
@@ -1224,6 +1233,8 @@ class AudioPlayer(QMainWindow):
         self.file_browser.ejectRequested.connect(self.clear_browser_preview)
         if hasattr(self, "btn_preview_eject"):
             self.btn_preview_eject.clicked.connect(self.clear_preview_deck)
+        if hasattr(self, "btn_air_eject"):
+            self.btn_air_eject.clicked.connect(self.clear_air_deck)
 
     def _cancel_crossfade(self) -> None:
         self._crossfade_timer.stop()
@@ -1257,7 +1268,7 @@ class AudioPlayer(QMainWindow):
     ) -> None:
         incoming_idx = 1 - self._active_player_idx
         self._crossfade_active = True
-        self._crossfade_fade_in_ms = max(1, fade_ms // 2)
+        self._crossfade_fade_in_ms = max(1, fade_ms)
         self._crossfade_incoming_path = file_path
         self._crossfade_outgoing_idx = self._active_player_idx
         self._crossfade_incoming_idx = incoming_idx
@@ -1286,7 +1297,8 @@ class AudioPlayer(QMainWindow):
             fade_ms,
             on_complete=self._stop_outgoing_player,
         )
-        self._crossfade_timer.start(self._crossfade_fade_in_ms)
+        # Incoming starts immediately (same moment as outgoing fade-out).
+        self._begin_incoming_crossfade()
 
     def _stop_outgoing_player(self) -> None:
         idx = self._crossfade_outgoing_idx
@@ -1671,7 +1683,9 @@ class AudioPlayer(QMainWindow):
         )
 
     def _window_title(self) -> str:
-        name = getattr(self.project, "name", None) or "Project"
+        name = getattr(self.project, "name", None) or "Untitled"
+        if getattr(self.project, "is_untitled", lambda: False)():
+            return f"{APP_NAME} — Untitled"
         return f"{APP_NAME} — {name}"
 
     def _update_window_title(self) -> None:
@@ -1684,7 +1698,7 @@ class AudioPlayer(QMainWindow):
 
     def _setup_project_menu(self) -> None:
         menu = self.menuBar().addMenu("Project")
-        act_new = QAction("New Project…", self)
+        act_new = QAction("New Project", self)
         act_new.triggered.connect(self.new_project)
         menu.addAction(act_new)
         act_open = QAction("Open Project…", self)
@@ -1844,7 +1858,7 @@ class AudioPlayer(QMainWindow):
         if old_abs in self._track_timeline_state:
             self._track_timeline_state[new_abs] = self._track_timeline_state.pop(old_abs)
         if old_abs in self._track_eq_state:
-            self._track_eq_state[new_abs] = self._track_eq_state.pop(old_abs)
+                self._track_eq_state[new_abs] = self._track_eq_state.pop(old_abs)
         if self._eq_bound_path == old_abs:
             self._eq_bound_path = new_abs
 
@@ -1858,6 +1872,17 @@ class AudioPlayer(QMainWindow):
             self._preview_displayed_track_path
         ) == old_abs:
             self._preview_displayed_track_path = new_abs
+
+    def _clone_path_metadata(self, old_path: str, new_path: str) -> None:
+        """Copy timeline/EQ for a duplicated file without touching the live deck."""
+        old_abs = os.path.abspath(old_path)
+        new_abs = os.path.abspath(new_path)
+        if old_abs == new_abs:
+            return
+        if old_abs in self._track_timeline_state and new_abs not in self._track_timeline_state:
+            self._track_timeline_state[new_abs] = self._track_timeline_state[old_abs]
+        if old_abs in self._track_eq_state and new_abs not in self._track_eq_state:
+            self._track_eq_state[new_abs] = dict(self._track_eq_state[old_abs])
 
     def move_selected_track_to_project(self, playlist: PlaylistWidget) -> None:
         item = playlist.currentItem()
@@ -1886,6 +1911,82 @@ class AudioPlayer(QMainWindow):
             self.file_browser.refresh_project_tab()
         self.save_project()
         self.refresh_playlist_footer(playlist)
+
+    def copy_playlist_tracks_to_project(self, playlist: PlaylistWidget) -> None:
+        if playlist.count() == 0:
+            QMessageBox.information(self, "Project", "Playlist is empty.")
+            return
+
+        pending: list[tuple[object, str]] = []
+        already = 0
+        missing = 0
+        for row in range(playlist.count()):
+            item = playlist.item(row)
+            src = get_item_file_path(item)
+            if not src:
+                missing += 1
+                continue
+            if self.project.is_path_in_project(src):
+                already += 1
+                continue
+            if not os.path.isfile(src):
+                missing += 1
+                continue
+            pending.append((item, src))
+
+        if not pending:
+            QMessageBox.information(
+                self,
+                "Project",
+                "Nothing to copy — tracks are already in the project, or files are missing.",
+            )
+            return
+
+        title = self.get_playlist_title(playlist.playlist_num)
+        answer = QMessageBox.question(
+            self,
+            "Copy to Project",
+            f"Copy {len(pending)} track(s) from {title} into the project folder?\n"
+            "Original files will be kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+
+        copied_by_src: dict[str, str] = {}
+        copied = 0
+        failed = 0
+        for item, src in pending:
+            src_abs = os.path.abspath(src)
+            new_path = copied_by_src.get(src_abs)
+            if new_path is None:
+                new_path = self.project.import_track(src, move=False)
+                if not new_path:
+                    failed += 1
+                    continue
+                copied_by_src[src_abs] = new_path
+                self._clone_path_metadata(src, new_path)
+            playlist.update_item_path(item, new_path)
+            copied += 1
+
+        if hasattr(self, "file_browser"):
+            self.file_browser.refresh_project_tab()
+        if copied:
+            self.save_project()
+        self.refresh_playlist_footer(playlist)
+
+        details = [f"Copied {copied} track(s) into the project."]
+        if already:
+            details.append(f"{already} already in the project.")
+        if missing:
+            details.append(f"{missing} missing on disk.")
+        if failed:
+            details.append(f"{failed} failed to copy.")
+        if failed:
+            QMessageBox.warning(self, "Project", "\n".join(details))
+        else:
+            QMessageBox.information(self, "Project", "\n".join(details))
 
     def _build_project_state(self) -> ProjectState:
         self._save_current_timeline_state()
@@ -1916,6 +2017,9 @@ class AudioPlayer(QMainWindow):
     def save_project(self) -> None:
         if getattr(self, "_saving_project", False):
             return
+        if self.project.is_untitled():
+            self.save_project_as()
+            return
         self._saving_project = True
         try:
             state = self._build_project_state()
@@ -1936,8 +2040,14 @@ class AudioPlayer(QMainWindow):
             self._saving_project = False
 
     def save_project_as(self) -> None:
-        start = str(self.project.root.parent)
-        chosen = QFileDialog.getExistingDirectory(self, "Save Project As — choose folder", start)
+        start = str(
+            Path.home()
+            if self.project.is_untitled()
+            else self.project.root.parent
+        )
+        chosen = QFileDialog.getExistingDirectory(
+            self, "Save Project As — choose folder", start
+        )
         if not chosen:
             return
         target = Path(chosen)
@@ -1954,11 +2064,35 @@ class AudioPlayer(QMainWindow):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
-        self.project.open(target)
-        if hasattr(self, "file_browser"):
-            self.file_browser.set_project_root(str(self.project.root), self.project.name)
-        self.save_project()
-        self.save_config()
+        try:
+            was_untitled = self.project.is_untitled()
+            if was_untitled:
+                self.project.relocate_to(target, name=target.name)
+            else:
+                self.project.open(target)
+            if hasattr(self, "file_browser"):
+                self.file_browser.set_project_root(
+                    str(self.project.root), self.project.name
+                )
+            self._saving_project = True
+            try:
+                state = self._build_project_state()
+                state.name = self.project.name
+                self.project.save_raw(state)
+                paths: list[str] = []
+                for playlist in self.playlists:
+                    paths.extend(playlist.all_file_paths())
+                self.project.export_analysis_for_paths(paths)
+                self.save_all_playlists()
+                if hasattr(self, "file_browser"):
+                    self.file_browser.refresh_project_tab()
+            finally:
+                self._saving_project = False
+            self.save_config()
+            self._update_window_title()
+        except Exception as exc:
+            print(f"Error saving project as: {exc}")
+            QMessageBox.warning(self, "Project", f"Could not save project:\n{exc}")
 
     def new_project(self) -> None:
         reply = QMessageBox.question(
@@ -1974,13 +2108,7 @@ class AudioPlayer(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             self.save_project()
 
-        chosen = QFileDialog.getExistingDirectory(
-            self, "New Project — choose empty folder", str(Path.home())
-        )
-        if not chosen:
-            return
-        target = Path(chosen)
-        self.project.create_new(target)
+        self.project.create_untitled()
         self._project_video_mixer = None
         self._apply_project_state(
             ProjectState(
@@ -1991,7 +2119,6 @@ class AudioPlayer(QMainWindow):
         )
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
-        self.save_project()
         self.save_config()
         self._update_window_title()
 
@@ -2877,6 +3004,42 @@ class AudioPlayer(QMainWindow):
     def clear_preview_deck(self) -> None:
         """Eject the playlist PREVIEW deck (public alias)."""
         self._clear_preview_deck()
+
+    def clear_air_deck(self) -> None:
+        """Eject / clear the ON AIR deck."""
+        self._clear_air_deck()
+
+    def _clear_air_deck(self) -> None:
+        if self._current_file_path:
+            self._save_timeline_for_path(self._current_file_path)
+        self._cancel_crossfade()
+        self.volume_fader.cancel()
+        self._stop_fade_active = False
+        self._stop_fade_path = None
+        self._stop_fade_item = None
+        self._stop_fade_playlist_num = None
+        self._queued_after_stop_fade = None
+        self._range_end_latched = False
+        self._suppress_range_end = False
+        self._pending_transition_fade_ms = 0
+        self._fade_out_started = False
+        self._cancel_pending_playback()
+        self._playback_token += 1
+        for media_player in self._players:
+            media_player.stop()
+        self._set_output_volume(self._playback_volume)
+        self.current_playing_playlist = None
+        self.current_playing_item = None
+        self._current_file_path = None
+        self._displayed_track_path = None
+        self.waveform.set_waveform([])
+        self.waveform.set_duration(0)
+        self.waveform.set_position(0)
+        self.track_info.setText("No track selected")
+        self._reset_bpm_label()
+        self._update_file_properties(None)
+        self._clear_air_spectrum()
+        self.update_time_display()
 
     def _clear_preview_deck(self) -> None:
         if self._preview_displayed_track_path:
@@ -3786,8 +3949,8 @@ class AudioPlayer(QMainWindow):
         elif not self._is_crossfade_mode():
             self._set_output_volume(0.0)
 
-    def _transition_fade_ms(self, space_triggered: bool) -> int:
-        if space_triggered or self._is_crossfade_mode():
+    def _transition_fade_ms(self, space_triggered: bool, *, overlap: bool = False) -> int:
+        if space_triggered or overlap or self._is_crossfade_mode():
             return self._space_fade_duration_ms()
         return self._fade_out_ms()
 
@@ -3948,6 +4111,7 @@ class AudioPlayer(QMainWindow):
         preserve_range_latch: bool = False,
         start_ms: int | None = None,
         force_restart: bool = False,
+        overlap: bool = False,
     ) -> bool:
         if not file_path or not os.path.isfile(file_path):
             return False
@@ -3957,6 +4121,7 @@ class AudioPlayer(QMainWindow):
             preserve_range_latch=preserve_range_latch,
             start_ms=start_ms,
             force_restart=force_restart,
+            overlap=overlap,
         ):
             return True
 
@@ -3985,7 +4150,7 @@ class AudioPlayer(QMainWindow):
             and (current_abs != abs_path or force_restart)
         )
 
-        fade_ms = self._transition_fade_ms(space_triggered)
+        fade_ms = self._transition_fade_ms(space_triggered, overlap=overlap)
         self._pending_transition_fade_ms = fade_ms if switching_track else 0
         # Block EOF/range-end of the dying track from cancelling this takeover
         # (common when Space is pressed in the last ~0.5s).
@@ -4059,7 +4224,7 @@ class AudioPlayer(QMainWindow):
             self._update_timeline_labels()
 
         if fade_ms > 0 and switching_track and not preserve_range_latch:
-            if self._is_crossfade_mode():
+            if self._is_crossfade_mode() or overlap:
                 self._start_crossfade_transition(
                     file_path,
                     abs_path,
@@ -4154,7 +4319,7 @@ class AudioPlayer(QMainWindow):
                 continue
             # Fresh start: do not keep end-latch; force reload after EOF/pause.
             self._range_end_latched = False
-            if self.play_file(path, force_restart=True):
+            if self.play_file(path, force_restart=True, overlap=True):
                 return True
         return False
 
@@ -4433,6 +4598,7 @@ class AudioPlayer(QMainWindow):
             self.player.stop()
             self._set_output_volume(self._playback_volume)
             self._fade_out_started = False
+            self._clear_air_spectrum()
             if queued:
                 self._start_queued_after_stop_fade(queued)
                 return
@@ -4461,6 +4627,7 @@ class AudioPlayer(QMainWindow):
         preserve_range_latch: bool = False,
         start_ms: int | None = None,
         force_restart: bool = False,
+        overlap: bool = False,
     ) -> bool:
         """Hold a next-track start until Stop fade-out finishes."""
         if not self._stop_fade_active:
@@ -4477,6 +4644,7 @@ class AudioPlayer(QMainWindow):
             "preserve_range_latch": preserve_range_latch,
             "start_ms": start_ms,
             "force_restart": force_restart,
+            "overlap": overlap,
             "playlist_num": self.current_playing_playlist,
             "item": self.current_playing_item,
         }
@@ -4505,6 +4673,7 @@ class AudioPlayer(QMainWindow):
             preserve_range_latch=bool(queued.get("preserve_range_latch")),
             start_ms=queued.get("start_ms"),
             force_restart=bool(queued.get("force_restart", True)),
+            overlap=bool(queued.get("overlap")),
         )
 
     def _playlist_index(self, playlist_num: int) -> int:
@@ -4620,9 +4789,22 @@ class AudioPlayer(QMainWindow):
             self._apply_timeline_volume(position)
 
         range_end = self._range_end_ms()
-        if position >= range_end and range_end > 0:
-            if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+        if range_end <= 0:
+            return
+        if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+
+        # NEXT: start the following track `fade` ms before the current one ends.
+        if self.playback_mode == "next":
+            fade_ms = self._space_fade_duration_ms()
+            start_ms = self._range_start_ms()
+            span = max(0, range_end - start_ms)
+            lead = min(fade_ms, max(0, span - 50)) if fade_ms > 0 else 0
+            if position >= range_end - lead:
+                self._handle_range_end()
                 return
+
+        if position >= range_end:
             self._handle_range_end()
 
     def update_time_display(self, *_args):

@@ -27,7 +27,7 @@ class FilePropertiesPanel(QFrame):
         super().__init__(parent)
         self.setObjectName("filePropertiesPanel")
         self.setMinimumWidth(280)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 8)
@@ -36,14 +36,14 @@ class FilePropertiesPanel(QFrame):
 
         self.eq_body = QWidget()
         self.eq_body.setObjectName("eqSectionBody")
-        self.eq_body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.eq_body.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         eq_body_layout = QVBoxLayout(self.eq_body)
         eq_body_layout.setContentsMargins(0, 0, 0, 0)
         eq_body_layout.setSpacing(2)
 
         self.eq_view = ParametricEqView(EqState(), self, compact=True)
-        self.eq_view.setMinimumHeight(140)
-        self.eq_view.setMaximumHeight(180)
+        self.eq_view.setMinimumHeight(200)
+        self.eq_view.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.eq_view.bandsChanged.connect(self.eqChanged.emit)
         self.eq_view.bypassChanged.connect(lambda _c: self.eqChanged.emit())
         eq_body_layout.addWidget(self.eq_view, 1)

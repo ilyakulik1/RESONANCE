@@ -46,13 +46,41 @@ class _EqCanvas(QWidget):
 
     bandsEdited = pyqtSignal()
     selectionChanged = pyqtSignal()
+    _LEFT_AXIS_W = 34
+    _SPECTRUM_DB_MIN = -90.0
+    _BOTTOM_AXIS_H = 22
+
+    # Major / labeled frequency marks (Hz)
+    _FREQ_MAJOR = (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000)
+    # Minor frequency ticks between decades
+    _FREQ_MINOR = (
+        30, 40, 60, 70, 80, 90,
+        150, 250, 300, 400, 600, 700, 800, 900,
+        1500, 2500, 3000, 4000, 6000, 7000, 8000, 9000,
+        12000, 15000, 16000, 18000,
+    )
+    _FREQ_LABELS = (
+        (20, "20"),
+        (50, "50"),
+        (100, "100"),
+        (200, "200"),
+        (500, "500"),
+        (1000, "1k"),
+        (2000, "2k"),
+        (5000, "5k"),
+        (10000, "10k"),
+        (20000, "20k"),
+    )
+    # dB: minor every 3, major (zero/emphasized) at multiples of 6
+    _DB_MINOR = (-15, -9, -3, 3, 9, 15)
+    _DB_MAJOR = (-18, -12, -6, 0, 6, 12, 18)
 
     def __init__(self, state: EqState, parent=None):
         super().__init__(parent)
         self._state = state
         self._spectrum_freqs: np.ndarray | None = None
         self._spectrum_db: np.ndarray | None = None
-        self._curve_freqs = log_freq_axis(256)
+        self._curve_freqs = log_freq_axis(512)
         self._drag_id: str | None = None
         self._drag_q = False
         self.setMinimumHeight(70)
@@ -81,8 +109,18 @@ class _EqCanvas(QWidget):
         self.update()
 
     def _plot_rect(self) -> QRectF:
-        # Leave room under the plot so freq labels stay above the band inspector
-        return QRectF(4, 4, max(1.0, self.width() - 8), max(1.0, self.height() - 18))
+        # Left strip for gain dB labels; bottom strip for freq labels
+        return QRectF(
+            4 + self._LEFT_AXIS_W,
+            4,
+            max(1.0, self.width() - 8 - self._LEFT_AXIS_W),
+            max(1.0, self.height() - self._BOTTOM_AXIS_H),
+        )
+
+    def _spectrum_y(self, db: float, rect: QRectF) -> float:
+        t = (db - self._SPECTRUM_DB_MIN) / (-self._SPECTRUM_DB_MIN)
+        y = rect.bottom() - t * rect.height() * 0.85
+        return max(rect.top(), min(rect.bottom(), y))
 
     def _freq_to_x(self, freq: float, rect: QRectF) -> float:
         f = max(FREQ_MIN_HZ, min(FREQ_MAX_HZ, freq))
@@ -128,31 +166,63 @@ class _EqCanvas(QWidget):
         painter.fillRect(self.rect(), self._bg)
         rect = self._plot_rect()
 
-        # Grid — frequency
-        painter.setPen(QPen(self._grid, 1))
-        for f in (20, 50, 100, 200, 500, 1000, 2000, 5000, 10000, 20000):
+        # Grid — frequency (minor + major)
+        minor_grid = QColor(255, 255, 255, 14)
+        painter.setPen(QPen(minor_grid, 1))
+        for f in self._FREQ_MINOR:
             x = self._freq_to_x(f, rect)
             painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
-        # Grid — dB
-        for db in (-18, -12, -6, 0, 6, 12, 18):
+        painter.setPen(QPen(self._grid, 1))
+        for f in self._FREQ_MAJOR:
+            x = self._freq_to_x(f, rect)
+            painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
+
+        # Grid — dB (EQ gain): every 3 dB, emphasize 0 and ±6/±12/±18
+        painter.setPen(QPen(minor_grid, 1))
+        for db in self._DB_MINOR:
+            y = self._db_to_y(db, rect)
+            painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+        for db in self._DB_MAJOR:
             y = self._db_to_y(db, rect)
             pen = QPen(self._grid_zero if db == 0 else self._grid, 1)
             painter.setPen(pen)
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
 
-        # Spectrum fill
+        # Gain dB axis (left) — every 3 dB, 0 at center
+        painter.setPen(self._label)
+        font = QFont(self.font())
+        font.setPixelSize(8)
+        painter.setFont(font)
+        axis_left = 1
+        for db in sorted(set(self._DB_MAJOR) | set(self._DB_MINOR), reverse=True):
+            y = self._db_to_y(float(db), rect)
+            text = "0" if db == 0 else f"{db:+d}"
+            painter.drawText(axis_left, int(y + 3), text)
+
+        # Spectrum fill (interpolated for smoother detail)
         if (
             self._spectrum_freqs is not None
             and self._spectrum_db is not None
             and len(self._spectrum_freqs) == len(self._spectrum_db)
         ):
+            freqs = np.asarray(self._spectrum_freqs, dtype=np.float64)
+            db_vals = np.asarray(self._spectrum_db, dtype=np.float64)
+            if freqs.size >= 2:
+                freq_interp = np.geomspace(
+                    max(FREQ_MIN_HZ, float(freqs[0])),
+                    min(FREQ_MAX_HZ, float(freqs[-1])),
+                    384,
+                )
+                db_interp = np.interp(freq_interp, freqs, db_vals)
+            else:
+                freq_interp = freqs
+                db_interp = db_vals
+
             path = QPainterPath()
             first = True
             baseline = rect.bottom()
-            for f, db in zip(self._spectrum_freqs, self._spectrum_db):
-                # Map -90..0 dB into lower half visually
-                y = rect.bottom() - ((db + 90.0) / 90.0) * rect.height() * 0.85
-                y = max(rect.top(), min(rect.bottom(), y))
+            for f, db in zip(freq_interp, db_interp):
+                y = self._spectrum_y(float(db), rect)
                 x = self._freq_to_x(float(f), rect)
                 if first:
                     path.moveTo(x, baseline)
@@ -161,7 +231,7 @@ class _EqCanvas(QWidget):
                 else:
                     path.lineTo(x, y)
             if not first:
-                path.lineTo(self._freq_to_x(float(self._spectrum_freqs[-1]), rect), baseline)
+                path.lineTo(self._freq_to_x(float(freq_interp[-1]), rect), baseline)
                 path.closeSubpath()
                 painter.fillPath(path, self._spectrum)
 
@@ -198,15 +268,17 @@ class _EqCanvas(QWidget):
                 painter.setPen(QPen(self._node_sel, 1.5))
                 painter.drawLine(QPointF(p.x() - wing, p.y()), QPointF(p.x() + wing, p.y()))
 
-        # Axis labels (kept inside the canvas bottom strip, clear of band inspector)
+        # Axis labels (freq, bottom strip)
         painter.setPen(self._label)
         font = QFont(self.font())
-        font.setPixelSize(9)
+        font.setPixelSize(8)
         painter.setFont(font)
-        label_y = int(min(rect.bottom() + 12, self.height() - 3))
-        for f, label in ((50, "50"), (200, "200"), (1000, "1k"), (5000, "5k"), (10000, "10k")):
+        label_y = int(min(rect.bottom() + 12, self.height() - 2))
+        for f, label in self._FREQ_LABELS:
             x = self._freq_to_x(f, rect)
-            painter.drawText(int(x - 10), label_y, label)
+            # Approximate center under tick
+            tw = len(label) * 4.5
+            painter.drawText(int(x - tw / 2), label_y, label)
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.button() != Qt.MouseButton.LeftButton:
@@ -326,17 +398,16 @@ class ParametricEqView(QWidget):
 
         self.canvas = _EqCanvas(self._state, self)
         if compact:
-            self.canvas.setMinimumHeight(78)
-            self.canvas.setMaximumHeight(100)
+            self.canvas.setMinimumHeight(140)
             self.canvas.setSizePolicy(
-                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+                QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
             )
             self.canvas.setToolTip(
                 "Double-click: add · Drag: freq/gain · Wheel: Q · Del: remove"
             )
         else:
             self.canvas.setMinimumHeight(140)
-        root.addWidget(self.canvas, 0 if compact else 1)
+        root.addWidget(self.canvas, 1)
 
         inspector = QHBoxLayout()
         inspector.setSpacing(3 if compact else 6)
@@ -415,24 +486,11 @@ class ParametricEqView(QWidget):
         self.btn_delete.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_delete.clicked.connect(self._on_delete)
 
-        if compact:
-            # Own row so BYP/RST/DEL stay clickable in a narrow properties panel.
-            inspector.addStretch(1)
-            root.addLayout(inspector)
-            actions = QHBoxLayout()
-            actions.setSpacing(3)
-            actions.setContentsMargins(0, 0, 0, 0)
-            actions.addWidget(self.btn_bypass)
-            actions.addWidget(self.btn_reset)
-            actions.addWidget(self.btn_delete)
-            actions.addStretch(1)
-            root.addLayout(actions)
-        else:
-            inspector.addStretch(1)
-            inspector.addWidget(self.btn_bypass)
-            inspector.addWidget(self.btn_reset)
-            inspector.addWidget(self.btn_delete)
-            root.addLayout(inspector)
+        inspector.addStretch(1)
+        inspector.addWidget(self.btn_bypass)
+        inspector.addWidget(self.btn_reset)
+        inspector.addWidget(self.btn_delete)
+        root.addLayout(inspector)
 
         self.canvas.bandsEdited.connect(self._on_canvas_edited)
         self.canvas.selectionChanged.connect(self._sync_inspector)

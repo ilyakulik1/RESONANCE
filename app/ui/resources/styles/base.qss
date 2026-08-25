@@ -71,6 +71,24 @@ QPushButton#accentButton:hover {
     background-color: #f06666;
 }
 
+QPushButton#accentButtonSpace {
+    background-color: {{colors.accent_red}};
+    color: {{colors.text_on_accent}};
+    font-size: {{typography.size_xxl}};
+    font-weight: bold;
+    min-width: 108px;
+    padding: {{spacing.sm}} {{spacing.md}};
+    border: none;
+}
+
+QPushButton#accentButtonSpace:hover {
+    background-color: #f06666;
+}
+
+QPushButton#accentButtonSpace:pressed {
+    background-color: {{colors.bg_control_pressed}};
+}
+
 QPushButton#segmentButton {
     min-width: 0;
     min-height: {{sizes.button_min_height}};

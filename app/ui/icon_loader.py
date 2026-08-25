@@ -246,6 +246,7 @@ def load_icon(
         "export": QStyle.StandardPixmap.SP_DialogSaveButton,
         "clear": QStyle.StandardPixmap.SP_DialogCloseButton,
         "to_project": QStyle.StandardPixmap.SP_DirLinkIcon,
+        "copy_to_project": QStyle.StandardPixmap.SP_DirLinkIcon,
         "bpm_all": QStyle.StandardPixmap.SP_BrowserReload,
         "bpm_one": QStyle.StandardPixmap.SP_FileDialogInfoView,
         "back_begin": QStyle.StandardPixmap.SP_MediaSkipBackward,

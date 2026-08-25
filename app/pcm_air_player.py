@@ -33,7 +33,7 @@ _DECODE_PACE_DEPTH = 36  # keep ~1.5s ahead at 48k
 _DECODE_PACE_SLEEP_S = 0.004
 _SPECTRUM_PCM_SAMPLES = 2048
 _SPECTRUM_CAPTURE_EVERY = 10
-_SPECTRUM_BINS = 48
+_SPECTRUM_BINS = 128
 _PREBUFFER_CHUNKS = 3
 _PREBUFFER_TIMEOUT_S = 0.08
 _PUT_TIMEOUT_S = 0.05
@@ -331,6 +331,10 @@ class PcmAirPlayer(QObject):
         self._position_ms = 0
         self._frames_played = 0
         self._seek_frame = 0
+        with self._spectrum_lock:
+            self._spectrum_pcm.fill(0.0)
+            self._spectrum_db.fill(-90.0)
+        self._spectrum_peak = -20.0
         self._set_playback_state(QMediaPlayer.PlaybackState.StoppedState)
         self.positionChanged.emit(0)
 

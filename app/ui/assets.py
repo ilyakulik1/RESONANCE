@@ -19,6 +19,7 @@ ICON_ALIASES: dict[str, tuple[str, ...]] = {
     "refresh": ("refresh",),
     "folder": ("folder",),
     "to_project": ("folder", "to_project"),
+    "copy_to_project": ("folder", "to_project", "copy_to_project"),
     "eject": ("eject",),
     "back_begin": ("back_begin", "back begin"),
     "fade_mode_1": ("fade_mode_1", "fade mode 1"),
