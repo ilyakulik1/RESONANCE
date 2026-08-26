@@ -255,6 +255,11 @@ def detect_bpm(file_path: str) -> int | None:
         if tagged_bpm is not None:
             return tagged_bpm
 
+        from app.time_utils import allows_bpm_loudness_analysis
+
+        if not allows_bpm_loudness_analysis(file_path):
+            return None
+
         samples = load_mono_samples(
             file_path,
             sample_rate=TARGET_SAMPLE_RATE,

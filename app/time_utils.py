@@ -1,7 +1,7 @@
 import os
 import wave
 
-from app.constants import PYDUB_AVAILABLE
+from app.constants import ANALYSIS_MAX_DURATION_MS, PYDUB_AVAILABLE
 
 
 def format_time_ms(ms: int | None) -> str:
@@ -52,3 +52,16 @@ def get_audio_duration_ms(file_path: str) -> int | None:
             pass
 
     return None
+
+
+def allows_bpm_loudness_analysis(
+    file_path: str | None = None,
+    duration_ms: int | None = None,
+) -> bool:
+    """False for tracks longer than ANALYSIS_MAX_DURATION_MS (BPM/loudness skip)."""
+    dur = duration_ms
+    if dur is None and file_path:
+        dur = get_audio_duration_ms(file_path)
+    if dur is None:
+        return True
+    return int(dur) <= ANALYSIS_MAX_DURATION_MS

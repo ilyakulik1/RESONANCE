@@ -12,6 +12,8 @@ DURATION_ROLE = Qt.ItemDataRole.UserRole + 1
 BPM_ROLE = Qt.ItemDataRole.UserRole + 2
 FILE_MISSING_ROLE = Qt.ItemDataRole.UserRole + 3
 COLOR_ROLE = Qt.ItemDataRole.UserRole + 4
+GAIN_DB_ROLE = Qt.ItemDataRole.UserRole + 5
+LUFS_ROLE = Qt.ItemDataRole.UserRole + 6
 
 # Preset mark colors for playlist tracks (stored as #RRGGBB).
 TRACK_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
@@ -110,6 +112,50 @@ def get_item_bpm(item: QListWidgetItem | None) -> float | None:
     if bpm <= 0:
         return None
     return bpm
+
+
+def set_item_gain_db(item: QListWidgetItem, gain_db: float | None) -> None:
+    if gain_db is None:
+        item.setData(GAIN_DB_ROLE, None)
+        return
+    try:
+        item.setData(GAIN_DB_ROLE, float(gain_db))
+    except (TypeError, ValueError):
+        item.setData(GAIN_DB_ROLE, None)
+
+
+def get_item_gain_db(item: QListWidgetItem | None) -> float | None:
+    if item is None:
+        return None
+    value = item.data(GAIN_DB_ROLE)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def set_item_lufs(item: QListWidgetItem, lufs: float | None) -> None:
+    if lufs is None:
+        item.setData(LUFS_ROLE, None)
+        return
+    try:
+        item.setData(LUFS_ROLE, float(lufs))
+    except (TypeError, ValueError):
+        item.setData(LUFS_ROLE, None)
+
+
+def get_item_lufs(item: QListWidgetItem | None) -> float | None:
+    if item is None:
+        return None
+    value = item.data(LUFS_ROLE)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _normalize_color(value: str | None) -> str | None:

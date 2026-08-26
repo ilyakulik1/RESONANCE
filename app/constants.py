@@ -1,6 +1,9 @@
 AUDIO_EXTENSIONS = (".mp3", ".wav", ".m4a", ".flac", ".aac")
-MAX_PLAYLISTS = 3
+MAX_PLAYLISTS = 3  # visible playlist columns
+MAX_TABS_PER_COLUMN = 20
 APP_NAME = "Decibel Player"
+# Skip BPM / loudness analysis for tracks longer than this.
+ANALYSIS_MAX_DURATION_MS = 10 * 60 * 1000
 
 try:
     from pydub import AudioSegment

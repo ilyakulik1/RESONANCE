@@ -67,6 +67,7 @@ class AnalysisCacheEntry:
     bpm: float | None
     peaks: list[float]
     num_bars: int = CANONICAL_WAVEFORM_BARS
+    lufs: float | None = None
 
 
 def resample_peaks(peaks: list[float], num_bars: int) -> list[float]:
@@ -130,9 +131,14 @@ def _load_npz(path: Path, file_path: str) -> AnalysisCacheEntry | None:
             if "size" in data.files and int(data["size"]) != size:
                 return None
             bpm = None if bpm_raw < 0 else bpm_raw
+            lufs = None
+            if "lufs" in data.files:
+                lufs_raw = float(data["lufs"])
+                if lufs_raw > -120.0:
+                    lufs = lufs_raw
             if not peaks:
                 return None
-            return AnalysisCacheEntry(bpm=bpm, peaks=peaks, num_bars=bars)
+            return AnalysisCacheEntry(bpm=bpm, peaks=peaks, num_bars=bars, lufs=lufs)
     except Exception:
         return None
 
@@ -160,10 +166,16 @@ def _load_by_digest(file_path: str, folder: Path | None = None) -> AnalysisCache
                 bars = int(data["num_bars"]) if "num_bars" in data.files else len(peaks)
                 if not peaks:
                     continue
+                lufs = None
+                if "lufs" in data.files:
+                    lufs_raw = float(data["lufs"])
+                    if lufs_raw > -120.0:
+                        lufs = lufs_raw
                 return AnalysisCacheEntry(
                     bpm=None if bpm_raw < 0 else bpm_raw,
                     peaks=peaks,
                     num_bars=bars,
+                    lufs=lufs,
                 )
         except Exception:
             continue
@@ -176,6 +188,7 @@ def save_analysis(
     bpm: float | None,
     peaks: list[float],
     num_bars: int = CANONICAL_WAVEFORM_BARS,
+    lufs: float | None = None,
 ) -> bool:
     path = _cache_path(file_path)
     fp = _file_fingerprint(file_path)
@@ -190,6 +203,7 @@ def save_analysis(
             num_bars=np.int32(num_bars),
             mtime=np.float64(mtime),
             size=np.int64(size),
+            lufs=np.float64(-200.0 if lufs is None else float(lufs)),
         )
         # Drop older cache files for same digest
         digest = fp[0]
@@ -208,6 +222,11 @@ def save_analysis(
 def has_waveform_cache(file_path: str) -> bool:
     entry = load_analysis(file_path)
     return entry is not None and bool(entry.peaks)
+
+
+def has_loudness_cache(file_path: str) -> bool:
+    entry = load_analysis(file_path)
+    return entry is not None and entry.lufs is not None
 
 
 def load_bpm(file_path: str) -> float | None:
@@ -234,6 +253,7 @@ def relocate_analysis(old_path: str, new_path: str) -> bool:
         bpm=entry.bpm,
         peaks=entry.peaks,
         num_bars=entry.num_bars,
+        lufs=entry.lufs,
     )
 
 
@@ -252,6 +272,7 @@ def export_analysis_to_dir(file_path: str, dest_dir: Path | str) -> bool:
             bpm=entry.bpm,
             peaks=entry.peaks,
             num_bars=entry.num_bars,
+            lufs=entry.lufs,
         )
     finally:
         set_cache_dir(previous)

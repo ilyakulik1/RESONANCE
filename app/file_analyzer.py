@@ -1,4 +1,4 @@
-"""Background file analysis: BPM + canonical waveform, with disk cache."""
+"""Background file analysis: BPM + waveform + loudness, with disk cache."""
 
 from __future__ import annotations
 
@@ -11,12 +11,14 @@ from PyQt6.QtWidgets import QListWidgetItem
 
 from app.analysis_cache import (
     CANONICAL_WAVEFORM_BARS,
+    has_loudness_cache,
     has_waveform_cache,
     load_analysis,
     save_analysis,
 )
 from app.audio_utils import generate_waveform_data
 from app.bpm_detector import detect_bpm
+from app.loudness import measure_file_lufs
 
 
 @dataclass
@@ -27,7 +29,7 @@ class _AnalyzeJob:
 
 
 class _AnalyzeWorker(QThread):
-    finished = pyqtSignal(str, object, object)  # path, bpm, peaks
+    finished = pyqtSignal(str, object, object, object, bool)  # path, bpm, peaks, lufs, force
 
     def __init__(self, file_path: str, *, force: bool = False):
         super().__init__()
@@ -40,25 +42,40 @@ class _AnalyzeWorker(QThread):
         path = self._file_path
         bpm: float | None = None
         peaks: list[float] | None = None
+        lufs: float | None = None
+
+        from app.time_utils import allows_bpm_loudness_analysis
+
+        allow_bpm_lufs = allows_bpm_loudness_analysis(path)
 
         if not self._force:
             cached = load_analysis(path)
             if cached is not None and cached.peaks:
                 bpm = cached.bpm
                 peaks = list(cached.peaks)
-                if bpm is None:
+                lufs = cached.lufs
+                dirty = False
+                if allow_bpm_lufs and bpm is None:
                     bpm = detect_bpm(path)
                     if isinstance(bpm, (int, float)):
-                        save_analysis(path, bpm=float(bpm), peaks=peaks)
+                        bpm = float(bpm)
+                        dirty = True
+                if allow_bpm_lufs and lufs is None and not self.isInterruptionRequested():
+                    lufs = measure_file_lufs(path)
+                    if lufs is not None:
+                        dirty = True
+                if dirty:
+                    save_analysis(path, bpm=bpm, peaks=peaks, lufs=lufs)
                 if not self.isInterruptionRequested():
-                    self.finished.emit(path, bpm, peaks)
+                    self.finished.emit(path, bpm, peaks, lufs, False)
                 return
 
         if self.isInterruptionRequested():
             return
-        bpm_raw = detect_bpm(path)
-        if isinstance(bpm_raw, (int, float)):
-            bpm = float(bpm_raw)
+        if allow_bpm_lufs:
+            bpm_raw = detect_bpm(path)
+            if isinstance(bpm_raw, (int, float)):
+                bpm = float(bpm_raw)
 
         if self.isInterruptionRequested():
             return
@@ -68,18 +85,26 @@ class _AnalyzeWorker(QThread):
             start_ms=0,
             end_ms=None,
         )
+
+        if self.isInterruptionRequested():
+            return
+        if allow_bpm_lufs:
+            lufs = measure_file_lufs(path)
+
         if peaks:
-            save_analysis(path, bpm=bpm, peaks=peaks, num_bars=len(peaks))
+            save_analysis(path, bpm=bpm, peaks=peaks, num_bars=len(peaks), lufs=lufs)
 
         if not self.isInterruptionRequested():
-            self.finished.emit(path, bpm, peaks or [])
+            self.finished.emit(path, bpm, peaks or [], lufs, True)
 
 
 class FileAnalyzer(QObject):
-    """Queue analysis jobs that produce BPM + waveform peaks."""
+    """Queue analysis jobs that produce BPM + waveform peaks + loudness."""
 
-    item_analyzed = pyqtSignal(object, str, object, object)  # item, path, bpm, peaks
-    file_analyzed = pyqtSignal(str, object, object)  # path, bpm, peaks
+    item_analyzed = pyqtSignal(
+        object, str, object, object, object, bool
+    )  # item, path, bpm, peaks, lufs, force
+    file_analyzed = pyqtSignal(str, object, object, object, bool)  # path, bpm, peaks, lufs, force
     progress = pyqtSignal(int, int)  # done, total
     busyChanged = pyqtSignal(bool)
     statusChanged = pyqtSignal(str)
@@ -98,7 +123,8 @@ class FileAnalyzer(QObject):
         return self._busy
 
     def analyze_playlist(self, playlist, *, only_missing: bool = True) -> int:
-        from app.playlist_io import get_item_bpm
+        from app.playlist_io import get_item_bpm, get_item_duration
+        from app.time_utils import allows_bpm_loudness_analysis
 
         jobs: list[_AnalyzeJob] = []
         for row in range(playlist.count()):
@@ -109,9 +135,13 @@ class FileAnalyzer(QObject):
             if not file_path or not os.path.isfile(file_path):
                 continue
             if only_missing:
-                has_bpm = get_item_bpm(item) is not None
+                long_track = not allows_bpm_loudness_analysis(
+                    file_path, get_item_duration(item)
+                )
+                has_bpm = get_item_bpm(item) is not None or long_track
                 has_wave = has_waveform_cache(file_path)
-                if has_bpm and has_wave:
+                has_lufs = has_loudness_cache(file_path) or long_track
+                if has_bpm and has_wave and has_lufs:
                     continue
             jobs.append(_AnalyzeJob(os.path.abspath(file_path), item=item, force=False))
 
@@ -182,7 +212,14 @@ class FileAnalyzer(QObject):
         self._worker = None
         self._active = None
 
-    def _on_worker_finished(self, file_path: str, bpm: object, peaks: object) -> None:
+    def _on_worker_finished(
+        self,
+        file_path: str,
+        bpm: object,
+        peaks: object,
+        lufs: object,
+        force: bool = False,
+    ) -> None:
         job = self._active
         worker = self._worker
         self._worker = None
@@ -195,10 +232,13 @@ class FileAnalyzer(QObject):
         self.progress.emit(self._done, total)
 
         peak_list = peaks if isinstance(peaks, list) else []
+        force_flag = bool(force)
         if job is not None and job.item is not None:
-            self.item_analyzed.emit(job.item, file_path, bpm, peak_list)
+            self.item_analyzed.emit(
+                job.item, file_path, bpm, peak_list, lufs, force_flag
+            )
         else:
-            self.file_analyzed.emit(file_path, bpm, peak_list)
+            self.file_analyzed.emit(file_path, bpm, peak_list, lufs, force_flag)
 
         if self._queue:
             self._start_next()

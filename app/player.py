@@ -38,18 +38,23 @@ from app.playlist_io import (
     get_item_color,
     get_item_duration,
     get_item_file_path,
+    get_item_gain_db,
+    get_item_lufs,
     load_playlist_from_entries,
-    load_playlist_from_file,
-    save_playlist_to_file,
     set_item_bpm,
     set_item_color,
     set_item_duration,
+    set_item_gain_db,
+    set_item_lufs,
 )
+from app.loudness import TARGET_LUFS, clamp_gain_db, clamp_target_lufs, gain_db_to_target
 from app.project import (
+    ProjectColumnState,
     ProjectManager,
     ProjectPlaylistState,
     ProjectState,
     default_project_root,
+    empty_project_columns,
 )
 from app.time_utils import format_time_ms, get_audio_duration_ms
 from app.waveform_cache import WaveformCache, WaveformCacheEntry, WaveformCacheKey
@@ -99,20 +104,22 @@ class AudioPlayer(QMainWindow):
         self._outputs[1].setVolume(0.0)
 
         self.config_path = get_config_path("config.json")
-        self.playlist_paths = [
-            get_config_path(f"playlist{i}.json") for i in range(1, MAX_PLAYLISTS + 1)
-        ]
         self.project = ProjectManager(_peek_saved_project_root())
         self._pending_project_root = str(self.project.root)
         self._project_video_mixer: dict | None = None
+        self._playlist_id_counter = 0
 
         self.last_selected_playlist = None
         self._is_window_resizing = False
         self._stable_window_size = None
         self._track_timeline_state: dict[str, TimelineState] = {}
         self._track_eq_state: dict[str, dict] = {}
+        self._track_gain_db: dict[str, float] = {}
+        self._track_lufs: dict[str, float] = {}
+        self._target_lufs = TARGET_LUFS
         self._eq_bound_path: str | None = None
         self._eq_loading = False
+        self._gain_loading = False
         self._fade_out_started = False
         self._handling_range_end = False
         self._range_end_latched = False
@@ -144,6 +151,7 @@ class AudioPlayer(QMainWindow):
         self._crossfade_incoming_idx: int | None = None
         self._pending_playback_player_idx: int | None = None
         self._crossfade_active = False
+        self._high_cut_active = False
         self._crossfade_fade_in_ms = 0
         self._crossfade_incoming_ready_to_play = False
 
@@ -199,7 +207,7 @@ class AudioPlayer(QMainWindow):
         self.setup_ui()
         self._setup_air_spectrum()
         self._setup_audio_output_devices()
-        self._update_fade_mode_button()
+        self._update_fade_mode_ui()
         self.duration_prober = DurationProber(self)
         self.duration_prober.itemProbed.connect(self._on_playlist_item_probed)
         self.bpm_detector = BpmDetector(self)
@@ -243,9 +251,6 @@ class AudioPlayer(QMainWindow):
             playlist.duration_prober = self.duration_prober
             playlist.set_playlist_registry(self.playlists)
             playlist.itemDropped.connect(self._on_playlist_item_dropped)
-            playlist.tracksChanged.connect(
-                lambda pl=playlist: self.refresh_playlist_footer(pl)
-            )
         self.setup_connections()
         self.setup_shortcuts()
         self._setup_menus()
@@ -407,7 +412,7 @@ class AudioPlayer(QMainWindow):
     def _apply_output_volume(self, volume: float) -> None:
         volume = max(0.0, min(1.0, volume))
         self._output_volume = volume
-        if self._crossfade_active:
+        if self._crossfade_active or self._high_cut_active:
             return
         self._apply_player_volume(self._active_player_idx, volume)
 
@@ -416,7 +421,7 @@ class AudioPlayer(QMainWindow):
         self._apply_output_volume(volume)
 
     def _reapply_output_volume(self) -> None:
-        if self._crossfade_active:
+        if self._crossfade_active or self._high_cut_active:
             return
         if self.volume_fader.is_active:
             self._apply_output_volume(self.volume_fader.current_volume)
@@ -617,9 +622,10 @@ class AudioPlayer(QMainWindow):
             pass
 
     def _update_file_properties(self, file_path: str | None = None) -> None:
-        """Bind air EQ to the current on-air track (metadata lives on preview)."""
+        """Bind air EQ/gain to the current on-air track (metadata lives on preview)."""
         path = file_path or self._current_file_path
         self._bind_eq_to_path(path)
+        self._bind_gain_to_path(path)
 
     def _update_preview_properties(self, file_path: str | None = None) -> None:
         if not hasattr(self, "preview_properties_panel"):
@@ -628,7 +634,16 @@ class AudioPlayer(QMainWindow):
         bpm = None
         if self._preview_item is not None:
             bpm = get_item_bpm(self._preview_item)
-        self.preview_properties_panel.set_file(path, bpm=bpm)
+        key = os.path.abspath(path) if path else None
+        lufs = self._track_lufs.get(key) if key else None
+        if lufs is None and self._preview_item is not None:
+            lufs = get_item_lufs(self._preview_item)
+        gain_db = self._track_gain_db.get(key, 0.0) if key else None
+        if gain_db is None and self._preview_item is not None:
+            gain_db = get_item_gain_db(self._preview_item)
+        self.preview_properties_panel.set_file(
+            path, bpm=bpm, lufs=lufs, gain_db=gain_db
+        )
 
     def _eq_path_key(self, file_path: str | None = None) -> str | None:
         path = file_path or self._current_file_path or self._displayed_track_path
@@ -684,6 +699,7 @@ class AudioPlayer(QMainWindow):
             player.setSource(QUrl())
             return
         player.set_eq_state(self._eq_state_for_path(file_path))
+        player.set_track_gain_db(self._gain_db_for_path(file_path))
         player.setSource(QUrl.fromLocalFile(file_path))
 
     def _apply_live_eq_to_air(self) -> None:
@@ -719,6 +735,7 @@ class AudioPlayer(QMainWindow):
         # _set_air_source when the source is set.
         if (
             self._crossfade_active
+            or self._high_cut_active
             or self._suppress_range_end
             or self._pending_playback_start
         ):
@@ -727,6 +744,191 @@ class AudioPlayer(QMainWindow):
             self.player.set_eq_state(state)
         except Exception:
             pass
+
+    def _gain_db_for_path(self, file_path: str | None) -> float:
+        if not file_path:
+            return 0.0
+        key = os.path.abspath(file_path)
+        return float(self._track_gain_db.get(key, 0.0))
+
+    def _lufs_for_path(self, file_path: str | None) -> float | None:
+        if not file_path:
+            return None
+        return self._track_lufs.get(os.path.abspath(file_path))
+
+    def _save_gain_for_bound_path(self) -> None:
+        if not hasattr(self, "file_properties_panel") or self._gain_loading:
+            return
+        key = self._eq_bound_path
+        if not key:
+            return
+        self._track_gain_db[key] = clamp_gain_db(self.file_properties_panel.gain_db())
+
+    def _bind_gain_to_path(self, file_path: str | None) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        key = self._eq_path_key(file_path) if file_path else None
+        gain = float(self._track_gain_db.get(key, 0.0)) if key else 0.0
+        lufs = self._track_lufs.get(key) if key else None
+        self._gain_loading = True
+        try:
+            self.file_properties_panel.set_gain_db(gain, lufs=lufs)
+        finally:
+            self._gain_loading = False
+        self._apply_live_gain_to_air()
+
+    def _apply_live_gain_to_air(self) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        gain = clamp_gain_db(self.file_properties_panel.gain_db())
+        key = self._eq_bound_path
+        applied = False
+        for idx, player in enumerate(self._players):
+            try:
+                src = player.source().toLocalFile()
+            except Exception:
+                continue
+            if not src:
+                continue
+            src_abs = os.path.abspath(src)
+            if key is not None:
+                if src_abs == key:
+                    player.set_track_gain_db(gain)
+                    applied = True
+            elif idx == self._active_player_idx:
+                player.set_track_gain_db(gain)
+                applied = True
+        if applied:
+            return
+        if (
+            self._crossfade_active
+            or self._high_cut_active
+            or self._suppress_range_end
+            or self._pending_playback_start
+        ):
+            return
+        try:
+            self.player.set_track_gain_db(gain)
+        except Exception:
+            pass
+
+    def _on_gain_changed(self, gain_db: float) -> None:
+        if self._gain_loading or self._eq_loading:
+            return
+        key = self._eq_bound_path
+        if key:
+            gain = clamp_gain_db(gain_db)
+            self._track_gain_db[key] = gain
+            self._sync_gain_to_playlist_items(key, gain)
+        self._apply_live_gain_to_air()
+        if not hasattr(self, "_gain_save_timer"):
+            self._gain_save_timer = QTimer(self)
+            self._gain_save_timer.setSingleShot(True)
+            self._gain_save_timer.timeout.connect(self._persist_gain_changes)
+        self._gain_save_timer.start(400)
+
+    def _persist_gain_changes(self) -> None:
+        self._save_gain_for_bound_path()
+        self.save_config()
+
+    def _sync_gain_to_playlist_items(self, file_path: str, gain_db: float) -> None:
+        abs_path = os.path.abspath(file_path)
+        for playlist in getattr(self, "playlists", []) or []:
+            for row in range(playlist.count()):
+                item = playlist.item(row)
+                path = get_item_file_path(item)
+                if path and os.path.abspath(path) == abs_path:
+                    set_item_gain_db(item, gain_db)
+                    playlist.viewport().update()
+
+    def _apply_analyzed_loudness(
+        self,
+        file_path: str,
+        lufs: float,
+        *,
+        item=None,
+        force_gain: bool = False,
+    ) -> None:
+        """Store measured LUFS and auto-set gain toward the current target."""
+        key = os.path.abspath(file_path)
+        self._track_lufs[key] = float(lufs)
+        if item is not None:
+            set_item_lufs(item, float(lufs))
+        suggested = gain_db_to_target(float(lufs), target_lufs=self._target_lufs_value())
+        if force_gain or key not in self._track_gain_db:
+            self._track_gain_db[key] = suggested
+            if item is not None:
+                set_item_gain_db(item, suggested)
+            if self._eq_bound_path == key and hasattr(self, "file_properties_panel"):
+                self._gain_loading = True
+                try:
+                    self.file_properties_panel.set_gain_db(suggested, lufs=float(lufs))
+                finally:
+                    self._gain_loading = False
+                self._apply_live_gain_to_air()
+            else:
+                for player in self._players:
+                    try:
+                        src = player.source().toLocalFile()
+                    except Exception:
+                        continue
+                    if src and os.path.abspath(src) == key:
+                        player.set_track_gain_db(suggested)
+        elif self._eq_bound_path == key and hasattr(self, "file_properties_panel"):
+            self.file_properties_panel.set_lufs(float(lufs))
+        preview = getattr(self, "_preview_file_path", None)
+        if preview and os.path.abspath(preview) == key and hasattr(
+            self, "preview_properties_panel"
+        ):
+            self.preview_properties_panel.set_loudness(
+                float(lufs), self._track_gain_db.get(key, 0.0)
+            )
+
+    def _target_lufs_value(self) -> float:
+        if hasattr(self, "file_properties_panel") and self.file_properties_panel is not None:
+            return clamp_target_lufs(self.file_properties_panel.target_lufs())
+        return clamp_target_lufs(self._target_lufs)
+
+    def _on_target_lufs_changed(self, target_lufs: float) -> None:
+        self._target_lufs = clamp_target_lufs(target_lufs)
+        self._reapply_gains_to_target()
+        if not hasattr(self, "_target_lufs_save_timer"):
+            self._target_lufs_save_timer = QTimer(self)
+            self._target_lufs_save_timer.setSingleShot(True)
+            self._target_lufs_save_timer.timeout.connect(self.save_config)
+        self._target_lufs_save_timer.start(400)
+
+    def _reapply_gains_to_target(self) -> None:
+        """Recalculate per-track gain for every track with measured LUFS."""
+        target = self._target_lufs_value()
+        for key, lufs in list(self._track_lufs.items()):
+            suggested = gain_db_to_target(float(lufs), target_lufs=target)
+            self._track_gain_db[key] = suggested
+            self._sync_gain_to_playlist_items(key, suggested)
+            for player in self._players:
+                try:
+                    src = player.source().toLocalFile()
+                except Exception:
+                    continue
+                if src and os.path.abspath(src) == key:
+                    player.set_track_gain_db(suggested)
+        bound = self._eq_bound_path
+        if bound and hasattr(self, "file_properties_panel"):
+            gain = float(self._track_gain_db.get(bound, 0.0))
+            lufs = self._track_lufs.get(bound)
+            self._gain_loading = True
+            try:
+                self.file_properties_panel.set_gain_db(gain, lufs=lufs)
+            finally:
+                self._gain_loading = False
+            self._apply_live_gain_to_air()
+        preview = getattr(self, "_preview_file_path", None)
+        if preview and hasattr(self, "preview_properties_panel"):
+            key = os.path.abspath(preview)
+            self.preview_properties_panel.set_loudness(
+                self._track_lufs.get(key),
+                self._track_gain_db.get(key, 0.0),
+            )
 
     def _on_eq_changed(self) -> None:
         if self._eq_loading:
@@ -778,6 +980,12 @@ class AudioPlayer(QMainWindow):
                 set_item_bpm(item, cached_bpm)
                 self._save_playlist_for_item(item)
             return
+        from app.time_utils import allows_bpm_loudness_analysis
+
+        duration = get_item_duration(item) if item is not None else None
+        if not allows_bpm_loudness_analysis(file_path, duration):
+            self.bpm_label.setText("—")
+            return
         self._set_bpm_label_detecting()
         self.bpm_detector.request_bpm(file_path)
 
@@ -786,18 +994,50 @@ class AudioPlayer(QMainWindow):
         if not isinstance(widget, PlaylistWidget):
             return
         try:
-            playlist_index = self.playlists.index(widget)
-        except ValueError:
-            return
-        save_playlist_to_file(
-            widget,
-            str(self.playlist_paths[playlist_index]),
-            self._track_timeline_state,
-        )
-        try:
             self.project.save_raw(self._build_project_state())
         except Exception as exc:
             print(f"Project auto-save error: {exc}")
+
+    def _alloc_playlist_num(self) -> int:
+        self._playlist_id_counter += 1
+        return self._playlist_id_counter
+
+    def _rebuild_playlist_registry(self) -> None:
+        playlists: list[PlaylistWidget] = []
+        columns = getattr(self, "playlist_columns", None) or []
+        for column in columns:
+            playlists.extend(column.all_playlists())
+        self.playlists = playlists
+        for playlist in self.playlists:
+            if hasattr(self, "duration_prober"):
+                playlist.duration_prober = self.duration_prober
+            playlist.set_playlist_registry(self.playlists)
+            # Ensure drop / import signals are connected once
+            try:
+                playlist.itemDropped.disconnect(self._on_playlist_item_dropped)
+            except TypeError:
+                pass
+            playlist.itemDropped.connect(self._on_playlist_item_dropped)
+            try:
+                playlist.fileImported.disconnect(self._on_playlist_file_imported)
+            except TypeError:
+                pass
+            playlist.fileImported.connect(self._on_playlist_file_imported)
+
+    def _on_playlist_file_imported(self, item, file_path: str) -> None:
+        """Auto-queue BPM + waveform analysis when a track is added to a playlist."""
+        if item is None or not file_path or not os.path.isfile(file_path):
+            return
+        if not hasattr(self, "file_analyzer"):
+            return
+        self.file_analyzer.analyze_item(item, file_path, force=False)
+
+    def _on_playlist_tabs_changed(self) -> None:
+        self._rebuild_playlist_registry()
+        if hasattr(self, "duration_prober"):
+            for playlist in self.get_visible_playlists():
+                self.duration_prober.probe_playlist(playlist)
+        self._update_playlist_focus_highlight()
 
     def _on_bpm_detected(self, file_path: str, bpm: object) -> None:
         current_abs = os.path.abspath(self._current_file_path) if self._current_file_path else None
@@ -832,21 +1072,15 @@ class AudioPlayer(QMainWindow):
                 self.bpm_label.setText("?")
 
     def analyze_playlist_files(self, playlist: PlaylistWidget) -> None:
+        """Queue missing analysis for all tracks (used internally / automation)."""
         if playlist.count() == 0:
-            QMessageBox.information(self, "Analyze", "Playlist is empty.")
             return
-        queued = self.file_analyzer.analyze_playlist(playlist, only_missing=True)
-        if queued == 0:
-            QMessageBox.information(
-                self,
-                "Analyze",
-                "All tracks already have BPM and cached waveforms.",
-            )
+        self.file_analyzer.analyze_playlist(playlist, only_missing=True)
 
     def analyze_selected_file(self, playlist: PlaylistWidget) -> None:
         item = playlist.currentItem()
         if item is None:
-            QMessageBox.information(self, "Analyze", "Select a track to analyze.")
+            QMessageBox.information(self, "Analyze", "Select a track to re-analyze.")
             return
         file_path = playlist.file_path_at(playlist.currentRow())
         if not file_path:
@@ -864,7 +1098,15 @@ class AudioPlayer(QMainWindow):
         """Backward-compatible alias."""
         self.analyze_selected_file(playlist)
 
-    def _on_item_analyzed(self, item, file_path: str, bpm: object, peaks: object) -> None:
+    def _on_item_analyzed(
+        self,
+        item,
+        file_path: str,
+        bpm: object,
+        peaks: object,
+        lufs: object = None,
+        force: bool = False,
+    ) -> None:
         widget = item.listWidget() if item is not None else None
         if isinstance(bpm, (int, float)):
             set_item_bpm(item, float(bpm))
@@ -876,8 +1118,22 @@ class AudioPlayer(QMainWindow):
         if isinstance(peaks, list) and peaks:
             self._store_waveform_cache(file_path, peaks, 0, 0)
             self._apply_analysis_peaks_if_current(file_path, peaks)
+        if isinstance(lufs, (int, float)):
+            self._apply_analyzed_loudness(
+                file_path, float(lufs), item=item, force_gain=bool(force)
+            )
+            if widget is not None:
+                widget.viewport().update()
+            self._save_playlist_for_item(item)
 
-    def _on_file_analyzed(self, file_path: str, bpm: object, peaks: object) -> None:
+    def _on_file_analyzed(
+        self,
+        file_path: str,
+        bpm: object,
+        peaks: object,
+        lufs: object = None,
+        force: bool = False,
+    ) -> None:
         if isinstance(bpm, (int, float)):
             current_abs = os.path.abspath(self._current_file_path) if self._current_file_path else None
             if current_abs == os.path.abspath(file_path):
@@ -888,6 +1144,10 @@ class AudioPlayer(QMainWindow):
         if isinstance(peaks, list) and peaks:
             self._store_waveform_cache(file_path, peaks, 0, 0)
             self._apply_analysis_peaks_if_current(file_path, peaks)
+        if isinstance(lufs, (int, float)):
+            self._apply_analyzed_loudness(
+                file_path, float(lufs), force_gain=bool(force)
+            )
 
     def _apply_analysis_peaks_if_current(self, file_path: str, peaks: list) -> None:
         abs_path = os.path.abspath(file_path)
@@ -940,11 +1200,17 @@ class AudioPlayer(QMainWindow):
             self.refresh_playlist_footer(self.get_playlist(to_playlist_num))
 
     def refresh_playlist_footer(self, playlist: PlaylistWidget | None = None) -> None:
-        for i, pl in enumerate(self.playlists):
-            if playlist is not None and pl is not playlist:
-                continue
-            if i >= len(self.playlist_footer_labels):
-                continue
+        columns = getattr(self, "playlist_columns", None) or []
+        targets: list[PlaylistWidget] = []
+        if playlist is not None:
+            targets = [playlist]
+        else:
+            for column in columns:
+                current = column.current_playlist()
+                if current is not None:
+                    targets.append(current)
+
+        for pl in targets:
             count, total_ms = pl.get_stats()
             hours = total_ms // 3_600_000
             minutes = (total_ms % 3_600_000) // 60_000
@@ -953,22 +1219,60 @@ class AudioPlayer(QMainWindow):
                 total_text = f"{hours}:{minutes:02d}:{seconds:02d}"
             else:
                 total_text = f"{minutes}:{seconds:02d}"
-            self.playlist_footer_labels[i].setText(
-                f"Total Tracks: {count}   Total Time: {total_text}"
-            )
+            column = self._column_for_playlist(pl)
+            if column is None:
+                continue
+            # Only update footer when this playlist is the active tab
+            if column.current_playlist() is pl:
+                column.footer_label.setText(
+                    f"Total Tracks: {count}   Total Time: {total_text}"
+                )
+
+    def _column_for_playlist(self, playlist: PlaylistWidget):
+        columns = getattr(self, "playlist_columns", None) or []
+        col_idx = getattr(playlist, "_column_index", None)
+        if isinstance(col_idx, int) and 0 <= col_idx < len(columns):
+            return columns[col_idx]
+        for column in columns:
+            if playlist in column.all_playlists():
+                return column
+        return None
 
     def get_visible_playlists(self) -> list[PlaylistWidget]:
-        return self.playlists[:self.columns_spin.value()]
+        """Active tab of each visible column (playback / selection order)."""
+        count = self.columns_spin.value() if hasattr(self, "columns_spin") else MAX_PLAYLISTS
+        columns = getattr(self, "playlist_columns", None) or []
+        result: list[PlaylistWidget] = []
+        for column in columns[:count]:
+            current = column.current_playlist()
+            if current is not None:
+                result.append(current)
+        return result
 
-    def get_playlist(self, playlist_num: int) -> PlaylistWidget:
-        return self.playlists[playlist_num - 1]
+    def get_playlist(self, playlist_num: int) -> PlaylistWidget | None:
+        for playlist in self.playlists:
+            if playlist.playlist_num == playlist_num:
+                return playlist
+        return None
 
     def default_playlist_title(self, playlist_num: int) -> str:
         return f"Playlist {playlist_num}"
 
     def get_playlist_title(self, playlist_num: int) -> str:
         custom = self._playlist_titles.get(playlist_num, "").strip()
-        return custom or self.default_playlist_title(playlist_num)
+        if custom:
+            return custom
+        playlist = self.get_playlist(playlist_num)
+        column = self._column_for_playlist(playlist) if playlist else None
+        if column is not None and playlist is not None:
+            for i in range(column.tabs.count()):
+                page = column.tabs.widget(i)
+                pl = getattr(page, "playlist_widget", None) if page else None
+                if pl is playlist:
+                    text = column.tabs.tabText(i).strip()
+                    if text:
+                        return text
+        return self.default_playlist_title(playlist_num)
 
     def on_playlist_title_changed(self, playlist_num: int, title: str) -> None:
         title = title.strip()
@@ -979,21 +1283,26 @@ class AudioPlayer(QMainWindow):
         else:
             self._playlist_titles[playlist_num] = title
             canonical = title
-
-        header = self.playlist_headers[playlist_num - 1]
-        if header.title() != canonical:
-            header.setTitle(canonical)
+        playlist = self.get_playlist(playlist_num)
+        column = self._column_for_playlist(playlist) if playlist else None
+        if column is None or playlist is None:
+            return
+        for i in range(column.tabs.count()):
+            page = column.tabs.widget(i)
+            pl = getattr(page, "playlist_widget", None) if page else None
+            if pl is playlist:
+                column.tabs.setTabText(i, canonical)
+                break
 
     def _apply_playlist_header_titles(self) -> None:
-        for i, header in enumerate(self.playlist_headers, start=1):
-            header.setTitle(self.get_playlist_title(i))
+        return
 
     def set_playlist_columns(self, count: int):
         for i, panel in enumerate(self.playlist_panels):
             panel.setVisible(i < count)
         if not hasattr(self, "duration_prober"):
             return
-        for playlist in self.playlists[:count]:
+        for playlist in self.get_visible_playlists():
             self.duration_prober.probe_playlist(playlist)
             playlist.viewport().update()
 
@@ -1001,12 +1310,11 @@ class AudioPlayer(QMainWindow):
         if item is None:
             return
         self.last_selected_playlist = playlist_num
-        for i, playlist in enumerate(self.get_visible_playlists(), start=1):
-            if i != playlist_num and playlist.currentItem() is not None:
+        for playlist in self.get_visible_playlists():
+            if playlist.playlist_num != playlist_num and playlist.currentItem() is not None:
                 playlist.blockSignals(True)
                 playlist.clearSelection()
                 playlist.blockSignals(False)
-        # Lock focus before preview load — media/waveform callbacks often steal it.
         self._retain_playlist_keyboard_focus(playlist_num)
         self.load_preview_track(playlist_num, item)
         self._retain_playlist_keyboard_focus(playlist_num)
@@ -1014,8 +1322,8 @@ class AudioPlayer(QMainWindow):
     def _retain_playlist_keyboard_focus(self, playlist_num: int) -> None:
         """Keep ↑/↓ on the playlist even if preview loading moves focus."""
         self._retain_playlist_focus_num = playlist_num
-        for i, playlist in enumerate(self.playlists, start=1):
-            playlist.set_reclaim_focus(i == playlist_num)
+        for playlist in self.playlists:
+            playlist.set_reclaim_focus(playlist.playlist_num == playlist_num)
         self._restore_playlist_keyboard_focus()
         self._update_playlist_focus_highlight()
         QTimer.singleShot(0, self._restore_playlist_keyboard_focus)
@@ -1096,9 +1404,9 @@ class AudioPlayer(QMainWindow):
             elif hasattr(self, "file_browser") and self._widget_belongs_to(new, self.file_browser):
                 self._clear_playlist_focus_retain()
             elif playlist is not None and new != playlist:
-                for i, other in enumerate(self.playlists, start=1):
-                    if other == new and i != self._retain_playlist_focus_num:
-                        self._retain_playlist_keyboard_focus(i)
+                for other in self.playlists:
+                    if other == new and other.playlist_num != self._retain_playlist_focus_num:
+                        self._retain_playlist_keyboard_focus(other.playlist_num)
                         break
 
         self._update_playlist_focus_highlight()
@@ -1118,21 +1426,21 @@ class AudioPlayer(QMainWindow):
 
     def _update_playlist_focus_highlight(self) -> None:
         focused = QApplication.focusWidget()
-        for index, playlist in enumerate(self.playlists):
-            panel = (
-                self.playlist_panels[index]
-                if index < len(self.playlist_panels)
-                else None
-            )
-            num = index + 1
-            in_panel = panel is not None and self._widget_belongs_to(focused, panel)
+        for playlist in self.playlists:
+            column = self._column_for_playlist(playlist)
+            num = playlist.playlist_num
+            in_panel = column is not None and self._widget_belongs_to(focused, column)
             retained = self._retain_playlist_focus_num == num
-            # Keep blue ring while this playlist is the keyboard target,
-            # even if Qt focus briefly jumps during preview load / style polish.
-            is_active = retained or in_panel or (
+            is_active = retained or (
+                in_panel and column is not None and column.current_playlist() is playlist
+            ) or (
                 focused is None and self.last_selected_playlist == num
             )
-            list_frame = playlist.parentWidget()
+            list_frame = None
+            if column is not None:
+                list_frame = column.list_frame_for(playlist)
+            if list_frame is None:
+                list_frame = playlist.parentWidget()
             if list_frame is None:
                 continue
             previous = list_frame.property("playlistActive")
@@ -1147,15 +1455,15 @@ class AudioPlayer(QMainWindow):
     def get_selected_track(self) -> tuple[int | None, object | None]:
         if self.last_selected_playlist is not None:
             playlist = self.get_playlist(self.last_selected_playlist)
-            if playlist.isVisible():
+            if playlist is not None and playlist.isVisible():
                 item = playlist.currentItem()
                 if item:
                     return self.last_selected_playlist, item
 
-        for i, playlist in enumerate(self.get_visible_playlists(), start=1):
+        for playlist in self.get_visible_playlists():
             item = playlist.currentItem()
             if item:
-                return i, item
+                return playlist.playlist_num, item
         return None, None
 
     @staticmethod
@@ -1168,6 +1476,8 @@ class AudioPlayer(QMainWindow):
 
     def on_playlist_item_renamed(self, playlist_num, item):
         playlist = self.get_playlist(playlist_num)
+        if playlist is None:
+            return
         playlist.viewport().update()
         if self.current_playing_item is not item:
             return
@@ -1182,16 +1492,21 @@ class AudioPlayer(QMainWindow):
             self.playback_mode_group.set_value(mode)
 
     def change_playlist_font(self, playlist_num, size):
+        playlist = self.get_playlist(playlist_num)
+        if playlist is None:
+            return
         family = get_token("typography.font_family_ui", "Arial")
-        self.get_playlist(playlist_num).set_playlist_font(QFont(family, size))
+        playlist._font_size = int(size)
+        playlist.set_playlist_font(QFont(family, size))
 
     def refresh_playlist_display(self):
-        for index, playlist in enumerate(self.playlists):
-            if index < len(self.font_size_spins):
-                self.change_playlist_font(index + 1, self.font_size_spins[index].value())
+        for playlist in self.playlists:
+            size = int(getattr(playlist, "_font_size", 13) or 13)
+            self.change_playlist_font(playlist.playlist_num, size)
             playlist.viewport().update()
         for playlist in self.get_visible_playlists():
-            self.duration_prober.probe_playlist(playlist)
+            if hasattr(self, "duration_prober"):
+                self.duration_prober.probe_playlist(playlist)
         for playlist in self.playlists:
             self.refresh_playlist_footer(playlist)
 
@@ -1242,6 +1557,7 @@ class AudioPlayer(QMainWindow):
         self._incoming_fader.cancel()
         for idx in {self._crossfade_outgoing_idx, self._crossfade_incoming_idx}:
             if idx is not None:
+                self._players[idx].clear_high_cut_sweep()
                 self._players[idx].stop()
                 if idx == self._active_player_idx:
                     self._apply_player_volume(idx, self._playback_volume)
@@ -1253,6 +1569,7 @@ class AudioPlayer(QMainWindow):
         self._crossfade_outgoing_idx = None
         self._crossfade_incoming_idx = None
         self._crossfade_active = False
+        self._high_cut_active = False
         self._crossfade_fade_in_ms = 0
         self._crossfade_incoming_ready_to_play = False
         self._suppress_range_end = False
@@ -1268,6 +1585,7 @@ class AudioPlayer(QMainWindow):
     ) -> None:
         incoming_idx = 1 - self._active_player_idx
         self._crossfade_active = True
+        self._high_cut_active = False
         self._crossfade_fade_in_ms = max(1, fade_ms)
         self._crossfade_incoming_path = file_path
         self._crossfade_outgoing_idx = self._active_player_idx
@@ -1288,8 +1606,9 @@ class AudioPlayer(QMainWindow):
         if not self._air_player_has_loaded_source(incoming_idx, abs_path):
             self._set_air_source(incoming_idx, file_path)
         else:
-            # Reused deck: still refresh EQ for the incoming path.
+            # Reused deck: still refresh EQ/gain for the incoming path.
             self._players[incoming_idx].set_eq_state(self._eq_state_for_path(file_path))
+            self._players[incoming_idx].set_track_gain_db(self._gain_db_for_path(file_path))
 
         self._outgoing_fader.sync_volume(self._playback_volume)
         self._outgoing_fader.fade_to(
@@ -1304,12 +1623,14 @@ class AudioPlayer(QMainWindow):
         idx = self._crossfade_outgoing_idx
         if idx is None:
             return
+        self._players[idx].clear_high_cut_sweep()
         self._players[idx].stop()
         self._apply_player_volume(idx, self._playback_volume)
 
     def _finish_crossfade(self) -> None:
         self._stop_outgoing_player()
         self._crossfade_active = False
+        self._high_cut_active = False
         self._crossfade_fade_in_ms = 0
         self._crossfade_incoming_path = None
         self._crossfade_outgoing_idx = None
@@ -1372,34 +1693,57 @@ class AudioPlayer(QMainWindow):
             and self._pending_playback_player_idx == self._crossfade_incoming_idx
         )
 
+    def on_fade_mode_changed(self, mode: str) -> None:
+        if mode not in ("sequential", "crossfade", "high_cut"):
+            return
+        self._fade_mode = mode
+        self._update_fade_mode_ui()
+        self.save_config()
+
     def toggle_fade_mode(self) -> None:
-        if self._fade_mode == "crossfade":
-            self._fade_mode = "sequential"
-        else:
-            self._fade_mode = "crossfade"
+        """Cycle SEQ → XFADE → HCUT (kept for compatibility)."""
+        order = ("sequential", "crossfade", "high_cut")
+        try:
+            idx = order.index(self._fade_mode)
+        except ValueError:
+            idx = 0
+        self.on_fade_mode_changed(order[(idx + 1) % len(order)])
+
+    def _update_fade_mode_ui(self) -> None:
+        if hasattr(self, "fade_mode_group") and self.fade_mode_group is not None:
+            self.fade_mode_group.blockSignals(True)
+            self.fade_mode_group.set_value(self._fade_mode)
+            self.fade_mode_group.blockSignals(False)
         self._update_fade_mode_button()
+        if hasattr(self, "high_cut_q_stepper") and self.high_cut_q_stepper is not None:
+            self.high_cut_q_stepper.set_enabled(self._is_high_cut_mode())
 
     def _update_fade_mode_button(self) -> None:
-        if not hasattr(self, "btn_fade_mode"):
+        if not hasattr(self, "btn_fade_mode") or self.btn_fade_mode is None:
             return
-        icon_name = "fade_mode_2" if self._fade_mode == "crossfade" else "fade_mode_1"
+        icon_name = {
+            "crossfade": "fade_mode_2",
+            "high_cut": "fade_mode_2",
+            "sequential": "fade_mode_1",
+        }.get(self._fade_mode, "fade_mode_1")
         icon_px = get_token_int("sizes.icon_button", 18)
         self.btn_fade_mode.setIcon(load_icon(self, icon_name, icon_px))
         self.btn_fade_mode.setIconSize(icon_size(icon_px))
-        if self._fade_mode == "crossfade":
-            self.btn_fade_mode.setToolTip(
-                "Crossfade: outgoing fade out and incoming fade in overlap"
-            )
-        else:
-            self.btn_fade_mode.setToolTip(
-                "Sequential: fade out completes before the next track fades in"
-            )
+        tips = {
+            "crossfade": "Crossfade: outgoing fade out and incoming fade in overlap",
+            "high_cut": "High cut: resonant filter closes with fadeout, then next track starts clean",
+            "sequential": "Sequential: fade out completes before the next track fades in",
+        }
+        self.btn_fade_mode.setToolTip(tips.get(self._fade_mode, tips["sequential"]))
 
     def _is_crossfade_mode(self) -> bool:
         return self._fade_mode == "crossfade"
 
+    def _is_high_cut_mode(self) -> bool:
+        return self._fade_mode == "high_cut"
+
     def _timeline_fades_enabled(self) -> bool:
-        return not self._is_crossfade_mode()
+        return self._fade_mode == "sequential"
 
     def reset_waveform_zoom(self) -> None:
         self.waveform.reset_view()
@@ -1858,7 +2202,11 @@ class AudioPlayer(QMainWindow):
         if old_abs in self._track_timeline_state:
             self._track_timeline_state[new_abs] = self._track_timeline_state.pop(old_abs)
         if old_abs in self._track_eq_state:
-                self._track_eq_state[new_abs] = self._track_eq_state.pop(old_abs)
+            self._track_eq_state[new_abs] = self._track_eq_state.pop(old_abs)
+        if old_abs in self._track_gain_db:
+            self._track_gain_db[new_abs] = self._track_gain_db.pop(old_abs)
+        if old_abs in self._track_lufs:
+            self._track_lufs[new_abs] = self._track_lufs.pop(old_abs)
         if self._eq_bound_path == old_abs:
             self._eq_bound_path = new_abs
 
@@ -1874,7 +2222,7 @@ class AudioPlayer(QMainWindow):
             self._preview_displayed_track_path = new_abs
 
     def _clone_path_metadata(self, old_path: str, new_path: str) -> None:
-        """Copy timeline/EQ for a duplicated file without touching the live deck."""
+        """Copy timeline/EQ/gain for a duplicated file without touching the live deck."""
         old_abs = os.path.abspath(old_path)
         new_abs = os.path.abspath(new_path)
         if old_abs == new_abs:
@@ -1883,6 +2231,10 @@ class AudioPlayer(QMainWindow):
             self._track_timeline_state[new_abs] = self._track_timeline_state[old_abs]
         if old_abs in self._track_eq_state and new_abs not in self._track_eq_state:
             self._track_eq_state[new_abs] = dict(self._track_eq_state[old_abs])
+        if old_abs in self._track_gain_db and new_abs not in self._track_gain_db:
+            self._track_gain_db[new_abs] = float(self._track_gain_db[old_abs])
+        if old_abs in self._track_lufs and new_abs not in self._track_lufs:
+            self._track_lufs[new_abs] = float(self._track_lufs[old_abs])
 
     def move_selected_track_to_project(self, playlist: PlaylistWidget) -> None:
         item = playlist.currentItem()
@@ -1990,27 +2342,23 @@ class AudioPlayer(QMainWindow):
 
     def _build_project_state(self) -> ProjectState:
         self._save_current_timeline_state()
-        playlists = self.project.collect_playlist_entries(
-            self.playlists, self._track_timeline_state
-        )
-        for i, pl_state in enumerate(playlists):
-            num = i + 1
-            title = self._playlist_titles.get(num, "").strip()
-            if not title and hasattr(self, "playlist_headers") and i < len(self.playlist_headers):
-                title = self.playlist_headers[i].title().strip()
-            pl_state.title = title if title != self.default_playlist_title(num) else ""
-            if i < len(self.font_size_spins):
-                pl_state.font_size = self.font_size_spins[i].value()
+        columns = []
+        for column in getattr(self, "playlist_columns", []) or []:
+            columns.append(column.collect_column_state())
+        while len(columns) < MAX_PLAYLISTS:
+            columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
 
         return ProjectState(
             name=self.project.name,
-            playlists=playlists,
+            columns=columns[:MAX_PLAYLISTS],
             playlist_columns=self.columns_spin.value() if hasattr(self, "columns_spin") else 2,
             track_timelines={
                 path: self._timeline_state_to_dict(state)
                 for path, state in self._track_timeline_state.items()
             },
             track_eq=dict(self._track_eq_state),
+            track_gain_db=dict(self._track_gain_db),
+            track_lufs=dict(self._track_lufs),
             video_mixer=self._project_video_mixer,
         )
 
@@ -2028,8 +2376,6 @@ class AudioPlayer(QMainWindow):
             for playlist in self.playlists:
                 paths.extend(playlist.all_file_paths())
             self.project.export_analysis_for_paths(paths)
-            # Keep legacy playlist JSON in sync for older tools / backup
-            self.save_all_playlists()
             if hasattr(self, "file_browser"):
                 self.file_browser.refresh_project_tab()
             self._update_window_title()
@@ -2083,7 +2429,6 @@ class AudioPlayer(QMainWindow):
                 for playlist in self.playlists:
                     paths.extend(playlist.all_file_paths())
                 self.project.export_analysis_for_paths(paths)
-                self.save_all_playlists()
                 if hasattr(self, "file_browser"):
                     self.file_browser.refresh_project_tab()
             finally:
@@ -2113,7 +2458,7 @@ class AudioPlayer(QMainWindow):
         self._apply_project_state(
             ProjectState(
                 name=self.project.name,
-                playlists=[ProjectPlaylistState() for _ in range(MAX_PLAYLISTS)],
+                columns=empty_project_columns(),
                 video_mixer=None,
             )
         )
@@ -2174,30 +2519,31 @@ class AudioPlayer(QMainWindow):
             for path, data in state.track_eq.items()
             if isinstance(data, dict)
         }
+        self._track_gain_db = {
+            path: float(value)
+            for path, value in getattr(state, "track_gain_db", {}).items()
+            if isinstance(value, (int, float))
+        }
+        self._track_lufs = {
+            path: float(value)
+            for path, value in getattr(state, "track_lufs", {}).items()
+            if isinstance(value, (int, float))
+        }
         self._eq_bound_path = None
         self._bind_eq_to_path(self._current_file_path)
+        self._bind_gain_to_path(self._current_file_path)
 
-        for i, pl_state in enumerate(state.playlists[:MAX_PLAYLISTS]):
-            playlist = self.playlists[i]
-            load_playlist_from_entries(
-                playlist,
-                pl_state.tracks,
-                clear=True,
-                timeline_states=self._track_timeline_state,
-            )
-            num = i + 1
-            if pl_state.title:
-                self._playlist_titles[num] = pl_state.title
-            else:
-                self._playlist_titles.pop(num, None)
-            if i < len(self.font_size_spins):
-                self.font_size_spins[i].blockSignals(True)
-                self.font_size_spins[i].setValue(pl_state.font_size)
-                self.font_size_spins[i].blockSignals(False)
-                self.change_playlist_font(num, pl_state.font_size)
+        self._playlist_titles.clear()
+        self._playlist_id_counter = 0
+        columns = getattr(self, "playlist_columns", None) or []
+        column_states = list(state.columns) if state.columns else empty_project_columns()
+        while len(column_states) < MAX_PLAYLISTS:
+            column_states.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
 
-        if hasattr(self, "playlist_headers"):
-            self._apply_playlist_header_titles()
+        for i, column in enumerate(columns[:MAX_PLAYLISTS]):
+            column.load_column_state(column_states[i])
+
+        self._rebuild_playlist_registry()
 
         if hasattr(self, "columns_spin"):
             self.columns_spin.setValue(state.playlist_columns)
@@ -2209,10 +2555,6 @@ class AudioPlayer(QMainWindow):
     def load_project(self) -> None:
         state = self.project.load_raw()
         if state is None:
-            # First run / empty project: migrate legacy auto-playlists if present
-            self.load_playlists()
-            if any(pl.count() for pl in self.playlists):
-                self.save_project()
             if hasattr(self, "file_browser"):
                 self.file_browser.set_project_root(str(self.project.root), self.project.name)
             return
@@ -2220,6 +2562,14 @@ class AudioPlayer(QMainWindow):
         self._apply_project_state(state)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
+
+    def load_playlists(self):
+        """Legacy no-op — playlists live in the project."""
+        return
+
+    def save_all_playlists(self):
+        """Legacy no-op — use save_project()."""
+        return
 
     def load_config(self):
         if not self.config_path.exists():
@@ -2238,25 +2588,6 @@ class AudioPlayer(QMainWindow):
                         for path, data in track_timelines.items()
                         if isinstance(data, dict)
                     }
-
-            for i in range(MAX_PLAYLISTS):
-                key = f"playlist{i + 1}_font_size"
-                if key in config and i < len(self.font_size_spins):
-                    # Prefer project font sizes when project already applied them
-                    if not self.project.project_file.is_file():
-                        size = config[key]
-                        self.font_size_spins[i].setValue(size)
-                        self.change_playlist_font(i + 1, size)
-
-            for i in range(MAX_PLAYLISTS):
-                key = f"playlist{i + 1}_title"
-                if key in config and isinstance(config[key], str):
-                    if not self.project.project_file.is_file():
-                        title = config[key].strip()
-                        if title:
-                            self._playlist_titles[i + 1] = title
-            if hasattr(self, "playlist_headers") and not self.project.project_file.is_file():
-                self._apply_playlist_header_titles()
 
             if "playback_mode" in config:
                 mode = config["playback_mode"]
@@ -2284,10 +2615,16 @@ class AudioPlayer(QMainWindow):
             if "fade_duration_ms" in config:
                 self.fade_duration_spin.setValue(config["fade_duration_ms"])
 
+            if "high_cut_q" in config and hasattr(self, "high_cut_q_stepper"):
+                try:
+                    self.high_cut_q_stepper.set_value(float(config["high_cut_q"]))
+                except (TypeError, ValueError):
+                    pass
+
             fade_mode = config.get("fade_mode")
-            if fade_mode in ("crossfade", "sequential"):
+            if fade_mode in ("crossfade", "sequential", "high_cut"):
                 self._fade_mode = fade_mode
-                self._update_fade_mode_button()
+                self._update_fade_mode_ui()
 
             if "waveform_res_enabled" in config:
                 self._waveform_res_enabled = bool(config["waveform_res_enabled"])
@@ -2383,11 +2720,27 @@ class AudioPlayer(QMainWindow):
             self._properties_collapsed = bool(config.get("properties_collapsed", False))
             self._apply_properties_collapsed_state(self._properties_collapsed)
             if hasattr(self, "file_properties_panel"):
+                if "target_lufs" in config:
+                    try:
+                        self._target_lufs = clamp_target_lufs(float(config["target_lufs"]))
+                    except (TypeError, ValueError):
+                        self._target_lufs = TARGET_LUFS
+                    self.file_properties_panel.set_target_lufs(self._target_lufs)
                 track_eq = config.get("track_eq")
                 if isinstance(track_eq, dict):
                     for key, value in track_eq.items():
                         if isinstance(value, dict) and key:
                             self._track_eq_state[os.path.abspath(str(key))] = dict(value)
+                track_gain = config.get("track_gain_db")
+                if isinstance(track_gain, dict):
+                    for key, value in track_gain.items():
+                        if key and isinstance(value, (int, float)):
+                            self._track_gain_db[os.path.abspath(str(key))] = float(value)
+                track_lufs = config.get("track_lufs")
+                if isinstance(track_lufs, dict):
+                    for key, value in track_lufs.items():
+                        if key and isinstance(value, (int, float)):
+                            self._track_lufs[os.path.abspath(str(key))] = float(value)
                 # Legacy global EQ → apply only if no per-track data yet
                 legacy_eq = config.get("eq")
                 if (
@@ -2401,6 +2754,7 @@ class AudioPlayer(QMainWindow):
                     )
                 self._eq_bound_path = None
                 self._bind_eq_to_path(self._current_file_path)
+                self._bind_gain_to_path(self._current_file_path)
 
             if hasattr(self, "control_panel_section"):
                 self.control_panel_section.setVisible(
@@ -2421,6 +2775,7 @@ class AudioPlayer(QMainWindow):
     def save_config(self):
         self._save_current_timeline_state()
         self._save_eq_for_bound_path()
+        self._save_gain_for_bound_path()
         geometry = self.geometry()
         config = {
             "project_path": str(self.project.root),
@@ -2430,12 +2785,16 @@ class AudioPlayer(QMainWindow):
             "time_display_mode": self._time_display_mode,
             "fade_duration_ms": self.fade_duration_spin.value(),
             "fade_mode": self._fade_mode,
+            "high_cut_q": self._high_cut_q(),
+            "target_lufs": self._target_lufs_value(),
             "waveform_res_enabled": self._waveform_res_enabled,
             "preview_autoplay": self._preview_autoplay,
             "browser_autoplay": self._browser_autoplay,
             "browser_collapsed": self._browser_collapsed,
             "properties_collapsed": self._properties_collapsed,
             "track_eq": dict(self._track_eq_state),
+            "track_gain_db": dict(self._track_gain_db),
+            "track_lufs": dict(self._track_lufs),
             "view_control_panel": (
                 not self.control_panel_section.isHidden()
                 if hasattr(self, "control_panel_section")
@@ -2477,12 +2836,6 @@ class AudioPlayer(QMainWindow):
                 config["audio_browser_splitter"] = self._browser_saved_splitter
             else:
                 config["audio_browser_splitter"] = self.audio_browser_splitter.sizes()
-        for i, spin in enumerate(self.font_size_spins, start=1):
-            config[f"playlist{i}_font_size"] = spin.value()
-        for i in range(1, MAX_PLAYLISTS + 1):
-            custom = self._playlist_titles.get(i, "").strip()
-            if custom and custom != self.default_playlist_title(i):
-                config[f"playlist{i}_title"] = custom
 
         if hasattr(self, "file_browser"):
             config["browser_tabs"] = [
@@ -2525,23 +2878,6 @@ class AudioPlayer(QMainWindow):
             and hasattr(self, "audio_browser_splitter")
         ):
             self.audio_browser_splitter.setSizes(self._browser_saved_splitter)
-    def load_playlists(self):
-        for path, playlist in zip(self.playlist_paths, self.playlists):
-            if path.exists():
-                try:
-                    load_playlist_from_file(
-                        playlist, str(path), timeline_states=self._track_timeline_state
-                    )
-                except Exception as e:
-                    print(f"Error loading playlist: {e}")
-
-    def save_all_playlists(self):
-        self._save_current_timeline_state()
-        for path, playlist in zip(self.playlist_paths, self.playlists):
-            try:
-                save_playlist_to_file(playlist, str(path), self._track_timeline_state)
-            except Exception as e:
-                print(f"Auto-save error: {e}")
 
     def _playlist_dialog_dir(self) -> str:
         if self._last_playlist_dialog_dir and os.path.isdir(self._last_playlist_dialog_dir):
@@ -2552,120 +2888,6 @@ class AudioPlayer(QMainWindow):
         parent = str(Path(file_path).resolve().parent)
         if os.path.isdir(parent):
             self._last_playlist_dialog_dir = parent
-
-    def export_playlist_widget(self, playlist: PlaylistWidget):
-        track_count = playlist.count()
-        file_paths = playlist.all_file_paths()
-
-        if track_count == 0:
-            QMessageBox.warning(self, "Export", "Playlist is empty.")
-            return
-
-        if not file_paths:
-            QMessageBox.warning(
-                self,
-                "Export",
-                "Tracks are listed but file paths are missing. "
-                "Try re-adding the audio files to the playlist.",
-            )
-            return
-
-        default_path = os.path.join(
-            self._playlist_dialog_dir(),
-            f"playlist{playlist.playlist_num}.json",
-        )
-        playlist_title = self.get_playlist_title(playlist.playlist_num)
-        file_path, _ = QFileDialog.getSaveFileName(
-            self,
-            f"Export {playlist_title}",
-            default_path,
-            "JSON Files (*.json)",
-        )
-        if not file_path:
-            return
-
-        if not file_path.lower().endswith('.json'):
-            file_path += '.json'
-
-        try:
-            self._save_current_timeline_state()
-            saved_count = save_playlist_to_file(playlist, file_path, self._track_timeline_state)
-            self._remember_playlist_dialog_path(file_path)
-            QMessageBox.information(
-                self,
-                "Success",
-                f"{playlist_title} exported ({saved_count} track(s))!",
-            )
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to export playlist: {e}")
-
-    def import_playlist_widget(self, playlist: PlaylistWidget):
-        playlist_title = self.get_playlist_title(playlist.playlist_num)
-        file_path, _ = QFileDialog.getOpenFileName(
-            self,
-            f"Import {playlist_title}",
-            self._playlist_dialog_dir(),
-            "JSON Files (*.json)",
-        )
-        if not file_path:
-            return
-
-        self._remember_playlist_dialog_path(file_path)
-        replace = True
-        if playlist.count() > 0:
-            dialog = QMessageBox(self)
-            dialog.setWindowTitle("Import Playlist")
-            dialog.setText("Replace current playlist or append imported tracks?")
-            replace_btn = dialog.addButton("Replace", QMessageBox.ButtonRole.YesRole)
-            append_btn = dialog.addButton("Append", QMessageBox.ButtonRole.NoRole)
-            cancel_btn = dialog.addButton("Cancel", QMessageBox.ButtonRole.RejectRole)
-            dialog.exec()
-            clicked = dialog.clickedButton()
-            if clicked is None or clicked == cancel_btn:
-                return
-            replace = clicked == replace_btn
-
-        try:
-            self._save_current_timeline_state()
-            added, skipped, missing = load_playlist_from_file(
-                playlist,
-                file_path,
-                clear=replace,
-                timeline_states=self._track_timeline_state,
-            )
-            if added == 0:
-                QMessageBox.warning(
-                    self,
-                    "Import",
-                    "No tracks were imported. The file is empty or contains invalid entries.",
-                )
-                return
-
-            self.duration_prober.probe_playlist(playlist)
-            playlist.setCurrentRow(0)
-            playlist.scrollToTop()
-            playlist.repaint()
-            self.refresh_playlist_footer(playlist)
-            playlist_index = self.playlists.index(playlist)
-            save_playlist_to_file(
-                playlist,
-                str(self.playlist_paths[playlist_index]),
-                self._track_timeline_state,
-            )
-
-            if missing > 0 or skipped > 0:
-                details = [f"Imported {added} track(s)."]
-                if missing > 0:
-                    details.append(
-                        f"{missing} track(s) were added but audio files were not found on disk."
-                    )
-                if skipped > 0:
-                    details.append(f"{skipped} invalid entr{'y' if skipped == 1 else 'ies'} skipped.")
-                QMessageBox.warning(self, "Import", "\n".join(details))
-            else:
-                QMessageBox.information(self, "Success", f"Imported {added} track(s).")
-        except Exception as e:
-            QMessageBox.warning(self, "Error", f"Failed to import playlist: {e}")
 
     def add_to_playlist_widget(self, playlist: PlaylistWidget):
         files, _ = QFileDialog.getOpenFileNames(
@@ -2738,6 +2960,8 @@ class AudioPlayer(QMainWindow):
         preserve_range_latch: bool = False,
     ) -> bool:
         playlist = self.get_playlist(playlist_num)
+        if playlist is None:
+            return False
         current_item = playlist.currentItem()
         if not current_item:
             return False
@@ -3026,6 +3250,7 @@ class AudioPlayer(QMainWindow):
         self._cancel_pending_playback()
         self._playback_token += 1
         for media_player in self._players:
+            media_player.clear_high_cut_sweep()
             media_player.stop()
         self._set_output_volume(self._playback_volume)
         self.current_playing_playlist = None
@@ -3873,6 +4098,11 @@ class AudioPlayer(QMainWindow):
     def _space_fade_duration_ms(self) -> int:
         return self.fade_duration_spin.value()
 
+    def _high_cut_q(self) -> float:
+        if hasattr(self, "high_cut_q_spin") and self.high_cut_q_spin is not None:
+            return float(self.high_cut_q_spin.value())
+        return 0.707
+
     def _apply_fade_in(self) -> None:
         position = self.player.position()
         self._fade_out_started = False
@@ -3905,13 +4135,14 @@ class AudioPlayer(QMainWindow):
         if not self._timeline_fades_enabled():
             if (
                 not self._crossfade_active
+                and not self._high_cut_active
                 and not self.volume_fader.is_active
                 and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
             ):
                 self._set_output_volume(self._playback_volume)
             self._fade_out_started = False
             return
-        if self._crossfade_active or self.volume_fader.is_active:
+        if self._crossfade_active or self.volume_fader.is_active or self._high_cut_active:
             return
         if self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
             return
@@ -3946,11 +4177,41 @@ class AudioPlayer(QMainWindow):
             self.volume_fader.fade_to(0.0, fade_ms, on_complete)
         elif on_complete:
             on_complete()
-        elif not self._is_crossfade_mode():
+        elif not self._is_crossfade_mode() and not self._is_high_cut_mode():
             self._set_output_volume(0.0)
 
+    def _apply_high_cut_out(
+        self,
+        on_complete=None,
+        *,
+        duration_ms: int | None = None,
+    ) -> None:
+        """Close the active deck with a high-cut sweep, then run on_complete."""
+        fade_ms = self._space_fade_duration_ms() if duration_ms is None else duration_ms
+        self.volume_fader.cancel()
+        self._set_output_volume(self._playback_volume)
+
+        def after_cut():
+            self.player.clear_high_cut_sweep()
+            if on_complete:
+                on_complete()
+
+        if fade_ms > 0:
+            self.player.start_high_cut_sweep(
+                fade_ms,
+                on_complete=after_cut,
+                q=self._high_cut_q(),
+            )
+        else:
+            after_cut()
+
     def _transition_fade_ms(self, space_triggered: bool, *, overlap: bool = False) -> int:
-        if space_triggered or overlap or self._is_crossfade_mode():
+        if (
+            space_triggered
+            or overlap
+            or self._is_crossfade_mode()
+            or self._is_high_cut_mode()
+        ):
             return self._space_fade_duration_ms()
         return self._fade_out_ms()
 
@@ -4045,6 +4306,7 @@ class AudioPlayer(QMainWindow):
         self._range_end_latched = False
         self.waveform.set_position(start_ms)
         self._seek_target_ms = start_ms if start_ms > 0 else None
+        media_player.clear_high_cut_sweep()
         media_player.setPosition(start_ms)
         self._set_output_volume(self._playback_volume)
         media_player.play()
@@ -4224,7 +4486,10 @@ class AudioPlayer(QMainWindow):
             self._update_timeline_labels()
 
         if fade_ms > 0 and switching_track and not preserve_range_latch:
-            if self._is_crossfade_mode() or overlap:
+            if self._is_high_cut_mode():
+                # High cut finishes first; next track starts clean (no fade-in).
+                self._apply_high_cut_out(begin_playback, duration_ms=fade_ms)
+            elif self._is_crossfade_mode() or overlap:
                 self._start_crossfade_transition(
                     file_path,
                     abs_path,
@@ -4235,7 +4500,7 @@ class AudioPlayer(QMainWindow):
                 self._apply_fade_out(begin_playback, duration_ms=fade_ms)
         else:
             if switching_track or preserve_range_latch:
-                if not self._crossfade_active:
+                if not self._crossfade_active and not self._high_cut_active:
                     self.volume_fader.cancel()
                     self._set_output_volume(self._playback_volume)
             begin_playback()
@@ -4332,26 +4597,26 @@ class AudioPlayer(QMainWindow):
         if playlist_num is None:
             if visible[0].count() > 0:
                 visible[0].setCurrentRow(0)
-                self.last_selected_playlist = 1
+                self.last_selected_playlist = visible[0].playlist_num
             return
 
-        current_idx = self._playlist_index(playlist_num)
-        if current_idx >= len(visible):
+        current_idx = self._visible_playlist_index(playlist_num)
+        if current_idx < 0:
             current_idx = 0
 
         current_playlist = visible[current_idx]
-        current_num = current_idx + 1
         current_row = current_playlist.currentRow()
 
         if current_row < current_playlist.count() - 1:
             current_playlist.setCurrentRow(current_row + 1)
-            self.last_selected_playlist = current_num
+            self.last_selected_playlist = current_playlist.playlist_num
         elif current_idx < len(visible) - 1 and visible[current_idx + 1].count() > 0:
-            visible[current_idx + 1].setCurrentRow(0)
-            self.last_selected_playlist = current_idx + 2
+            nxt = visible[current_idx + 1]
+            nxt.setCurrentRow(0)
+            self.last_selected_playlist = nxt.playlist_num
         elif current_playlist.count() > 0:
             current_playlist.setCurrentRow(0)
-            self.last_selected_playlist = current_num
+            self.last_selected_playlist = current_playlist.playlist_num
 
     def update_ready_for_selection(self):
         playlist_num, item = self.get_selected_track()
@@ -4399,9 +4664,10 @@ class AudioPlayer(QMainWindow):
         self._stop_fade_path = None
         self._stop_fade_item = None
         self._stop_fade_playlist_num = None
-        if self._crossfade_active:
+        if self._crossfade_active or self._high_cut_active:
             self._cancel_crossfade()
         self.volume_fader.cancel()
+        self.player.clear_high_cut_sweep()
         self._range_end_latched = False
         self._suppress_range_end = False
         self._pending_transition_fade_ms = 0
@@ -4508,16 +4774,16 @@ class AudioPlayer(QMainWindow):
             self.load_preview_track(playlist_num, item)
             self.take_preview_to_air(space_triggered=True)
         else:
-            for i, playlist in enumerate(self.get_visible_playlists(), start=1):
+            for playlist in self.get_visible_playlists():
                 if playlist.count() > 0:
                     playlist.setCurrentRow(0)
                     item = playlist.currentItem()
-                    self.load_preview_track(i, item)
+                    self.load_preview_track(playlist.playlist_num, item)
                     self.take_preview_to_air(space_triggered=True)
                     return
 
     def toggle_play(self):
-        if self._crossfade_active:
+        if self._crossfade_active or self._high_cut_active:
             self._cancel_crossfade()
         if self._stop_fade_active:
             if self._preview_differs_from_track(
@@ -4559,7 +4825,7 @@ class AudioPlayer(QMainWindow):
             self._resume_with_fade()
 
     def pause(self):
-        if self._crossfade_active:
+        if self._crossfade_active or self._high_cut_active:
             self._cancel_crossfade()
         if self._stop_fade_active:
             self._stop_fade_active = False
@@ -4568,6 +4834,7 @@ class AudioPlayer(QMainWindow):
             self._stop_fade_item = None
             self._stop_fade_playlist_num = None
         self.volume_fader.cancel()
+        self.player.clear_high_cut_sweep()
         self._set_output_volume(self._playback_volume)
         self.player.pause()
         self.update_track_info_ready()
@@ -4579,7 +4846,7 @@ class AudioPlayer(QMainWindow):
             return
 
         self._arm_space_restart_from_air()
-        if self._crossfade_active:
+        if self._crossfade_active or self._high_cut_active:
             self._cancel_crossfade()
         fade_ms = self._space_fade_duration_ms()
         is_active = self._is_playback_active()
@@ -4592,6 +4859,7 @@ class AudioPlayer(QMainWindow):
             self._stop_fade_playlist_num = None
             self._queued_after_stop_fade = None
             self.volume_fader.cancel()
+            self.player.clear_high_cut_sweep()
             self._range_end_latched = False
             self._suppress_range_end = False
             self._pending_transition_fade_ms = 0
@@ -4615,7 +4883,10 @@ class AudioPlayer(QMainWindow):
             self._stop_fade_item = self.current_playing_item
             self._stop_fade_playlist_num = self.current_playing_playlist
             self._suppress_range_end = True
-            self._apply_fade_out(finish_stop, use_spinbox=True)
+            if self._is_high_cut_mode():
+                self._apply_high_cut_out(finish_stop, duration_ms=fade_ms)
+            else:
+                self._apply_fade_out(finish_stop, use_spinbox=True)
         else:
             finish_stop()
 
@@ -4629,10 +4900,11 @@ class AudioPlayer(QMainWindow):
         force_restart: bool = False,
         overlap: bool = False,
     ) -> bool:
-        """Hold a next-track start until Stop fade-out finishes."""
+        """Hold a next-track start until Stop fade-out / high-cut finishes."""
         if not self._stop_fade_active:
             return False
-        if not self.volume_fader.is_active:
+        transition_running = self.volume_fader.is_active or self.player.is_high_cut_active()
+        if not transition_running:
             self._stop_fade_active = False
             return False
         fading = self._stop_fade_path
@@ -4676,8 +4948,14 @@ class AudioPlayer(QMainWindow):
             overlap=bool(queued.get("overlap")),
         )
 
+    def _visible_playlist_index(self, playlist_num: int) -> int:
+        for i, playlist in enumerate(self.get_visible_playlists()):
+            if playlist.playlist_num == playlist_num:
+                return i
+        return -1
+
     def _playlist_index(self, playlist_num: int) -> int:
-        return playlist_num - 1
+        return self._visible_playlist_index(playlist_num)
 
     def next_track(self):
         visible = self.get_visible_playlists()
@@ -4699,24 +4977,23 @@ class AudioPlayer(QMainWindow):
         if self.current_playing_playlist is None:
             if visible[0].count() > 0:
                 visible[0].setCurrentRow(0)
-                self.play_selected(1)
+                self.play_selected(visible[0].playlist_num)
             return
 
-        current_idx = self._playlist_index(self.current_playing_playlist)
-        if current_idx >= len(visible):
+        current_idx = self._visible_playlist_index(self.current_playing_playlist)
+        if current_idx < 0:
             current_idx = 0
 
         current_playlist = visible[current_idx]
-        current_num = current_idx + 1
         current_row = current_playlist.currentRow()
 
         if current_row > 0:
             current_playlist.setCurrentRow(current_row - 1)
-            self.play_selected(current_num)
+            self.play_selected(current_playlist.playlist_num)
         elif current_idx > 0 and visible[current_idx - 1].count() > 0:
             prev_playlist = visible[current_idx - 1]
             prev_playlist.setCurrentRow(prev_playlist.count() - 1)
-            self.play_selected(current_idx)
+            self.play_selected(prev_playlist.playlist_num)
 
     def seek(self, position):
         if self._crossfade_active:
@@ -4750,6 +5027,7 @@ class AudioPlayer(QMainWindow):
             self._suppress_range_end
             or self._stop_fade_active
             or self._crossfade_active
+            or self._high_cut_active
             or self._pending_playback_start
             or self._handling_range_end
             or self._range_end_latched
@@ -4864,6 +5142,8 @@ class AudioPlayer(QMainWindow):
         self.update_time_display()
 
     def update_position(self):
+        for media_player in self._players:
+            media_player.advance_high_cut_sweep()
         if self._crossfade_active:
             self._outgoing_fader.advance()
             self._incoming_fader.advance()

@@ -12,7 +12,7 @@ import threading
 import time
 
 import numpy as np
-from PyQt6.QtCore import QIODevice, QObject, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import QElapsedTimer, QIODevice, QObject, QTimer, QUrl, pyqtSignal
 from PyQt6.QtMultimedia import (
     QAudioDevice,
     QAudioFormat,
@@ -22,7 +22,7 @@ from PyQt6.QtMultimedia import (
 )
 
 from app.eq_curve import log_freq_axis
-from app.eq_dsp import EqProcessor
+from app.eq_dsp import EqProcessor, HighCutSweep
 from app.eq_state import EqState
 
 _CHUNK_FRAMES = 2048
@@ -156,6 +156,12 @@ class PcmAirPlayer(QObject):
 
         self._eq = EqProcessor(channels=_TARGET_CHANNELS, sample_rate=44100.0)
         self._eq_state = EqState()
+        self._track_gain = 1.0
+        self._high_cut = HighCutSweep(channels=_TARGET_CHANNELS, sample_rate=44100.0)
+        self._high_cut_elapsed = QElapsedTimer()
+        self._high_cut_duration_ms = 0
+        self._high_cut_on_complete = None
+        self._high_cut_ui_active = False
 
         self._sample_rate = 44100
         self._sink: QAudioSink | None = None
@@ -327,6 +333,7 @@ class PcmAirPlayer(QObject):
         self._pos_timer.stop()
 
     def stop(self) -> None:
+        self.clear_high_cut_sweep()
         self._stop_pipeline(destroy_sink=True)
         self._position_ms = 0
         self._frames_played = 0
@@ -342,6 +349,58 @@ class PcmAirPlayer(QObject):
         """Live coefficient swap — no pipeline restart."""
         self._eq_state = state or EqState()
         self._eq.set_state(self._eq_state)
+
+    def set_track_gain_db(self, gain_db: float) -> None:
+        """Per-track linear gain applied in the PCM path (after EQ)."""
+        from app.loudness import clamp_gain_db, db_to_linear
+
+        self._track_gain = db_to_linear(clamp_gain_db(gain_db))
+
+    def start_high_cut_sweep(
+        self,
+        duration_ms: int,
+        on_complete=None,
+        *,
+        q: float | None = None,
+    ) -> None:
+        """Sweep low-pass closed over duration_ms (with end fadeout); then on_complete."""
+        self.clear_high_cut_sweep()
+        duration = max(0, int(duration_ms))
+        if duration <= 0:
+            if on_complete:
+                on_complete()
+            return
+        self._high_cut_duration_ms = duration
+        self._high_cut_on_complete = on_complete
+        self._high_cut_ui_active = True
+        self._high_cut.set_sample_rate(float(self._sample_rate))
+        self._high_cut.start(q=q)
+        self._high_cut.set_progress(0.0)
+        self._high_cut_elapsed.start()
+
+    def clear_high_cut_sweep(self) -> None:
+        self._high_cut_ui_active = False
+        self._high_cut_on_complete = None
+        self._high_cut_duration_ms = 0
+        self._high_cut.clear()
+
+    def is_high_cut_active(self) -> bool:
+        return bool(self._high_cut_ui_active)
+
+    def advance_high_cut_sweep(self) -> None:
+        if not self._high_cut_ui_active:
+            return
+        elapsed = self._high_cut_elapsed.elapsed()
+        duration = max(1, self._high_cut_duration_ms)
+        if elapsed >= duration:
+            self._high_cut.set_progress(1.0)
+            self._high_cut_ui_active = False
+            callback = self._high_cut_on_complete
+            self._high_cut_on_complete = None
+            if callback:
+                callback()
+            return
+        self._high_cut.set_progress(elapsed / float(duration))
 
     def _on_output_params_changed(self) -> None:
         if self._sink is not None:
@@ -403,6 +462,7 @@ class PcmAirPlayer(QObject):
         self._sample_rate = rate
         self._eq.set_sample_rate(float(self._sample_rate))
         self._eq.set_state(self._eq_state)
+        self._high_cut.set_sample_rate(float(self._sample_rate))
 
         if self._sink is not None and getattr(self, "_sink_rate", None) == rate:
             try:
@@ -697,6 +757,10 @@ class PcmAirPlayer(QObject):
                 dry = self._float_pending[:take]
                 self._float_pending = self._float_pending[take:]
                 wet = self._eq.process_interleaved(dry)
+                wet = self._high_cut.process_interleaved(wet)
+                gain = float(self._track_gain)
+                if gain != 1.0:
+                    wet = wet * np.float32(gain)
                 self._capture_spectrum(wet)
                 clipped = np.clip(wet, -1.0, 1.0)
                 pcm = (clipped * 32767.0).astype(np.int16)

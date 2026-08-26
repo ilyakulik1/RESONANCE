@@ -25,6 +25,11 @@ QLabel#propertiesMetaValue {
     font-size: {{typography.size_xs}};
 }
 
+QLabel#trackLufsLabel {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_sm}};
+}
+
 QWidget#eqCanvas {
     background-color: #0a0a0a;
     border: 1px solid {{colors.border}};

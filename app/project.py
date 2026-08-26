@@ -26,14 +26,12 @@ from app.analysis_cache import (
 )
 from app.config import get_config_path
 from app.constants import MAX_PLAYLISTS
-from app.playlist_io import playlist_to_entries
-from app.widgets.audio_waveform import TimelineState
 
 PROJECT_FILENAME = "project.json"
 MEDIA_DIRNAME = "media"
 ANALYSIS_DIRNAME = "analysis"
 SCENE_THUMBS_DIRNAME = "scene_thumbs"
-PROJECT_VERSION = 1
+PROJECT_VERSION = 2
 
 
 def untitled_project_root() -> Path:
@@ -186,19 +184,50 @@ def import_track_into_project(
 
 @dataclass
 class ProjectPlaylistState:
+    """One playlist tab."""
+
     title: str = ""
     font_size: int = 13
     tracks: list[dict] = field(default_factory=list)
 
 
 @dataclass
+class ProjectColumnState:
+    """One visible column with its own tabs."""
+
+    tabs: list[ProjectPlaylistState] = field(default_factory=list)
+    active_tab: int = 0
+
+
+@dataclass
 class ProjectState:
     name: str = "Project"
-    playlists: list[ProjectPlaylistState] = field(default_factory=list)
+    columns: list[ProjectColumnState] = field(default_factory=list)
     playlist_columns: int = 2
     track_timelines: dict[str, dict] = field(default_factory=dict)
     track_eq: dict[str, dict] = field(default_factory=dict)
+    track_gain_db: dict[str, float] = field(default_factory=dict)
+    track_lufs: dict[str, float] = field(default_factory=dict)
     video_mixer: dict | None = None
+
+    @property
+    def playlists(self) -> list[ProjectPlaylistState]:
+        """Flat view of the active tab in each column (legacy helpers)."""
+        result: list[ProjectPlaylistState] = []
+        for col in self.columns:
+            if col.tabs:
+                idx = max(0, min(col.active_tab, len(col.tabs) - 1))
+                result.append(col.tabs[idx])
+            else:
+                result.append(ProjectPlaylistState())
+        return result
+
+
+def empty_project_columns() -> list[ProjectColumnState]:
+    return [
+        ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0)
+        for _ in range(MAX_PLAYLISTS)
+    ]
 
 
 def mixer_dict_for_storage(data: dict, root: Path | str) -> dict:
@@ -244,6 +273,65 @@ def resolve_mixer_dict(data: dict, root: Path | str) -> dict:
     return payload
 
 
+def _resolve_tracks(raw_tracks, root: Path) -> list[dict]:
+    if not isinstance(raw_tracks, list):
+        return []
+    resolved: list[dict] = []
+    for track in raw_tracks:
+        if not isinstance(track, dict):
+            continue
+        stored_path = track.get("path") or track.get("file")
+        if not stored_path:
+            continue
+        abs_path, exists = resolve_project_path(str(stored_path), root)
+        item = dict(track)
+        item["path"] = abs_path
+        item["_exists"] = exists
+        resolved.append(item)
+    return resolved
+
+
+def _playlist_state_from_dict(entry: dict, root: Path) -> ProjectPlaylistState:
+    return ProjectPlaylistState(
+        title=str(entry.get("title") or "").strip(),
+        font_size=int(entry.get("font_size") or 13),
+        tracks=_resolve_tracks(entry.get("tracks"), root),
+    )
+
+
+def _column_state_from_dict(entry: dict, root: Path) -> ProjectColumnState:
+    tabs_raw = entry.get("tabs")
+    tabs: list[ProjectPlaylistState] = []
+    if isinstance(tabs_raw, list) and tabs_raw:
+        for tab_entry in tabs_raw:
+            if isinstance(tab_entry, dict):
+                tabs.append(_playlist_state_from_dict(tab_entry, root))
+            else:
+                tabs.append(ProjectPlaylistState())
+    else:
+        # Legacy flat playlist shape reused as a single tab
+        tabs.append(_playlist_state_from_dict(entry, root))
+    active = int(entry.get("active_tab") or 0)
+    active = max(0, min(active, max(0, len(tabs) - 1)))
+    return ProjectColumnState(tabs=tabs, active_tab=active)
+
+
+def _playlist_dict_for_storage(pl: ProjectPlaylistState, root: Path) -> dict:
+    return {
+        "title": pl.title,
+        "font_size": pl.font_size,
+        "tracks": [
+            {
+                **track,
+                "path": to_project_path(str(track["path"]), root)
+                if track.get("path")
+                else track.get("path"),
+            }
+            for track in pl.tracks
+        ],
+    }
+
+
 class ProjectManager:
     """Owns the active project root and persists project.json + analysis."""
 
@@ -268,10 +356,7 @@ class ProjectManager:
         self.root = ensure_project_dirs(root)
         self.name = (name or self.root.name).strip() or "Project"
         self._activate_analysis_cache()
-        # Empty project file so the folder is recognized immediately
-        self.save_raw(
-            ProjectState(name=self.name, playlists=[ProjectPlaylistState() for _ in range(MAX_PLAYLISTS)])
-        )
+        self.save_raw(ProjectState(name=self.name, columns=empty_project_columns()))
 
     def create_untitled(self) -> None:
         """Start a fresh unnamed project in the app config directory."""
@@ -288,12 +373,7 @@ class ProjectManager:
         self.root = ensure_project_dirs(root)
         self.name = "Untitled"
         self._activate_analysis_cache()
-        self.save_raw(
-            ProjectState(
-                name=self.name,
-                playlists=[ProjectPlaylistState() for _ in range(MAX_PLAYLISTS)],
-            )
-        )
+        self.save_raw(ProjectState(name=self.name, columns=empty_project_columns()))
 
     def is_untitled(self) -> bool:
         try:
@@ -331,20 +411,6 @@ class ProjectManager:
     def import_track(self, src_path: str, *, move: bool = True) -> str | None:
         return import_track_into_project(src_path, self.root, move=move)
 
-    def collect_playlist_entries(
-        self,
-        playlist_widgets,
-        timeline_states: dict[str, TimelineState] | None,
-    ) -> list[ProjectPlaylistState]:
-        """Build playlist states with absolute track paths (converted on save)."""
-        states: list[ProjectPlaylistState] = []
-        for widget in playlist_widgets:
-            entries = playlist_to_entries(widget, timeline_states)
-            states.append(ProjectPlaylistState(tracks=list(entries)))
-        while len(states) < MAX_PLAYLISTS:
-            states.append(ProjectPlaylistState())
-        return states[:MAX_PLAYLISTS]
-
     def export_analysis_for_paths(self, file_paths: list[str]) -> int:
         dest = analysis_dir(self.root)
         count = 0
@@ -355,25 +421,22 @@ class ProjectManager:
 
     def save_raw(self, state: ProjectState) -> None:
         ensure_project_dirs(self.root)
+        columns = list(state.columns) if state.columns else empty_project_columns()
+        while len(columns) < MAX_PLAYLISTS:
+            columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
+        columns = columns[:MAX_PLAYLISTS]
+
         payload = {
             "version": PROJECT_VERSION,
             "name": state.name or self.name,
             "playlist_columns": state.playlist_columns,
-            "playlists": [
+            "columns": [
                 {
-                    "title": pl.title,
-                    "font_size": pl.font_size,
-                    "tracks": [
-                        {
-                            **track,
-                            "path": to_project_path(str(track["path"]), self.root)
-                            if track.get("path")
-                            else track.get("path"),
-                        }
-                        for track in pl.tracks
-                    ],
+                    "active_tab": col.active_tab,
+                    "tabs": [_playlist_dict_for_storage(tab, self.root) for tab in col.tabs]
+                    or [_playlist_dict_for_storage(ProjectPlaylistState(), self.root)],
                 }
-                for pl in state.playlists
+                for col in columns
             ],
             "track_timelines": {
                 to_project_path(path, self.root): data
@@ -382,6 +445,16 @@ class ProjectManager:
             "track_eq": {
                 to_project_path(path, self.root): data
                 for path, data in state.track_eq.items()
+            },
+            "track_gain_db": {
+                to_project_path(path, self.root): float(value)
+                for path, value in state.track_gain_db.items()
+                if isinstance(value, (int, float))
+            },
+            "track_lufs": {
+                to_project_path(path, self.root): float(value)
+                for path, value in state.track_lufs.items()
+                if isinstance(value, (int, float))
             },
             "video_mixer": (
                 mixer_dict_for_storage(state.video_mixer, self.root)
@@ -409,38 +482,34 @@ class ProjectManager:
 
         name = str(data.get("name") or self.root.name).strip() or "Project"
         self.name = name
+        root = self.root
 
-        playlists: list[ProjectPlaylistState] = []
-        raw_playlists = data.get("playlists")
-        if isinstance(raw_playlists, list):
-            for entry in raw_playlists[:MAX_PLAYLISTS]:
-                if not isinstance(entry, dict):
-                    playlists.append(ProjectPlaylistState())
-                    continue
-                tracks = entry.get("tracks")
-                if not isinstance(tracks, list):
-                    tracks = []
-                resolved_tracks = []
-                for track in tracks:
-                    if not isinstance(track, dict):
-                        continue
-                    stored_path = track.get("path") or track.get("file")
-                    if not stored_path:
-                        continue
-                    abs_path, exists = resolve_project_path(str(stored_path), self.root)
-                    item = dict(track)
-                    item["path"] = abs_path
-                    item["_exists"] = exists
-                    resolved_tracks.append(item)
-                playlists.append(
-                    ProjectPlaylistState(
-                        title=str(entry.get("title") or "").strip(),
-                        font_size=int(entry.get("font_size") or 13),
-                        tracks=resolved_tracks,
-                    )
-                )
-        while len(playlists) < MAX_PLAYLISTS:
-            playlists.append(ProjectPlaylistState())
+        columns: list[ProjectColumnState] = []
+        raw_columns = data.get("columns")
+        if isinstance(raw_columns, list) and raw_columns:
+            for entry in raw_columns[:MAX_PLAYLISTS]:
+                if isinstance(entry, dict):
+                    columns.append(_column_state_from_dict(entry, root))
+                else:
+                    columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()]))
+        else:
+            # v1: flat playlists[] → one tab per column
+            raw_playlists = data.get("playlists")
+            if isinstance(raw_playlists, list):
+                for entry in raw_playlists[:MAX_PLAYLISTS]:
+                    if isinstance(entry, dict):
+                        columns.append(
+                            ProjectColumnState(
+                                tabs=[_playlist_state_from_dict(entry, root)],
+                                active_tab=0,
+                            )
+                        )
+                    else:
+                        columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()]))
+
+        while len(columns) < MAX_PLAYLISTS:
+            columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
+        columns = columns[:MAX_PLAYLISTS]
 
         timelines: dict[str, dict] = {}
         raw_timelines = data.get("track_timelines")
@@ -448,7 +517,7 @@ class ProjectManager:
             for key, value in raw_timelines.items():
                 if not isinstance(value, dict):
                     continue
-                abs_path, _ = resolve_project_path(str(key), self.root)
+                abs_path, _ = resolve_project_path(str(key), root)
                 timelines[abs_path] = value
 
         track_eq: dict[str, dict] = {}
@@ -457,23 +526,43 @@ class ProjectManager:
             for key, value in raw_eq.items():
                 if not isinstance(value, dict):
                     continue
-                abs_path, _ = resolve_project_path(str(key), self.root)
+                abs_path, _ = resolve_project_path(str(key), root)
                 track_eq[abs_path] = value
+
+        track_gain_db: dict[str, float] = {}
+        raw_gain = data.get("track_gain_db")
+        if isinstance(raw_gain, dict):
+            for key, value in raw_gain.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                abs_path, _ = resolve_project_path(str(key), root)
+                track_gain_db[abs_path] = float(value)
+
+        track_lufs: dict[str, float] = {}
+        raw_lufs = data.get("track_lufs")
+        if isinstance(raw_lufs, dict):
+            for key, value in raw_lufs.items():
+                if not isinstance(value, (int, float)):
+                    continue
+                abs_path, _ = resolve_project_path(str(key), root)
+                track_lufs[abs_path] = float(value)
 
         video_mixer = data.get("video_mixer")
         if not isinstance(video_mixer, dict):
             video_mixer = None
         else:
-            video_mixer = resolve_mixer_dict(video_mixer, self.root)
+            video_mixer = resolve_mixer_dict(video_mixer, root)
 
-        columns = int(data.get("playlist_columns") or 2)
-        columns = max(1, min(MAX_PLAYLISTS, columns))
+        columns_count = int(data.get("playlist_columns") or 2)
+        columns_count = max(1, min(MAX_PLAYLISTS, columns_count))
 
         return ProjectState(
             name=name,
-            playlists=playlists,
-            playlist_columns=columns,
+            columns=columns,
+            playlist_columns=columns_count,
             track_timelines=timelines,
             track_eq=track_eq,
+            track_gain_db=track_gain_db,
+            track_lufs=track_lufs,
             video_mixer=video_mixer,
         )

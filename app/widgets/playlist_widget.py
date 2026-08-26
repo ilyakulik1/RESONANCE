@@ -79,6 +79,7 @@ class PlaylistWidget(QListWidget):
     focused = pyqtSignal(int)
     selectionNavigated = pyqtSignal(object)
     tracksChanged = pyqtSignal()
+    fileImported = pyqtSignal(object, str)  # item, absolute file path
 
     def __init__(self, name, playlist_num, parent=None):
         super().__init__(parent)
@@ -152,8 +153,11 @@ class PlaylistWidget(QListWidget):
         self._playlists = playlists
 
     def _resolve_playlist(self, playlist_num: int) -> "PlaylistWidget | None":
-        if self._playlists and 1 <= playlist_num <= len(self._playlists):
-            return self._playlists[playlist_num - 1]
+        if not self._playlists:
+            return None
+        for playlist in self._playlists:
+            if playlist.playlist_num == playlist_num:
+                return playlist
         return None
 
     def _clear_drop_indicator(self) -> None:
@@ -441,8 +445,12 @@ class PlaylistWidget(QListWidget):
         super().dropEvent(event)
 
     def add_file(self, file_path, row: int | None = None):
-        if file_path:
-            self.add_item_with_path(file_path, row=row)
+        if not file_path:
+            return None
+        item = self.add_item_with_path(file_path, row=row)
+        abs_path = os.path.abspath(file_path)
+        self.fileImported.emit(item, abs_path)
+        return item
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_F2):

@@ -39,3 +39,46 @@ QFrame#playlistListFrame {
 QFrame#playlistListFrame[playlistActive="true"] {
     border-color: {{colors.border_focus}};
 }
+
+QTabWidget#playlistColumnTabs::pane {
+    border: none;
+    background: transparent;
+    top: 0;
+}
+
+QTabWidget#playlistColumnTabs QTabBar::tab {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_lg}};
+    padding: 4px 12px;
+    margin-right: 1px;
+    border: 1px solid {{colors.border}};
+    border-bottom: none;
+    min-height: 22px;
+}
+
+QTabWidget#playlistColumnTabs QTabBar::tab:selected {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+}
+
+QTabWidget#playlistColumnTabs QTabBar::tab:hover:!selected {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QToolButton#playlistAddTab,
+QToolButton#playlistDeleteTab {
+    color: {{colors.text_primary}};
+    background-color: {{colors.bg_control}};
+    border: 1px solid {{colors.border}};
+    padding: 1px 6px;
+    font-size: {{typography.size_lg}};
+    font-weight: bold;
+    min-width: 22px;
+    min-height: 22px;
+}
+
+QToolButton#playlistAddTab:hover,
+QToolButton#playlistDeleteTab:hover {
+    background-color: {{colors.bg_control_hover}};
+}

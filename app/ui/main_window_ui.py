@@ -22,12 +22,14 @@ from PyQt6.QtWidgets import (
 from app.constants import MAX_PLAYLISTS
 from app.ui.icon_loader import icon_size, load_icon
 from app.ui.tokens import get_token_int
-from app.ui.widgets.section_header import EditableSectionHeader, SectionHeader
+from app.ui.widgets.section_header import SectionHeader
 from app.ui.widgets.segment_button import SegmentButtonGroup
 from app.ui.widgets.square_checkbox import SquareCheckBox
 from app.ui.widgets.value_stepper import ValueStepper
+from app.ui.widgets.float_value_stepper import FloatValueStepper
 from app.widgets.audio_waveform import AudioWaveform
 from app.widgets.playlist_widget import PlaylistWidget
+from app.eq_dsp import HIGH_CUT_Q_DEFAULT, HIGH_CUT_Q_MAX, HIGH_CUT_Q_MIN
 
 if TYPE_CHECKING:
     from app.player import AudioPlayer
@@ -63,6 +65,10 @@ class MainWindowUi:
 
         window.file_properties_panel = FilePropertiesPanel(window)
         window.file_properties_panel.eqChanged.connect(window._on_eq_changed)
+        window.file_properties_panel.gainChanged.connect(window._on_gain_changed)
+        window.file_properties_panel.targetLufsChanged.connect(
+            window._on_target_lufs_changed
+        )
 
         window.preview_properties_panel = PreviewPropertiesPanel(window)
 
@@ -210,12 +216,21 @@ class MainWindowUi:
         window.radio_stop = None
         window.radio_loop = None
 
-        window.btn_fade_mode = self._fade_mode_button(
-            window,
-            window.toggle_fade_mode,
-            tooltip="Sequential: fade out completes before the next track fades in",
+        window.fade_mode_group = SegmentButtonGroup(
+            [
+                ("sequential", "SEQ"),
+                ("crossfade", "XFADE"),
+                ("high_cut", "HCUT"),
+            ],
         )
-        add_labeled("FADE MODE", window.btn_fade_mode)
+        window.fade_mode_group.set_value("sequential")
+        window.fade_mode_group.setToolTip(
+            "SEQ: fade out then next · XFADE: overlapping fades · "
+            "HCUT: resonant high-cut kill with end fadeout, then next starts clean"
+        )
+        window.fade_mode_group.valueChanged.connect(window.on_fade_mode_changed)
+        add_labeled("FADE MODE", window.fade_mode_group)
+        window.btn_fade_mode = None
 
         fade_ms_wrap = QWidget()
         fade_ms_wrap.setFixedHeight(control_row_height)
@@ -233,13 +248,38 @@ class MainWindowUi:
         )
         window.fade_duration_spin = window.fade_duration_stepper.spin_box()
         window.fade_duration_spin.setToolTip(
-            "Fade out on Space/Stop; crossfade/sequential track transition duration"
+            "Transition duration for Space/Stop and track changes "
+            "(volume fade or high-cut, depending on FADE MODE)"
         )
         fade_ms_unit = QLabel("MS")
         fade_ms_unit.setObjectName("fadeMsLabel")
         fade_ms_layout.addWidget(window.fade_duration_stepper)
         fade_ms_layout.addWidget(fade_ms_unit)
         add_labeled("FADE", fade_ms_wrap)
+
+        res_wrap = QWidget()
+        res_wrap.setFixedHeight(control_row_height)
+        res_layout = QHBoxLayout(res_wrap)
+        res_layout.setContentsMargins(0, 0, 0, 0)
+        res_layout.setSpacing(4)
+        window.high_cut_q_stepper = FloatValueStepper(
+            window,
+            HIGH_CUT_Q_MIN,
+            HIGH_CUT_Q_MAX,
+            HIGH_CUT_Q_DEFAULT,
+            step=0.1,
+            decimals=2,
+            value_width=52,
+        )
+        window.high_cut_q_spin = window.high_cut_q_stepper.spin_box()
+        window.high_cut_q_spin.setToolTip(
+            "High-cut resonance (Q). Higher values peak near the cutoff as the filter closes."
+        )
+        res_unit = QLabel("Q")
+        res_unit.setObjectName("fadeMsLabel")
+        res_layout.addWidget(window.high_cut_q_stepper)
+        res_layout.addWidget(res_unit)
+        add_labeled("RES", res_wrap)
 
         window.columns_stepper = ValueStepper(window, 1, MAX_PLAYLISTS, 2)
         window.columns_spin = window.columns_stepper.spin_box()
@@ -599,7 +639,9 @@ class MainWindowUi:
         return block
 
     def _build_playlists(self, window: AudioPlayer) -> QWidget:
-        """Горизонтальный ряд панелей плейлистов; видимость задаётся числом колонок."""
+        """Горизонтальный ряд колонок; у каждой колонки свои вкладки-плейлисты."""
+        from app.widgets.playlist_column import PlaylistColumnPanel
+
         container = QFrame()
         container.setObjectName("playlistSection")
         layout = QHBoxLayout(container)
@@ -607,139 +649,36 @@ class MainWindowUi:
         layout.setSpacing(8)
 
         window.playlist_panels = []
+        window.playlist_columns = []
         window.playlists = []
         window.font_size_spins = []
         window.playlist_footer_labels = []
         window.playlist_headers = []
+        window._playlist_id_counter = 0
 
-        for i in range(1, MAX_PLAYLISTS + 1):
-            panel = self._create_playlist_panel(window, i)
+        def alloc_playlist_num() -> int:
+            window._playlist_id_counter += 1
+            return window._playlist_id_counter
+
+        for i in range(MAX_PLAYLISTS):
+            panel = PlaylistColumnPanel(
+                window,
+                i,
+                alloc_playlist_num=alloc_playlist_num,
+            )
             window.playlist_panels.append(panel)
+            window.playlist_columns.append(panel)
             layout.addWidget(panel, 1)
+            panel.playlistsChanged.connect(window._on_playlist_tabs_changed)
+            panel.add_empty_tab(title=f"Playlist {i + 1}")
 
         window.playlists_layout = layout
+        window._rebuild_playlist_registry()
         return container
 
     def _create_playlist_panel(self, window: AudioPlayer, playlist_num: int) -> QWidget:
-        """Один плейлист: тулбар → список треков → футер со статистикой и размером шрифта."""
-        panel = QFrame()
-        panel.setObjectName("playlistPanel")
-        layout = QVBoxLayout(panel)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
-
-        header = EditableSectionHeader(f"Playlist {playlist_num}")
-        header.titleChanged.connect(
-            lambda title, n=playlist_num: window.on_playlist_title_changed(n, title)
-        )
-        window.playlist_headers.append(header)
-        layout.addWidget(header)
-
-        # Тулбар по центру над списком
-        toolbar_wrap = QFrame()
-        toolbar_wrap.setObjectName("playlistToolbarWrap")
-        toolbar_wrap_layout = QHBoxLayout(toolbar_wrap)
-        toolbar_wrap_layout.setContentsMargins(0, 0, 0, 0)
-        toolbar_wrap_layout.addStretch()
-
-        toolbar = QFrame()
-        toolbar.setObjectName("playlistToolbar")
-        tb_layout = QHBoxLayout(toolbar)
-        tb_layout.setContentsMargins(0, 0, 0, 0)
-        tb_layout.setSpacing(2)
-
-        playlist = PlaylistWidget(f"Playlist{playlist_num}", playlist_num)
-
-        def add_tool(name: str, tooltip: str, slot, *, opacity: float = 1.0):
-            icon_px = get_token_int("sizes.icon", 12)
-            tool_px = get_token_int("sizes.tool_button", 16)
-            btn = QToolButton()
-            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
-            btn.setIcon(load_icon(window, name, icon_px, opacity=opacity))
-            btn.setIconSize(icon_size(icon_px))
-            btn.setFixedSize(tool_px, tool_px)
-            btn.setToolTip(tooltip)
-            btn.clicked.connect(slot)
-            tb_layout.addWidget(btn)
-
-        # Перемещение треков
-        add_tool("up", "Move up", lambda checked=False: playlist.move_item_up())
-        add_tool("down", "Move down", lambda checked=False: playlist.move_item_down())
-        add_tool("top", "Move to top", lambda checked=False: playlist.move_item_top())
-        add_tool("bottom", "Move to bottom", lambda checked=False: playlist.move_item_bottom())
-        # Файлы / импорт-экспорт плейлиста
-        add_tool("add", "Add files", lambda checked=False, pl=playlist: window.add_to_playlist_widget(pl))
-        add_tool("remove", "Remove", lambda checked=False, pl=playlist: window.remove_from_playlist_widget(pl))
-        add_tool("import", "Import", lambda checked=False, pl=playlist: window.import_playlist_widget(pl))
-        add_tool("export", "Export", lambda checked=False, pl=playlist: window.export_playlist_widget(pl))
-        add_tool("clear", "Clear", lambda checked=False, pl=playlist: window.clear_playlist_widget(pl))
-        add_tool(
-            "to_project",
-            "Move selected track into project folder",
-            lambda checked=False, pl=playlist: window.move_selected_track_to_project(pl),
-        )
-        add_tool(
-            "copy_to_project",
-            "Copy all tracks into project folder",
-            lambda checked=False, pl=playlist: window.copy_playlist_tracks_to_project(pl),
-        )
-        # Анализ файла (BPM + аудиоволна → кеш)
-        add_tool(
-            "bpm_all",
-            "Analyze playlist (BPM + waveform)",
-            lambda checked=False, pl=playlist: window.analyze_playlist_files(pl),
-        )
-        add_tool(
-            "bpm_one",
-            "Re-analyze selected track (BPM + waveform)",
-            lambda checked=False, pl=playlist: window.analyze_selected_file(pl),
-            opacity=0.72,
-        )
-        toolbar_wrap_layout.addWidget(toolbar)
-        toolbar_wrap_layout.addStretch()
-        layout.addWidget(toolbar_wrap)
-
-        # Список треков (stretch — занимает всю вертикаль)
-        list_frame = QFrame()
-        list_frame.setObjectName("playlistListFrame")
-        list_layout = QVBoxLayout(list_frame)
-        list_layout.setContentsMargins(0, 0, 0, 0)
-        playlist.itemClicked.connect(
-            lambda item, n=playlist_num: window.on_playlist_item_clicked(n, item)
-        )
-        playlist.selectionNavigated.connect(
-            lambda item, n=playlist_num: window.on_playlist_item_clicked(n, item)
-        )
-        playlist.itemChanged.connect(
-            lambda item, n=playlist_num: window.on_playlist_item_renamed(n, item)
-        )
-        playlist.focused.connect(window.on_playlist_focused)
-        list_layout.addWidget(playlist)
-        layout.addWidget(list_frame, 1)
-
-        # Футер: число треков / общая длительность + размер шрифта плейлиста
-        footer = QHBoxLayout()
-        footer_label = QLabel("Total Tracks: 0   Total Time: 0:00")
-        footer_label.setObjectName("playlistFooter")
-        window.playlist_footer_labels.append(footer_label)
-        footer.addWidget(footer_label)
-        footer.addStretch()
-
-        font_label = QLabel("FONT SIZE")
-        font_label.setObjectName("fontSizeLabel")
-        font_stepper = ValueStepper(window, 8, 30, 13)
-        font_spin = font_stepper.spin_box()
-        font_spin.valueChanged.connect(lambda v, n=playlist_num: window.change_playlist_font(n, v))
-        font_spin.valueChanged.connect(lambda _v, pl=playlist: window.refresh_playlist_footer(pl))
-        footer.addWidget(font_label)
-        footer.addWidget(font_stepper)
-        layout.addLayout(footer)
-
-        window.playlists.append(playlist)
-        window.font_size_spins.append(font_spin)
-        window.change_playlist_font(playlist_num, font_spin.value())
-        return panel
+        """Deprecated — columns are built via PlaylistColumnPanel."""
+        raise RuntimeError("Use PlaylistColumnPanel tabs instead of _create_playlist_panel")
 
     @staticmethod
     def _bind_checkbox_label(checkbox: SquareCheckBox, label: QLabel) -> None:
