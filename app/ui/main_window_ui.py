@@ -35,11 +35,52 @@ if TYPE_CHECKING:
     from app.player import AudioPlayer
 
 
+class _TrackTitleLabel(QLabel):
+    """Single-line track name: elides instead of wrapping and shifting layout."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._full = text
+        self.setObjectName("previewTrackInfo")
+        self.setWordWrap(False)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self._pin_height()
+
+    def setText(self, text: str) -> None:
+        self._full = text or ""
+        self.setToolTip(self._full if self._full else "")
+        self._apply_elide()
+
+    def text(self) -> str:
+        return self._full
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._apply_elide()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._pin_height()
+        self._apply_elide()
+
+    def _pin_height(self) -> None:
+        self.ensurePolished()
+        self.setFixedHeight(self.fontMetrics().height() + 2)
+
+    def _apply_elide(self) -> None:
+        width = max(0, self.width() - 2)
+        elided = self.fontMetrics().elidedText(
+            self._full, Qt.TextElideMode.ElideRight, width
+        )
+        super().setText(elided)
+
+
 class MainWindowUi:
     """Создаёт виджеты и layout'ы, привязывает их к окну-плееру."""
 
     def setup_ui(self, window: AudioPlayer) -> None:
-        """Корневой layout: файловый браузер | аудио-UI с плейлистами."""
+        """Корневой layout: файловый браузер | аудио-UI | Video Mixer."""
         central = QWidget()
         central.setObjectName("centralWidget")
         window.setCentralWidget(central)
@@ -66,8 +107,17 @@ class MainWindowUi:
         window.file_properties_panel = FilePropertiesPanel(window)
         window.file_properties_panel.eqChanged.connect(window._on_eq_changed)
         window.file_properties_panel.gainChanged.connect(window._on_gain_changed)
+        window.file_properties_panel.masterVolumeChanged.connect(
+            window._on_master_volume_changed
+        )
         window.file_properties_panel.targetLufsChanged.connect(
             window._on_target_lufs_changed
+        )
+        window.file_properties_panel.stemSelectionChanged.connect(
+            window._on_stem_selection_changed
+        )
+        window.file_properties_panel.stemGainChanged.connect(
+            window._on_stem_gain_changed
         )
 
         window.preview_properties_panel = PreviewPropertiesPanel(window)
@@ -145,7 +195,11 @@ class MainWindowUi:
         left_wrap_layout.setSpacing(0)
         left_wrap_layout.addWidget(browser_expand)
         left_wrap_layout.addWidget(left_splitter, 1)
-        root.addWidget(left_wrap, 1)
+
+        from app.video_mixer.controller import VideoMixerController
+
+        window.video_mixer = VideoMixerController(window)
+        window.video_mixer.attach_to_layout(root, left_wrap, stretch=1)
 
         window.audio_output.setVolume(window._playback_volume)
         window.setFocusPolicy(Qt.FocusPolicy.NoFocus)
@@ -184,30 +238,11 @@ class MainWindowUi:
             )
             col += 1
 
-        window.btn_space = QPushButton("ON AIR")
-        window.btn_space.setObjectName("accentButtonSpace")
-        window.btn_space.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        window.btn_space.setAutoDefault(False)
-        window.btn_space.setDefault(False)
-        window.btn_space.setToolTip("Load preview to air (same as Space key)")
-        window.btn_space.setMinimumWidth(108)
-        window.btn_space.setSizePolicy(
-            QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding
-        )
-        window.btn_space.clicked.connect(window.handle_space)
-        # Без подписи сверху — на всю высоту панели (обе строки сетки)
-        grid.addWidget(
-            window.btn_space,
-            0,
-            col,
-            2,
-            1,
-            Qt.AlignmentFlag.AlignVCenter,
-        )
-        col += 1
-
         window.playback_mode_group = SegmentButtonGroup(
             [("loop", "LOOP"), ("next", "NEXT"), ("stop", "STOP")],
+        )
+        window.playback_mode_group.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
         )
         window.playback_mode_group.set_value("next")
         window.playback_mode_group.valueChanged.connect(window.on_playback_mode_changed)
@@ -222,6 +257,9 @@ class MainWindowUi:
                 ("crossfade", "XFADE"),
                 ("high_cut", "HCUT"),
             ],
+        )
+        window.fade_mode_group.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
         )
         window.fade_mode_group.set_value("sequential")
         window.fade_mode_group.setToolTip(
@@ -324,8 +362,9 @@ class MainWindowUi:
         grid.addWidget(spacer, 0, col, 2, 1)
         col += 1
 
-        # Время справа: Elapsed/Remaining + крупные цифры (без FADE)
+        # Справа: ON AIR + Elapsed/Remaining, под ними крупные цифры
         time_wrap = QWidget()
+        time_wrap.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         time_layout = QVBoxLayout(time_wrap)
         time_layout.setContentsMargins(0, 0, 0, 0)
         time_layout.setSpacing(2)
@@ -336,20 +375,42 @@ class MainWindowUi:
         window.time_mode_group.setObjectName("timeModeGroup")
         window.time_mode_group.set_value("elapsed")
         window.time_mode_group.valueChanged.connect(window.on_time_mode_changed)
-        time_layout.addWidget(window.time_mode_group, 0, Qt.AlignmentFlag.AlignRight)
+
+        window.btn_space = QPushButton("ON AIR")
+        window.btn_space.setObjectName("accentButtonSpace")
+        window.btn_space.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        window.btn_space.setAutoDefault(False)
+        window.btn_space.setDefault(False)
+        window.btn_space.setToolTip("Load preview to air (same as Space key)")
+        window.btn_space.setSizePolicy(
+            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
+        )
+        window.btn_space.clicked.connect(window.handle_space)
+
+        time_header = QHBoxLayout()
+        time_header.setContentsMargins(0, 0, 0, 0)
+        time_header.setSpacing(8)
+        time_header.addWidget(window.btn_space, 0, Qt.AlignmentFlag.AlignVCenter)
+        time_header.addWidget(window.time_mode_group, 0, Qt.AlignmentFlag.AlignVCenter)
+        time_layout.addLayout(time_header, 0)
 
         time_values = QHBoxLayout()
         time_values.setSpacing(8)
+        time_values.setContentsMargins(0, 0, 0, 0)
+        time_values.addStretch(1)
         window.time_large_label = QLabel("--:--")
         window.time_large_label.setObjectName("timeLarge")
         window.time_large_label.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
         window.time_duration_label = QLabel("--:--")
         window.time_duration_label.setObjectName("timeDuration")
         window.time_duration_label.setAlignment(
             Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
         )
+        # MM:SS only — hour-wide slots were shoving the EQ.
+        self._lock_time_label_width(window.time_large_label, "-00:00")
+        self._lock_time_label_width(window.time_duration_label, "00:00")
         time_values.addWidget(window.time_large_label)
         time_values.addWidget(window.time_duration_label)
         time_layout.addLayout(time_values)
@@ -365,6 +426,18 @@ class MainWindowUi:
 
         layout.addLayout(grid)
         return section
+
+    @staticmethod
+    def _lock_time_label_width(label: QLabel, sample: str) -> None:
+        """Reserve MM:SS width so remaining time does not reflow the panel."""
+        from PyQt6.QtGui import QFont, QFontMetrics
+
+        font = QFont(label.font())
+        font.setBold(True)
+        font.setPixelSize(get_token_int("typography.size_display_sm", 28))
+        label.setFont(font)
+        label.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Preferred)
+        label.setMinimumWidth(max(1, QFontMetrics(font).horizontalAdvance(sample)))
 
     def _build_timeline(self, window: AudioPlayer) -> QWidget:
         """Стек: ON AIR сверху, PREVIEW снизу (без заголовка TIMELINE)."""
@@ -407,12 +480,7 @@ class MainWindowUi:
         air_device_row.addWidget(window.air_output_combo, 1)
         air_layout.addLayout(air_device_row)
 
-        window.track_info = QLabel("No track selected")
-        window.track_info.setObjectName("previewTrackInfo")
-        window.track_info.setWordWrap(True)
-        window.track_info.setAlignment(
-            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
-        )
+        window.track_info = _TrackTitleLabel("No track selected")
         air_layout.addWidget(window.track_info)
 
         air_layout.addLayout(self._build_waveform_row(
@@ -454,9 +522,7 @@ class MainWindowUi:
         track_meta_row = QHBoxLayout()
         track_meta_row.setContentsMargins(0, 0, 0, 0)
         track_meta_row.setSpacing(8)
-        window.preview_track_info = QLabel("No track selected")
-        window.preview_track_info.setObjectName("previewTrackInfo")
-        window.preview_track_info.setWordWrap(True)
+        window.preview_track_info = _TrackTitleLabel("No track selected")
         track_meta_row.addWidget(window.preview_track_info, 1)
         track_meta_row.addWidget(
             window.preview_properties_panel, 0, Qt.AlignmentFlag.AlignRight

@@ -249,6 +249,7 @@ def load_icon(
         "copy_to_project": QStyle.StandardPixmap.SP_DirLinkIcon,
         "bpm_all": QStyle.StandardPixmap.SP_BrowserReload,
         "bpm_one": QStyle.StandardPixmap.SP_FileDialogInfoView,
+        "stems": QStyle.StandardPixmap.SP_MediaSeekForward,
         "back_begin": QStyle.StandardPixmap.SP_MediaSkipBackward,
         "fade_mode_1": QStyle.StandardPixmap.SP_MediaPlay,
         "fade_mode_2": QStyle.StandardPixmap.SP_MediaPause,

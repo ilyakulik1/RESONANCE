@@ -2,7 +2,7 @@
 
 QFrame#filePropertiesPanel {
     background-color: {{colors.bg_primary}};
-    min-width: 80px;
+    min-width: 280px;
 }
 
 QFrame#previewPropertiesPanel {
@@ -28,6 +28,34 @@ QLabel#propertiesMetaValue {
 QLabel#trackLufsLabel {
     color: {{colors.text_muted}};
     font-size: {{typography.size_sm}};
+}
+
+QWidget#volumeKnob {
+    min-width: 44px;
+    max-width: 52px;
+}
+
+QLabel#volumeKnobCaption,
+QLabel#volumeKnobValue {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+}
+
+QWidget#volumeKnob[midiLearn="true"] QLabel#volumeKnobCaption {
+    color: {{colors.accent_red}};
+}
+
+QLabel#volumeKnobValue {
+    color: {{colors.text_primary}};
+    font-weight: 600;
+}
+
+QDial#volumeKnobDial {
+    background-color: {{colors.bg_control}};
+    min-width: 26px;
+    min-height: 26px;
+    max-width: 26px;
+    max-height: 26px;
 }
 
 QWidget#eqCanvas {
@@ -75,4 +103,59 @@ QComboBox#eqTypeCombo {
     max-height: 18px;
     padding: 0 2px;
     font-size: {{typography.size_xs}};
+}
+
+QWidget#stemFader {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+    border-radius: 3px;
+    min-width: 44px;
+    max-width: 56px;
+}
+
+QCheckBox#stemFaderFine {
+    spacing: 0;
+    margin: 0;
+    padding: 0;
+}
+
+QCheckBox#stemFaderFine::indicator {
+    width: 14px;
+    height: 14px;
+}
+
+QLabel#stemFaderCaption,
+QLabel#stemFaderValue,
+QLabel#stemFaderUnity {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+}
+
+QLabel#stemFaderValue {
+    color: {{colors.text_primary}};
+    font-weight: 600;
+}
+
+QSlider#stemFaderSlider::groove:vertical {
+    background: {{colors.bg_control}};
+    width: 8px;
+    border-radius: 4px;
+}
+
+QSlider#stemFaderSlider::handle:vertical {
+    background: {{colors.accent}};
+    height: 14px;
+    width: 18px;
+    margin: 0 -5px;
+    border-radius: 3px;
+}
+
+QSlider#stemFaderSlider::sub-page:vertical {
+    background: {{colors.bg_control}};
+    border-radius: 4px;
+}
+
+QSlider#stemFaderSlider::add-page:vertical {
+    background: {{colors.accent}};
+    border-radius: 4px;
 }

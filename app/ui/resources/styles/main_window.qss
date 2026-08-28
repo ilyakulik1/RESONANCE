@@ -37,14 +37,21 @@ QLabel#bpmValue {
 QFrame#timeBlock {
     background-color: {{colors.bg_black}};
     border-radius: {{radius.md}};
-    min-width: 200px;
-    max-width: 200px;
 }
 
-QWidget#timeModeGroup QPushButton#segmentButton {
+QWidget#timeModeGroup QPushButton#segmentButton,
+QPushButton#accentButtonSpace {
     min-height: {{sizes.button_min_height_sm}};
-    padding: {{spacing.xs}};
+    padding: {{spacing.xs}} {{spacing.sm}};
     font-size: {{typography.size_sm}};
+}
+
+QPushButton#accentButtonSpace {
+    background-color: {{colors.accent_red}};
+    color: {{colors.text_on_accent}};
+    font-weight: bold;
+    min-width: 0;
+    border: none;
 }
 
 QLabel#timeDuration {
@@ -93,7 +100,8 @@ QLabel#spaceAdvancesLabel {
 QLabel#previewTrackInfo {
     color: {{colors.text_muted}};
     font-size: {{typography.size_md}};
-    padding: 0 0 2px 0;
+    padding: 0;
+    max-height: 16px;
 }
 
 QPushButton#deviceRefreshButton {

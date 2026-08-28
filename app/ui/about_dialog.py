@@ -21,8 +21,8 @@ class AboutInfo:
     """Контент окна About — редактируйте здесь."""
 
     # Заголовок окна и крупное название в диалоге
-    window_title = "About Decibel Player"
-    app_name = "Decibel Player"
+    window_title = "About RESONANCE"
+    app_name = "RESONANCE"
     version = "1.0.0"
 
     # Короткий слоган под названием (можно оставить "")

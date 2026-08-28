@@ -6,7 +6,13 @@ from PyQt6.QtCore import Qt, QRect, QSize
 from PyQt6.QtGui import QColor, QFont, QPainter
 from PyQt6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionViewItem
 
-from app.playlist_io import BPM_ROLE, COLOR_ROLE, DURATION_ROLE, is_item_file_missing
+from app.playlist_io import (
+    BPM_ROLE,
+    COLOR_ROLE,
+    DURATION_ROLE,
+    STEMS_ROLE,
+    is_item_file_missing,
+)
 from app.time_utils import format_time_ms
 from app.ui.tokens import get_token
 
@@ -45,6 +51,10 @@ def _color_from_index(index) -> QColor | None:
     return color if color.isValid() else None
 
 
+def _has_stems_from_index(index) -> bool:
+    return bool(index.data(STEMS_ROLE))
+
+
 def _format_bpm(bpm: float) -> str:
     if bpm == int(bpm):
         return str(int(bpm))
@@ -57,6 +67,7 @@ class _ColumnLayout:
     name_rect: QRect
     time_rect: QRect
     bpm_rect: QRect
+    stems_rect: QRect | None
 
 
 class PlaylistItemDelegate(QStyledItemDelegate):
@@ -65,6 +76,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
     INDEX_BADGE_W = 24
     TIME_BADGE_W = 46
     BPM_BADGE_W = 32
+    STEMS_BADGE_W = 40
     BADGE_RADIUS = 5
     ROW_V_PAD = 4
 
@@ -80,13 +92,14 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         fm = option.fontMetrics
         return max(18, fm.height() + 2)
 
-    def _layout_columns(self, rect: QRect, badge_h: int) -> _ColumnLayout:
+    def _layout_columns(self, rect: QRect, badge_h: int, *, has_stems: bool) -> _ColumnLayout:
         inner_left = rect.left() + self.ROW_PAD_H
         inner_right = rect.right() - self.ROW_PAD_H
         badge_y = rect.top() + (rect.height() - badge_h) // 2
 
         index_rect = QRect(inner_left, badge_y, self.INDEX_BADGE_W, badge_h)
 
+        # Right-aligned badges, LTR order: stems → time → bpm
         bpm_rect = QRect(
             inner_right - self.BPM_BADGE_W,
             badge_y,
@@ -99,9 +112,18 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             self.TIME_BADGE_W,
             badge_h,
         )
+        stems_rect = None
+        name_right = time_rect.left() - self.COL_GAP
+        if has_stems:
+            stems_rect = QRect(
+                time_rect.left() - self.COL_GAP - self.STEMS_BADGE_W,
+                badge_y,
+                self.STEMS_BADGE_W,
+                badge_h,
+            )
+            name_right = stems_rect.left() - self.COL_GAP
 
         name_left = index_rect.right() + self.COL_GAP
-        name_right = time_rect.left() - self.COL_GAP
         name_width = max(0, name_right - name_left)
         name_rect = QRect(name_left, rect.top(), name_width, rect.height())
 
@@ -110,6 +132,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             name_rect=name_rect,
             time_rect=time_rect,
             bpm_rect=bpm_rect,
+            stems_rect=stems_rect,
         )
 
     def _row_background(
@@ -172,7 +195,8 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         selected = bool(option.state & QStyle.StateFlag.State_Selected)
         hovered = bool(option.state & QStyle.StateFlag.State_MouseOver)
         badge_h = self._badge_height(option)
-        layout = self._layout_columns(option.rect, badge_h)
+        has_stems = _has_stems_from_index(index)
+        layout = self._layout_columns(option.rect, badge_h, has_stems=has_stems)
 
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
@@ -181,7 +205,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             option.rect,
             self._row_background(row, selected=selected, hovered=hovered, mark=mark),
         )
-        if mark is not None and mark.isValid() and not selected:
+        if mark is not None and mark.isValid():
             strip = QRect(option.rect.left(), option.rect.top(), 3, option.rect.height())
             painter.fillRect(strip, mark)
 
@@ -198,6 +222,17 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             bg=badge_bg,
             fg=badge_fg,
         )
+        if layout.stems_rect is not None:
+            accent_bg = QColor(get_token("colors.accent", "#3897fd"))
+            if selected:
+                accent_bg = QColor(255, 255, 255, 55)
+            self._draw_badge(
+                painter,
+                layout.stems_rect,
+                "stems",
+                bg=accent_bg,
+                fg=badge_fg,
+            )
         self._draw_badge(
             painter,
             layout.time_rect,

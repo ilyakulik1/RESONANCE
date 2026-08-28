@@ -21,6 +21,13 @@ CMD_SET_PLAYING = "set_playing"
 CMD_SET_LOOP = "set_loop"
 
 
+def _open_container(path: str):
+    """Open media; QuickTime files often have MacRoman/Cyrillic metadata, not UTF-8."""
+    import av
+
+    return av.open(path, metadata_errors="replace")
+
+
 def _write_error(error_buf: Any, message: str) -> None:
     raw = (message or "")[:255].encode("utf-8", errors="replace")
     with error_buf.get_lock():
@@ -173,7 +180,7 @@ def _run_session(
     at_eof_v.value = 0
     loop_restarted_v.value = 0
 
-    container = av.open(path)
+    container = _open_container(path)
     try:
         if not container.streams.video:
             _write_error(error_buf, "No video stream")
@@ -276,7 +283,7 @@ def _run_session(
                         pass
                     array, pts_ms = None, 0
                     try:
-                        container = av.open(path)
+                        container = _open_container(path)
                         stream = container.streams.video[0]
                         stream.thread_type = "AUTO"
                         array, pts_ms = _do_seek(container, stream, 0)

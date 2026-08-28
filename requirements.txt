@@ -6,3 +6,5 @@ librosa
 mutagen
 av
 moderngl
+audio-separator[cpu]
+python-rtmidi

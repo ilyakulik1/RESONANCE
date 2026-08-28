@@ -1,9 +1,10 @@
+import copy
 import json
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QPoint
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QKeyEvent, QAction
+from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QPoint, QMimeData
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QKeyEvent, QAction, QKeySequence
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow,
@@ -25,6 +26,7 @@ from app.bpm_detector import BpmDetector
 from app.config import get_config_path
 from app.constants import APP_NAME, MAX_PLAYLISTS
 from app.eq_state import EqState
+from app.midi import MidiHub, TARGET_MASTER_VOLUME, midi_available
 from app.pcm_air_player import PcmAirPlayer
 from app.ui.about_dialog import show_about_dialog
 from app.ui.main_window_ui import MainWindowUi
@@ -34,18 +36,27 @@ from app.duration_prober import DurationProber
 from app.volume_fader import VolumeFader
 from app.playlist_io import (
     TRACK_COLOR_PRESETS,
+    TRACKS_CLIPBOARD_MIME,
+    ensure_item_track_id,
     get_item_bpm,
     get_item_color,
     get_item_duration,
     get_item_file_path,
     get_item_gain_db,
     get_item_lufs,
+    get_item_mixer_scene_id,
+    get_item_track_id,
+    is_track_instance_id,
+    item_has_stems,
+    item_to_snapshot,
     load_playlist_from_entries,
     set_item_bpm,
     set_item_color,
     set_item_duration,
     set_item_gain_db,
+    set_item_has_stems,
     set_item_lufs,
+    set_item_mixer_scene_id,
 )
 from app.loudness import TARGET_LUFS, clamp_gain_db, clamp_target_lufs, gain_db_to_target
 from app.project import (
@@ -56,6 +67,14 @@ from app.project import (
     default_project_root,
     empty_project_columns,
 )
+from app.stem_separator import StemSeparator
+from app.stems import (
+    STEM_INSTRUMENTAL,
+    STEM_VOCALS,
+    StemChannelState,
+    TrackStemState,
+    load_cached_stems,
+)
 from app.time_utils import format_time_ms, get_audio_duration_ms
 from app.waveform_cache import WaveformCache, WaveformCacheEntry, WaveformCacheKey
 from app.waveform_loader import WaveformLoader
@@ -65,6 +84,7 @@ from app.widgets.audio_waveform import AudioWaveform, TimelineState
 
 
 from app.widgets.playlist_widget import PlaylistWidget
+from app.widgets.stem_fader import clamp_stem_gain_db
 
 
 def _peek_saved_project_root() -> Path:
@@ -116,8 +136,13 @@ class AudioPlayer(QMainWindow):
         self._track_eq_state: dict[str, dict] = {}
         self._track_gain_db: dict[str, float] = {}
         self._track_lufs: dict[str, float] = {}
+        self._track_stem_state: dict[str, TrackStemState] = {}
         self._target_lufs = TARGET_LUFS
         self._eq_bound_path: str | None = None
+        self._eq_bound_item = None
+        self._displayed_track_key: str | None = None
+        self._preview_displayed_track_key: str | None = None
+        self._stem_eq_loading = False
         self._eq_loading = False
         self._gain_loading = False
         self._fade_out_started = False
@@ -219,6 +244,12 @@ class AudioPlayer(QMainWindow):
         self.file_analyzer.progress.connect(self._on_analysis_progress)
         self.file_analyzer.busyChanged.connect(self._on_analysis_busy)
         self.file_analyzer.statusChanged.connect(self._on_analysis_status)
+
+        self.stem_separator = StemSeparator(self)
+        self.stem_separator.finished.connect(self._on_stems_separated)
+        self.stem_separator.progress.connect(self._on_stem_progress)
+        self.stem_separator.statusChanged.connect(self._on_analysis_status)
+        self.stem_separator.busyChanged.connect(self._on_stem_busy)
         self._setup_analysis_status_ui()
         self.waveform_loader = WaveformLoader(self)
         self.waveform_loader.waveform_ready.connect(self._on_waveform_ready)
@@ -254,6 +285,7 @@ class AudioPlayer(QMainWindow):
         self.setup_connections()
         self.setup_shortcuts()
         self._setup_menus()
+        self._setup_midi()
         self.setWindowTitle(self._window_title())
         self.setMinimumSize(1100, 900)
         self.resize(1280, 1150)
@@ -462,6 +494,25 @@ class AudioPlayer(QMainWindow):
                 self.stop()
                 return True
 
+            playlist = None
+            if self._retain_playlist_focus_num is not None:
+                playlist = self.get_playlist(self._retain_playlist_focus_num)
+            if playlist is None:
+                focused = QApplication.focusWidget()
+                if isinstance(focused, PlaylistWidget):
+                    playlist = focused
+            if (
+                playlist is not None
+                and playlist.isVisible()
+                and self._focus_allows_playlist_steal(QApplication.focusWidget())
+            ):
+                if playlist._is_copy_shortcut(event):
+                    self.copy_selected_playlist_tracks(playlist)
+                    return True
+                if playlist._is_paste_shortcut(event):
+                    self.paste_playlist_tracks(playlist)
+                    return True
+
             # Even if Qt focus was stolen during preview load, keep ↑/↓ on the
             # playlist that the user is navigating.
             if (
@@ -622,10 +673,12 @@ class AudioPlayer(QMainWindow):
             pass
 
     def _update_file_properties(self, file_path: str | None = None) -> None:
-        """Bind air EQ/gain to the current on-air track (metadata lives on preview)."""
+        """Bind air EQ/gain to the current on-air track."""
         path = file_path or self._current_file_path
+        self._eq_bound_item = self.current_playing_item
         self._bind_eq_to_path(path)
         self._bind_gain_to_path(path)
+        self._bind_stems_to_path(path)
 
     def _update_preview_properties(self, file_path: str | None = None) -> None:
         if not hasattr(self, "preview_properties_panel"):
@@ -634,18 +687,197 @@ class AudioPlayer(QMainWindow):
         bpm = None
         if self._preview_item is not None:
             bpm = get_item_bpm(self._preview_item)
-        key = os.path.abspath(path) if path else None
-        lufs = self._track_lufs.get(key) if key else None
+        path_key = os.path.abspath(path) if path else None
+        instance_key = self._settings_key(item=self._preview_item, file_path=path)
+        lufs = self._track_lufs.get(path_key) if path_key else None
         if lufs is None and self._preview_item is not None:
             lufs = get_item_lufs(self._preview_item)
-        gain_db = self._track_gain_db.get(key, 0.0) if key else None
+        gain_db = self._track_gain_db.get(instance_key, 0.0) if instance_key else None
         if gain_db is None and self._preview_item is not None:
             gain_db = get_item_gain_db(self._preview_item)
         self.preview_properties_panel.set_file(
             path, bpm=bpm, lufs=lufs, gain_db=gain_db
         )
 
+    def _clone_timeline_state(self, state: TimelineState | None) -> TimelineState | None:
+        if state is None:
+            return None
+        return TimelineState(
+            range_start_ms=state.range_start_ms,
+            range_end_ms=state.range_end_ms,
+            fade_in_ms=state.fade_in_ms,
+            fade_out_ms=state.fade_out_ms,
+        )
+
+    def _clone_stem_state(self, state: TrackStemState | None) -> TrackStemState | None:
+        if state is None:
+            return None
+        cloned = TrackStemState.from_dict(state.to_dict())
+        if cloned is not None:
+            return cloned
+        return TrackStemState(
+            vocals_path=state.vocals_path,
+            instrumental_path=state.instrumental_path,
+            vocals=StemChannelState(
+                gain_db=state.vocals.gain_db,
+                eq=copy.deepcopy(state.vocals.eq) if isinstance(state.vocals.eq, dict) else None,
+            ),
+            instrumental=StemChannelState(
+                gain_db=state.instrumental.gain_db,
+                eq=(
+                    copy.deepcopy(state.instrumental.eq)
+                    if isinstance(state.instrumental.eq, dict)
+                    else None
+                ),
+            ),
+            selected=state.selected,
+        )
+
+    def _adopt_item_settings(self, item) -> str | None:
+        """Assign a unique instance id and copy path-keyed settings onto it once."""
+        if item is None:
+            return None
+        track_id = ensure_item_track_id(item)
+        if not track_id:
+            return None
+        path = get_item_file_path(item)
+        abs_path = os.path.abspath(path) if path else None
+
+        if track_id not in self._track_timeline_state and abs_path:
+            cloned = self._clone_timeline_state(self._track_timeline_state.get(abs_path))
+            if cloned is not None:
+                self._track_timeline_state[track_id] = cloned
+
+        if track_id not in self._track_eq_state and abs_path and abs_path in self._track_eq_state:
+            self._track_eq_state[track_id] = copy.deepcopy(self._track_eq_state[abs_path])
+
+        if track_id not in self._track_gain_db:
+            item_gain = get_item_gain_db(item)
+            if item_gain is not None:
+                self._track_gain_db[track_id] = float(item_gain)
+            elif abs_path and abs_path in self._track_gain_db:
+                self._track_gain_db[track_id] = float(self._track_gain_db[abs_path])
+
+        if track_id not in self._track_stem_state and abs_path:
+            cloned_stem = self._clone_stem_state(self._track_stem_state.get(abs_path))
+            if cloned_stem is not None:
+                self._track_stem_state[track_id] = cloned_stem
+
+        if track_id in self._track_gain_db:
+            set_item_gain_db(item, self._track_gain_db[track_id])
+        return track_id
+
+    def _clone_instance_settings(self, src_item, dst_item) -> None:
+        src_key = self._adopt_item_settings(src_item)
+        dst_key = ensure_item_track_id(dst_item)
+        if not src_key or not dst_key or src_key == dst_key:
+            return
+
+        if src_key in self._track_timeline_state:
+            cloned = self._clone_timeline_state(self._track_timeline_state[src_key])
+            if cloned is not None:
+                self._track_timeline_state[dst_key] = cloned
+        if src_key in self._track_eq_state:
+            self._track_eq_state[dst_key] = copy.deepcopy(self._track_eq_state[src_key])
+        if src_key in self._track_gain_db:
+            self._track_gain_db[dst_key] = float(self._track_gain_db[src_key])
+            set_item_gain_db(dst_item, self._track_gain_db[dst_key])
+        if src_key in self._track_stem_state:
+            cloned_stem = self._clone_stem_state(self._track_stem_state[src_key])
+            if cloned_stem is not None:
+                self._track_stem_state[dst_key] = cloned_stem
+                set_item_has_stems(dst_item, True)
+
+    def _settings_key(self, item=None, file_path: str | None = None) -> str | None:
+        if item is not None:
+            return self._adopt_item_settings(item)
+        if file_path:
+            abs_path = os.path.abspath(file_path)
+            for candidate in (
+                getattr(self, "_eq_bound_item", None),
+                self.current_playing_item,
+                getattr(self, "_preview_item", None),
+            ):
+                if candidate is None:
+                    continue
+                path = get_item_file_path(candidate)
+                if path and os.path.abspath(path) == abs_path:
+                    return self._adopt_item_settings(candidate)
+            return abs_path
+        return None
+
+    def _snapshot_item_settings(self, item) -> dict | None:
+        snapshot = item_to_snapshot(item)
+        if snapshot is None:
+            return None
+        key = self._adopt_item_settings(item)
+        if key and key in self._track_timeline_state:
+            snapshot["timeline"] = self._timeline_state_to_dict(self._track_timeline_state[key])
+        if key and key in self._track_eq_state:
+            snapshot["eq"] = copy.deepcopy(self._track_eq_state[key])
+        if key and key in self._track_stem_state:
+            snapshot["stem_state"] = copy.deepcopy(self._track_stem_state[key].to_dict())
+        path = get_item_file_path(item)
+        if path:
+            lufs = self._track_lufs.get(os.path.abspath(path))
+            if lufs is not None:
+                snapshot["lufs"] = float(lufs)
+        return snapshot
+
+    def _apply_snapshot_settings(self, item, snapshot: dict) -> None:
+        if item is None or not isinstance(snapshot, dict):
+            return
+        key = ensure_item_track_id(item)
+        if snapshot.get("color"):
+            set_item_color(item, snapshot.get("color"))
+        if snapshot.get("gain_db") is not None:
+            try:
+                gain = float(snapshot["gain_db"])
+            except (TypeError, ValueError):
+                gain = None
+            if gain is not None:
+                set_item_gain_db(item, gain)
+                if key:
+                    self._track_gain_db[key] = gain
+        if snapshot.get("lufs") is not None:
+            try:
+                set_item_lufs(item, float(snapshot["lufs"]))
+            except (TypeError, ValueError):
+                pass
+        if snapshot.get("bpm") is not None:
+            set_item_bpm(item, snapshot.get("bpm"))
+        timeline = snapshot.get("timeline")
+        if key and isinstance(timeline, dict):
+            self._track_timeline_state[key] = self._timeline_state_from_dict(timeline)
+        eq = snapshot.get("eq")
+        if key and isinstance(eq, dict):
+            self._track_eq_state[key] = copy.deepcopy(eq)
+        stem_data = snapshot.get("stem_state")
+        if key and isinstance(stem_data, dict):
+            stem_state = TrackStemState.from_dict(stem_data)
+            if stem_state is not None:
+                self._track_stem_state[key] = stem_state
+                set_item_has_stems(item, True)
+        elif snapshot.get("stems"):
+            set_item_has_stems(item, True)
+        if snapshot.get("mixer_scene_id"):
+            set_item_mixer_scene_id(item, str(snapshot.get("mixer_scene_id")))
+
+    def _adopt_all_playlist_settings(self) -> None:
+        for playlist in getattr(self, "playlists", []) or []:
+            for row in range(playlist.count()):
+                self._adopt_item_settings(playlist.item(row))
+
     def _eq_path_key(self, file_path: str | None = None) -> str | None:
+        item = getattr(self, "_eq_bound_item", None)
+        if item is None:
+            item = self.current_playing_item
+        if item is not None:
+            item_path = get_item_file_path(item)
+            if not file_path or (
+                item_path and os.path.abspath(item_path) == os.path.abspath(file_path)
+            ):
+                return self._adopt_item_settings(item)
         path = file_path or self._current_file_path or self._displayed_track_path
         if not path:
             return None
@@ -658,6 +890,15 @@ class AudioPlayer(QMainWindow):
         if not key:
             return
         data = self.file_properties_panel.eq_state().to_dict()
+        stem_state = self._track_stem_state.get(key)
+        if stem_state is not None and self.file_properties_panel.stems_enabled():
+            selected = self.file_properties_panel.selected_stem()
+            channel = stem_state.channel(selected)
+            if not data.get("bands") and not data.get("bypass"):
+                channel.eq = None
+            else:
+                channel.eq = data
+            return
         if not data.get("bands") and not data.get("bypass"):
             self._track_eq_state.pop(key, None)
         else:
@@ -673,33 +914,72 @@ class AudioPlayer(QMainWindow):
         self._eq_bound_path = new_key
         self._eq_loading = True
         try:
-            if new_key and new_key in self._track_eq_state:
-                state = EqState.from_dict(self._track_eq_state[new_key])
-            else:
-                state = EqState()
+            state = self._eq_state_for_bound_ui(new_key)
             self.file_properties_panel.set_eq_state(state)
         finally:
             self._eq_loading = False
         self._apply_live_eq_to_air()
+
+    def _eq_state_for_bound_ui(self, key: str | None) -> EqState:
+        if not key:
+            return EqState()
+        stem_state = self._track_stem_state.get(key)
+        if stem_state is not None:
+            selected = (
+                self.file_properties_panel.selected_stem()
+                if hasattr(self, "file_properties_panel")
+                else stem_state.selected
+            )
+            channel = stem_state.channel(selected)
+            return EqState.from_dict(channel.eq) if isinstance(channel.eq, dict) else EqState()
+        data = self._track_eq_state.get(key)
+        return EqState.from_dict(data) if isinstance(data, dict) else EqState()
 
     def _sync_spectrum_playback(self) -> None:
         # Spectrum follows PCM air playback automatically; nothing to push.
         return
 
     def _eq_state_for_path(self, file_path: str | None) -> EqState:
-        if not file_path:
+        key = self._settings_key(item=self.current_playing_item, file_path=file_path)
+        if not key:
             return EqState()
-        key = os.path.abspath(file_path)
         data = self._track_eq_state.get(key)
         return EqState.from_dict(data) if isinstance(data, dict) else EqState()
 
+    def _stem_state_for_path(self, file_path: str | None) -> TrackStemState | None:
+        key = self._settings_key(item=self.current_playing_item, file_path=file_path)
+        if not key:
+            return None
+        return self._track_stem_state.get(key)
+
+    def _apply_stems_to_player(self, player, file_path: str | None) -> None:
+        stem_state = self._stem_state_for_path(file_path)
+        if stem_state is None or not stem_state.files_ok():
+            player.clear_stem_mix()
+            return
+        player.set_stem_mix(
+            vocals_path=stem_state.vocals_path,
+            instrumental_path=stem_state.instrumental_path,
+            vocals_eq=EqState.from_dict(stem_state.vocals.eq),
+            instrumental_eq=EqState.from_dict(stem_state.instrumental.eq),
+            vocals_gain_db=stem_state.vocals.gain_db,
+            instrumental_gain_db=stem_state.instrumental.gain_db,
+        )
+
     def _set_air_source(self, player_idx: int, file_path: str | None) -> None:
         player = self._players[player_idx]
+        if player.playbackState() != QMediaPlayer.PlaybackState.StoppedState:
+            player.stop()
         if not file_path:
+            player.clear_stem_mix()
             player.setSource(QUrl())
             return
         player.set_eq_state(self._eq_state_for_path(file_path))
         player.set_track_gain_db(self._gain_db_for_path(file_path))
+        # Stem mix must be configured before setSource. LoadedMedia starts
+        # playback synchronously; leftover stem paths would play the previous
+        # track for a buffer or two.
+        self._apply_stems_to_player(player, file_path)
         player.setSource(QUrl.fromLocalFile(file_path))
 
     def _apply_live_eq_to_air(self) -> None:
@@ -712,6 +992,32 @@ class AudioPlayer(QMainWindow):
             return
         state = self.file_properties_panel.eq_state()
         key = self._eq_bound_path
+        stem_state = self._track_stem_state.get(key) if key else None
+        selected_stem = (
+            self.file_properties_panel.selected_stem()
+            if self.file_properties_panel.stems_enabled()
+            else None
+        )
+        bound_path = None
+        bound_item = getattr(self, "_eq_bound_item", None)
+        if bound_item is not None:
+            item_path = get_item_file_path(bound_item)
+            if item_path:
+                bound_path = os.path.abspath(item_path)
+            playing_key = (
+                get_item_track_id(self.current_playing_item)
+                if self.current_playing_item is not None
+                else None
+            )
+            if (
+                self.current_playing_item is not None
+                and bound_item is not self.current_playing_item
+                and playing_key != key
+            ):
+                return
+        elif key and os.path.isabs(key):
+            bound_path = key
+
         applied = False
         for idx, player in enumerate(self._players):
             try:
@@ -721,12 +1027,24 @@ class AudioPlayer(QMainWindow):
             if not src:
                 continue
             src_abs = os.path.abspath(src)
-            if key is not None:
-                if src_abs == key:
-                    player.set_eq_state(state)
+            if bound_path is not None:
+                if src_abs == bound_path:
+                    if (
+                        self._crossfade_active
+                        and idx == self._crossfade_outgoing_idx
+                        and bound_item is self.current_playing_item
+                    ):
+                        continue
+                    if stem_state is not None and selected_stem:
+                        player.set_stem_eq_state(selected_stem, state)
+                    else:
+                        player.set_eq_state(state)
                     applied = True
             elif idx == self._active_player_idx:
-                player.set_eq_state(state)
+                if stem_state is not None and selected_stem:
+                    player.set_stem_eq_state(selected_stem, state)
+                else:
+                    player.set_eq_state(state)
                 applied = True
         if applied:
             return
@@ -741,14 +1059,17 @@ class AudioPlayer(QMainWindow):
         ):
             return
         try:
-            self.player.set_eq_state(state)
+            if stem_state is not None and selected_stem:
+                self.player.set_stem_eq_state(selected_stem, state)
+            else:
+                self.player.set_eq_state(state)
         except Exception:
             pass
 
     def _gain_db_for_path(self, file_path: str | None) -> float:
-        if not file_path:
+        key = self._settings_key(item=self.current_playing_item, file_path=file_path)
+        if not key:
             return 0.0
-        key = os.path.abspath(file_path)
         return float(self._track_gain_db.get(key, 0.0))
 
     def _lufs_for_path(self, file_path: str | None) -> float | None:
@@ -756,20 +1077,36 @@ class AudioPlayer(QMainWindow):
             return None
         return self._track_lufs.get(os.path.abspath(file_path))
 
+    def _bound_file_path(self) -> str | None:
+        item = getattr(self, "_eq_bound_item", None)
+        if item is not None:
+            path = get_item_file_path(item)
+            if path:
+                return os.path.abspath(path)
+        key = self._eq_bound_path
+        if key and ("/" in key or "\\" in key):
+            return os.path.abspath(key)
+        return None
+
     def _save_gain_for_bound_path(self) -> None:
         if not hasattr(self, "file_properties_panel") or self._gain_loading:
             return
         key = self._eq_bound_path
         if not key:
             return
-        self._track_gain_db[key] = clamp_gain_db(self.file_properties_panel.gain_db())
+        gain = clamp_gain_db(self.file_properties_panel.gain_db())
+        self._track_gain_db[key] = gain
+        item = getattr(self, "_eq_bound_item", None)
+        if item is not None:
+            set_item_gain_db(item, gain)
 
     def _bind_gain_to_path(self, file_path: str | None) -> None:
         if not hasattr(self, "file_properties_panel"):
             return
         key = self._eq_path_key(file_path) if file_path else None
         gain = float(self._track_gain_db.get(key, 0.0)) if key else 0.0
-        lufs = self._track_lufs.get(key) if key else None
+        abs_path = os.path.abspath(file_path) if file_path else None
+        lufs = self._track_lufs.get(abs_path) if abs_path else None
         self._gain_loading = True
         try:
             self.file_properties_panel.set_gain_db(gain, lufs=lufs)
@@ -781,7 +1118,15 @@ class AudioPlayer(QMainWindow):
         if not hasattr(self, "file_properties_panel"):
             return
         gain = clamp_gain_db(self.file_properties_panel.gain_db())
-        key = self._eq_bound_path
+        bound_path = self._bound_file_path()
+        bound_item = getattr(self, "_eq_bound_item", None)
+        if (
+            bound_item is not None
+            and self.current_playing_item is not None
+            and bound_item is not self.current_playing_item
+            and get_item_track_id(self.current_playing_item) != self._eq_bound_path
+        ):
+            return
         applied = False
         for idx, player in enumerate(self._players):
             try:
@@ -791,8 +1136,14 @@ class AudioPlayer(QMainWindow):
             if not src:
                 continue
             src_abs = os.path.abspath(src)
-            if key is not None:
-                if src_abs == key:
+            if bound_path is not None:
+                if src_abs == bound_path:
+                    if (
+                        self._crossfade_active
+                        and idx == self._crossfade_outgoing_idx
+                        and bound_item is self.current_playing_item
+                    ):
+                        continue
                     player.set_track_gain_db(gain)
                     applied = True
             elif idx == self._active_player_idx:
@@ -819,7 +1170,7 @@ class AudioPlayer(QMainWindow):
         if key:
             gain = clamp_gain_db(gain_db)
             self._track_gain_db[key] = gain
-            self._sync_gain_to_playlist_items(key, gain)
+            self._sync_gain_to_item(getattr(self, "_eq_bound_item", None), gain)
         self._apply_live_gain_to_air()
         if not hasattr(self, "_gain_save_timer"):
             self._gain_save_timer = QTimer(self)
@@ -827,19 +1178,42 @@ class AudioPlayer(QMainWindow):
             self._gain_save_timer.timeout.connect(self._persist_gain_changes)
         self._gain_save_timer.start(400)
 
+    def _on_master_volume_changed(self, volume: float) -> None:
+        volume = max(0.0, min(1.0, float(volume)))
+        self._playback_volume = volume
+        if self._crossfade_active:
+            incoming = self._crossfade_incoming_idx
+            if incoming is not None:
+                if self._incoming_fader.is_active:
+                    self._incoming_fader.retarget(volume, max(1, self._crossfade_fade_in_ms))
+                else:
+                    self._apply_player_volume(incoming, volume)
+        elif self.volume_fader.is_active:
+            self.volume_fader.retarget(volume, 1)
+        elif (
+            self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            and self._timeline_fades_enabled()
+        ):
+            self._apply_timeline_volume(self.player.position())
+        else:
+            self._set_output_volume(volume)
+        if not hasattr(self, "_master_volume_save_timer"):
+            self._master_volume_save_timer = QTimer(self)
+            self._master_volume_save_timer.setSingleShot(True)
+            self._master_volume_save_timer.timeout.connect(self.save_config)
+        self._master_volume_save_timer.start(400)
+
     def _persist_gain_changes(self) -> None:
         self._save_gain_for_bound_path()
         self.save_config()
 
-    def _sync_gain_to_playlist_items(self, file_path: str, gain_db: float) -> None:
-        abs_path = os.path.abspath(file_path)
-        for playlist in getattr(self, "playlists", []) or []:
-            for row in range(playlist.count()):
-                item = playlist.item(row)
-                path = get_item_file_path(item)
-                if path and os.path.abspath(path) == abs_path:
-                    set_item_gain_db(item, gain_db)
-                    playlist.viewport().update()
+    def _sync_gain_to_item(self, item, gain_db: float) -> None:
+        if item is None:
+            return
+        set_item_gain_db(item, gain_db)
+        widget = item.listWidget()
+        if widget is not None:
+            widget.viewport().update()
 
     def _apply_analyzed_loudness(
         self,
@@ -850,39 +1224,44 @@ class AudioPlayer(QMainWindow):
         force_gain: bool = False,
     ) -> None:
         """Store measured LUFS and auto-set gain toward the current target."""
-        key = os.path.abspath(file_path)
-        self._track_lufs[key] = float(lufs)
+        path_key = os.path.abspath(file_path)
+        self._track_lufs[path_key] = float(lufs)
         if item is not None:
             set_item_lufs(item, float(lufs))
         suggested = gain_db_to_target(float(lufs), target_lufs=self._target_lufs_value())
-        if force_gain or key not in self._track_gain_db:
-            self._track_gain_db[key] = suggested
+        instance_key = self._adopt_item_settings(item) if item is not None else path_key
+        if force_gain or instance_key not in self._track_gain_db:
+            self._track_gain_db[instance_key] = suggested
             if item is not None:
                 set_item_gain_db(item, suggested)
-            if self._eq_bound_path == key and hasattr(self, "file_properties_panel"):
+            if self._eq_bound_path == instance_key and hasattr(self, "file_properties_panel"):
                 self._gain_loading = True
                 try:
                     self.file_properties_panel.set_gain_db(suggested, lufs=float(lufs))
                 finally:
                     self._gain_loading = False
                 self._apply_live_gain_to_air()
-            else:
+            elif item is self.current_playing_item:
                 for player in self._players:
                     try:
                         src = player.source().toLocalFile()
                     except Exception:
                         continue
-                    if src and os.path.abspath(src) == key:
+                    if src and os.path.abspath(src) == path_key:
                         player.set_track_gain_db(suggested)
-        elif self._eq_bound_path == key and hasattr(self, "file_properties_panel"):
+        elif self._eq_bound_path == instance_key and hasattr(self, "file_properties_panel"):
             self.file_properties_panel.set_lufs(float(lufs))
         preview = getattr(self, "_preview_file_path", None)
-        if preview and os.path.abspath(preview) == key and hasattr(
+        if preview and os.path.abspath(preview) == path_key and hasattr(
             self, "preview_properties_panel"
         ):
-            self.preview_properties_panel.set_loudness(
-                float(lufs), self._track_gain_db.get(key, 0.0)
-            )
+            preview_gain = 0.0
+            if self._preview_item is not None:
+                preview_key = self._settings_key(item=self._preview_item)
+                preview_gain = self._track_gain_db.get(preview_key, 0.0) if preview_key else 0.0
+            else:
+                preview_gain = self._track_gain_db.get(instance_key, 0.0)
+            self.preview_properties_panel.set_loudness(float(lufs), preview_gain)
 
     def _target_lufs_value(self) -> float:
         if hasattr(self, "file_properties_panel") and self.file_properties_panel is not None:
@@ -899,36 +1278,49 @@ class AudioPlayer(QMainWindow):
         self._target_lufs_save_timer.start(400)
 
     def _reapply_gains_to_target(self) -> None:
-        """Recalculate per-track gain for every track with measured LUFS."""
+        """Recalculate per-track gain for every playlist instance with measured LUFS."""
         target = self._target_lufs_value()
-        for key, lufs in list(self._track_lufs.items()):
-            suggested = gain_db_to_target(float(lufs), target_lufs=target)
-            self._track_gain_db[key] = suggested
-            self._sync_gain_to_playlist_items(key, suggested)
-            for player in self._players:
-                try:
-                    src = player.source().toLocalFile()
-                except Exception:
+        playing_key = (
+            get_item_track_id(self.current_playing_item)
+            if self.current_playing_item is not None
+            else None
+        )
+        for playlist in getattr(self, "playlists", []) or []:
+            for row in range(playlist.count()):
+                item = playlist.item(row)
+                path = get_item_file_path(item)
+                if not path:
                     continue
-                if src and os.path.abspath(src) == key:
-                    player.set_track_gain_db(suggested)
+                lufs = self._track_lufs.get(os.path.abspath(path))
+                if lufs is None:
+                    continue
+                suggested = gain_db_to_target(float(lufs), target_lufs=target)
+                instance_key = self._adopt_item_settings(item)
+                if not instance_key:
+                    continue
+                self._track_gain_db[instance_key] = suggested
+                self._sync_gain_to_item(item, suggested)
+                if instance_key == playing_key:
+                    for player in self._players:
+                        try:
+                            src = player.source().toLocalFile()
+                        except Exception:
+                            continue
+                        if src and os.path.abspath(src) == os.path.abspath(path):
+                            player.set_track_gain_db(suggested)
         bound = self._eq_bound_path
         if bound and hasattr(self, "file_properties_panel"):
             gain = float(self._track_gain_db.get(bound, 0.0))
-            lufs = self._track_lufs.get(bound)
+            bound_path = self._bound_file_path()
+            lufs = self._track_lufs.get(bound_path) if bound_path else None
             self._gain_loading = True
             try:
                 self.file_properties_panel.set_gain_db(gain, lufs=lufs)
             finally:
                 self._gain_loading = False
             self._apply_live_gain_to_air()
-        preview = getattr(self, "_preview_file_path", None)
-        if preview and hasattr(self, "preview_properties_panel"):
-            key = os.path.abspath(preview)
-            self.preview_properties_panel.set_loudness(
-                self._track_lufs.get(key),
-                self._track_gain_db.get(key, 0.0),
-            )
+        if hasattr(self, "preview_properties_panel"):
+            self._update_preview_properties()
 
     def _on_eq_changed(self) -> None:
         if self._eq_loading:
@@ -945,6 +1337,209 @@ class AudioPlayer(QMainWindow):
     def _persist_eq_changes(self) -> None:
         self._save_eq_for_bound_path()
         self.save_config()
+
+    def _clamp_stem_gain_db(self, gain_db: float) -> float:
+        return clamp_stem_gain_db(gain_db)
+
+    def _bind_stems_to_path(self, file_path: str | None) -> None:
+        if not hasattr(self, "file_properties_panel"):
+            return
+        key = self._eq_path_key(file_path) if file_path else None
+        stem_state = self._track_stem_state.get(key) if key else None
+        if stem_state is not None and not stem_state.files_ok():
+            self._track_stem_state.pop(key, None)
+            stem_state = None
+        if stem_state is None and file_path:
+            cached = load_cached_stems(file_path)
+            if cached is not None:
+                stem_state = TrackStemState.from_paths(cached)
+                if key:
+                    self._track_stem_state[key] = stem_state
+        enabled = stem_state is not None and stem_state.files_ok()
+        self.file_properties_panel.set_stems_enabled(enabled)
+        if not enabled or stem_state is None:
+            return
+        selected = stem_state.selected if stem_state.selected in (STEM_VOCALS, STEM_INSTRUMENTAL) else STEM_VOCALS
+        channel = stem_state.channel(selected)
+        self.file_properties_panel.set_stem_ui(selected=selected, gain_db=channel.gain_db)
+        # Refresh EQ view for the selected stem channel.
+        self._eq_loading = True
+        try:
+            self.file_properties_panel.set_eq_state(
+                EqState.from_dict(channel.eq) if isinstance(channel.eq, dict) else EqState()
+            )
+        finally:
+            self._eq_loading = False
+        self._apply_live_eq_to_air()
+        self._apply_live_stem_gains_to_air(key)
+
+    def _on_stem_selection_changed(self, stem_id: str) -> None:
+        if self._eq_loading or self._stem_eq_loading:
+            return
+        key = self._eq_bound_path
+        if not key:
+            return
+        stem_state = self._track_stem_state.get(key)
+        if stem_state is None:
+            return
+        self._save_eq_for_bound_path()
+        if stem_id not in (STEM_VOCALS, STEM_INSTRUMENTAL):
+            return
+        stem_state.selected = stem_id
+        channel = stem_state.channel(stem_id)
+        self._stem_eq_loading = True
+        try:
+            self.file_properties_panel.set_stem_ui(selected=stem_id, gain_db=channel.gain_db)
+            self._eq_loading = True
+            try:
+                self.file_properties_panel.set_eq_state(
+                    EqState.from_dict(channel.eq) if isinstance(channel.eq, dict) else EqState()
+                )
+            finally:
+                self._eq_loading = False
+        finally:
+            self._stem_eq_loading = False
+        self._apply_live_eq_to_air()
+        self._schedule_stem_persist()
+
+    def _on_stem_gain_changed(self, stem_id: str, gain_db: float) -> None:
+        if self._stem_eq_loading or self._eq_loading:
+            return
+        key = self._eq_bound_path
+        if not key:
+            return
+        stem_state = self._track_stem_state.get(key)
+        if stem_state is None:
+            return
+        if stem_id not in (STEM_VOCALS, STEM_INSTRUMENTAL):
+            return
+        stem_state.channel(stem_id).gain_db = self._clamp_stem_gain_db(gain_db)
+        bound_path = self._bound_file_path()
+        if bound_path:
+            for player in self._players:
+                try:
+                    src = player.source().toLocalFile()
+                except Exception:
+                    continue
+                if src and os.path.abspath(src) == bound_path:
+                    player.set_stem_gain_db(stem_id, stem_state.channel(stem_id).gain_db)
+        self._schedule_stem_persist()
+
+    def _apply_live_stem_gains_to_air(self, key: str | None) -> None:
+        if not key:
+            return
+        stem_state = self._track_stem_state.get(key)
+        if stem_state is None:
+            return
+        bound_path = self._bound_file_path()
+        if not bound_path:
+            return
+        for player in self._players:
+            try:
+                src = player.source().toLocalFile()
+            except Exception:
+                continue
+            if src and os.path.abspath(src) == bound_path:
+                player.set_stem_gain_db(STEM_VOCALS, stem_state.vocals.gain_db)
+                player.set_stem_gain_db(STEM_INSTRUMENTAL, stem_state.instrumental.gain_db)
+
+    def _schedule_stem_persist(self) -> None:
+        if not hasattr(self, "_stem_save_timer"):
+            self._stem_save_timer = QTimer(self)
+            self._stem_save_timer.setSingleShot(True)
+            self._stem_save_timer.timeout.connect(self._persist_stem_changes)
+        self._stem_save_timer.start(400)
+
+    def _persist_stem_changes(self) -> None:
+        self.save_config()
+        try:
+            self.project.save_raw(self._build_project_state())
+        except Exception as exc:
+            print(f"Project stem auto-save error: {exc}")
+
+    def separate_selected_stems(self, playlist: PlaylistWidget) -> None:
+        item = playlist.currentItem()
+        if item is None:
+            QMessageBox.information(self, "Stems", "Select a track to split into stems.")
+            return
+        file_path = playlist.file_path_at(playlist.currentRow())
+        if not file_path or not os.path.isfile(file_path):
+            QMessageBox.warning(self, "Stems", "Selected track has no readable file.")
+            return
+        if item_has_stems(item) and self._stem_state_for_path(file_path) is not None:
+            reply = QMessageBox.question(
+                self,
+                "Stems",
+                "This track already has stems. Re-separate?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            force = True
+        else:
+            force = False
+        self.statusBar().showMessage("Separating stems…", 0)
+        self.stem_separator.separate_item(item, file_path, force=force)
+
+    def _on_stem_progress(self, _path: str, value: float) -> None:
+        pct = max(0, min(100, int(round(float(value) * 100))))
+        self.statusBar().showMessage(f"Separating stems… {pct}%", 0)
+
+    def _on_stem_busy(self, busy: bool) -> None:
+        if not busy and not self.file_analyzer.is_busy:
+            self.statusBar().clearMessage()
+
+    def _on_stems_separated(self, item, file_path: str, paths, error) -> None:
+        if error:
+            QMessageBox.warning(
+                self,
+                "Stems",
+                f"Could not separate stems:\n{error}",
+            )
+            return
+        if paths is None:
+            return
+        from app.stems import is_readable_stem_wav
+
+        if not (
+            is_readable_stem_wav(paths.vocals) and is_readable_stem_wav(paths.instrumental)
+        ):
+            QMessageBox.warning(
+                self,
+                "Stems",
+                "Stem files were written but could not be read. Try again.",
+            )
+            return
+        instance_key = self._adopt_item_settings(item) if item is not None else os.path.abspath(file_path)
+        existing = self._track_stem_state.get(instance_key)
+        if existing is not None:
+            stem_state = existing
+            stem_state.vocals_path = paths.vocals
+            stem_state.instrumental_path = paths.instrumental
+        else:
+            stem_state = TrackStemState.from_paths(paths)
+        self._track_stem_state[instance_key] = stem_state
+        if item is not None:
+            set_item_has_stems(item, True)
+            widget = item.listWidget()
+            if widget is not None:
+                widget.viewport().update()
+            self._save_playlist_for_item(item)
+        abs_path = os.path.abspath(file_path)
+        if self._eq_bound_path == instance_key or (
+            self._current_file_path and os.path.abspath(self._current_file_path) == abs_path
+            and (item is None or item is self.current_playing_item)
+        ):
+            self._bind_stems_to_path(file_path)
+            for player in self._players:
+                try:
+                    src = player.source().toLocalFile()
+                except Exception:
+                    continue
+                if src and os.path.abspath(src) == abs_path:
+                    self._apply_stems_to_player(player, file_path)
+        self.statusBar().showMessage("Stems ready", 3000)
+        self.save_project()
 
     def collapse_file_properties(self) -> None:
         if self._properties_collapsed:
@@ -1023,6 +1618,21 @@ class AudioPlayer(QMainWindow):
             except TypeError:
                 pass
             playlist.fileImported.connect(self._on_playlist_file_imported)
+            try:
+                playlist.itemDuplicated.disconnect(self._clone_instance_settings)
+            except TypeError:
+                pass
+            playlist.itemDuplicated.connect(self._clone_instance_settings)
+            try:
+                playlist.copyRequested.disconnect(self.copy_selected_playlist_tracks)
+            except TypeError:
+                pass
+            playlist.copyRequested.connect(self.copy_selected_playlist_tracks)
+            try:
+                playlist.pasteRequested.disconnect(self.paste_playlist_tracks)
+            except TypeError:
+                pass
+            playlist.pasteRequested.connect(self.paste_playlist_tracks)
 
     def _on_playlist_file_imported(self, item, file_path: str) -> None:
         """Auto-queue BPM + waveform analysis when a track is added to a playlist."""
@@ -1072,10 +1682,13 @@ class AudioPlayer(QMainWindow):
                 self.bpm_label.setText("?")
 
     def analyze_playlist_files(self, playlist: PlaylistWidget) -> None:
-        """Queue missing analysis for all tracks (used internally / automation)."""
+        """Queue missing analysis for all tracks in the current playlist."""
         if playlist.count() == 0:
+            self._on_analysis_status("Playlist is empty.")
             return
-        self.file_analyzer.analyze_playlist(playlist, only_missing=True)
+        queued = self.file_analyzer.analyze_playlist(playlist, only_missing=True)
+        if queued == 0:
+            self._on_analysis_status("All tracks already analyzed.")
 
     def analyze_selected_file(self, playlist: PlaylistWidget) -> None:
         item = playlist.currentItem()
@@ -1199,6 +1812,91 @@ class AudioPlayer(QMainWindow):
         if to_playlist_num != from_playlist_num:
             self.refresh_playlist_footer(self.get_playlist(to_playlist_num))
 
+    def _focused_playlist(self) -> PlaylistWidget | None:
+        if self.last_selected_playlist is not None:
+            playlist = self.get_playlist(self.last_selected_playlist)
+            if playlist is not None and playlist.isVisible():
+                return playlist
+        focused = QApplication.focusWidget()
+        if isinstance(focused, PlaylistWidget):
+            return focused
+        for playlist in self.get_visible_playlists():
+            if playlist.hasFocus():
+                return playlist
+        return None
+
+    def copy_selected_playlist_tracks(self, playlist: PlaylistWidget | None = None) -> None:
+        if not isinstance(playlist, PlaylistWidget):
+            playlist = self._focused_playlist()
+        if playlist is None:
+            return
+        items = playlist.selected_track_items()
+        if not items:
+            item = playlist.currentItem()
+            items = [item] if item is not None else []
+        snapshots = []
+        for item in items:
+            snapshot = self._snapshot_item_settings(item)
+            if snapshot is not None:
+                snapshots.append(snapshot)
+        if not snapshots:
+            return
+        payload = json.dumps({"tracks": snapshots}, ensure_ascii=False)
+        mime = QMimeData()
+        mime.setData(TRACKS_CLIPBOARD_MIME, payload.encode("utf-8"))
+        mime.setText("\n".join(str(entry.get("name") or "") for entry in snapshots))
+        QApplication.clipboard().setMimeData(mime)
+
+    def paste_playlist_tracks(self, playlist: PlaylistWidget | None = None) -> None:
+        if not isinstance(playlist, PlaylistWidget):
+            playlist = self._focused_playlist()
+        if playlist is None:
+            return
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData() if clipboard is not None else None
+        if mime is None or not mime.hasFormat(TRACKS_CLIPBOARD_MIME):
+            return
+        try:
+            payload = json.loads(bytes(mime.data(TRACKS_CLIPBOARD_MIME)).decode("utf-8"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return
+        tracks = payload.get("tracks") if isinstance(payload, dict) else None
+        if not isinstance(tracks, list) or not tracks:
+            return
+
+        insert_at = playlist.currentRow() + 1 if playlist.currentRow() >= 0 else playlist.count()
+        insert_at = max(0, min(insert_at, playlist.count()))
+        inserted = []
+        for snapshot in tracks:
+            if not isinstance(snapshot, dict):
+                continue
+            file_path = str(snapshot.get("path") or "").strip()
+            if not file_path:
+                continue
+            item = playlist.add_item_with_path(
+                file_path,
+                display_name=str(snapshot.get("name") or "").strip() or None,
+                load_duration=snapshot.get("duration_ms") is None,
+                file_exists=os.path.isfile(file_path),
+                row=insert_at,
+            )
+            insert_at += 1
+            if snapshot.get("duration_ms") is not None:
+                try:
+                    set_item_duration(item, int(snapshot["duration_ms"]))
+                except (TypeError, ValueError):
+                    pass
+            self._apply_snapshot_settings(item, snapshot)
+            inserted.append(item)
+            playlist.fileImported.emit(item, os.path.abspath(file_path))
+        if not inserted:
+            return
+        playlist._select_items(inserted)
+        self.last_selected_playlist = playlist.playlist_num
+        self.load_preview_track(playlist.playlist_num, inserted[-1])
+        self.refresh_playlist_footer(playlist)
+        self.save_project()
+
     def refresh_playlist_footer(self, playlist: PlaylistWidget | None = None) -> None:
         columns = getattr(self, "playlist_columns", None) or []
         targets: list[PlaylistWidget] = []
@@ -1318,6 +2016,12 @@ class AudioPlayer(QMainWindow):
         self._retain_playlist_keyboard_focus(playlist_num)
         self.load_preview_track(playlist_num, item)
         self._retain_playlist_keyboard_focus(playlist_num)
+
+    def _cue_mixer_scene_for_item(self, item) -> None:
+        scene_id = get_item_mixer_scene_id(item)
+        if not scene_id or not hasattr(self, "video_mixer") or self.video_mixer is None:
+            return
+        self.video_mixer.take_scene_to_main(scene_id)
 
     def _retain_playlist_keyboard_focus(self, playlist_num: int) -> None:
         """Keep ↑/↓ on the playlist even if preview loading moves focus."""
@@ -1606,9 +2310,11 @@ class AudioPlayer(QMainWindow):
         if not self._air_player_has_loaded_source(incoming_idx, abs_path):
             self._set_air_source(incoming_idx, file_path)
         else:
-            # Reused deck: still refresh EQ/gain for the incoming path.
-            self._players[incoming_idx].set_eq_state(self._eq_state_for_path(file_path))
-            self._players[incoming_idx].set_track_gain_db(self._gain_db_for_path(file_path))
+            # Reused deck: still refresh EQ/gain/stems for the incoming path.
+            incoming = self._players[incoming_idx]
+            incoming.set_eq_state(self._eq_state_for_path(file_path))
+            incoming.set_track_gain_db(self._gain_db_for_path(file_path))
+            self._apply_stems_to_player(incoming, file_path)
 
         self._outgoing_fader.sync_volume(self._playback_volume)
         self._outgoing_fader.fade_to(
@@ -1661,14 +2367,21 @@ class AudioPlayer(QMainWindow):
         self._try_begin_pending_playback()
 
     def _prepare_incoming_track(self, file_path: str, abs_path: str) -> None:
-        if self._displayed_track_path and self._displayed_track_path != abs_path:
+        next_key = self._adopt_item_settings(self.current_playing_item)
+        is_new_track = (
+            self._displayed_track_key != next_key
+            if self._displayed_track_key
+            else self._displayed_track_path != abs_path
+        )
+        if self._displayed_track_key and next_key and self._displayed_track_key != next_key:
+            self._save_timeline_for_path(self._displayed_track_path or abs_path)
+        elif self._displayed_track_path and self._displayed_track_path != abs_path:
             self._save_timeline_for_path(self._displayed_track_path)
         if self._current_file_path and os.path.abspath(self._current_file_path) != abs_path:
             self._save_timeline_for_path(self._current_file_path)
 
         self._current_file_path = file_path
         self._fade_out_started = False
-        is_new_track = self._displayed_track_path != abs_path
         needs_waveform = is_new_track or not self.waveform.waveform_data
         self.waveform.reset_view()
         if is_new_track:
@@ -1676,6 +2389,7 @@ class AudioPlayer(QMainWindow):
         elif needs_waveform:
             self.waveform.set_waveform([])
         self._displayed_track_path = abs_path
+        self._displayed_track_key = next_key
         self._prepare_timeline_for_path(file_path)
         self.update_track_info_playing()
         self._update_file_properties(file_path)
@@ -2038,6 +2752,7 @@ class AudioPlayer(QMainWindow):
     def _setup_menus(self) -> None:
         self._setup_project_menu()
         self._setup_view_menu()
+        self._setup_midi_menu()
         self._setup_about_menu()
 
     def _setup_project_menu(self) -> None:
@@ -2086,7 +2801,95 @@ class AudioPlayer(QMainWindow):
         self._view_playlists_act.toggled.connect(self._on_view_playlists_toggled)
         menu.addAction(self._view_playlists_act)
 
+        self._view_video_mixer_act = QAction("Video Mixer", self)
+        self._view_video_mixer_act.setCheckable(True)
+        self._view_video_mixer_act.toggled.connect(self._on_view_video_mixer_toggled)
+        menu.addAction(self._view_video_mixer_act)
+
         self._sync_view_menu_actions()
+
+    def _setup_midi(self) -> None:
+        self._midi = MidiHub(self)
+        self._midi.ccReceived.connect(self._on_midi_cc)
+        self._midi.learnChanged.connect(self._on_midi_learn_changed)
+        self._midi.bindingChanged.connect(self._on_midi_binding_changed)
+        knob = self.file_properties_panel.master_knob
+        knob.midiLearnRequested.connect(self._midi_learn_master)
+        knob.midiLearnCancelRequested.connect(self._midi.cancel_learn)
+        knob.midiClearRequested.connect(self._midi_clear_master)
+        self._midi.start()
+
+    def _setup_midi_menu(self) -> None:
+        menu = self.menuBar().addMenu("MIDI")
+        menu.aboutToShow.connect(self._sync_midi_menu)
+        self._midi_learn_act = QAction("Learn Master Volume", self)
+        self._midi_learn_act.triggered.connect(self._midi_learn_master)
+        menu.addAction(self._midi_learn_act)
+        self._midi_clear_act = QAction("Clear Master Volume mapping", self)
+        self._midi_clear_act.triggered.connect(self._midi_clear_master)
+        menu.addAction(self._midi_clear_act)
+        menu.addSeparator()
+        refresh = QAction("Refresh MIDI inputs", self)
+        refresh.triggered.connect(self._midi_refresh_inputs)
+        menu.addAction(refresh)
+        self._midi_menu = menu
+
+    def _sync_midi_menu(self) -> None:
+        binding = self._midi.binding_for(TARGET_MASTER_VOLUME) if hasattr(self, "_midi") else None
+        if binding is None:
+            self._midi_clear_act.setText("Clear Master Volume mapping")
+            self._midi_clear_act.setEnabled(False)
+        else:
+            self._midi_clear_act.setText(f"Clear Master Volume ({binding.label()})")
+            self._midi_clear_act.setEnabled(True)
+        learning = bool(getattr(self, "_midi", None) and self._midi.learn_target)
+        self._midi_learn_act.setText(
+            "Cancel MIDI Learn" if learning else "Learn Master Volume"
+        )
+
+    def _midi_learn_master(self) -> None:
+        if not midi_available():
+            QMessageBox.warning(
+                self,
+                "MIDI",
+                "MIDI support needs python-rtmidi.\nInstall with: pip install python-rtmidi",
+            )
+            return
+        if not hasattr(self, "_midi"):
+            return
+        if self._midi.learn_target:
+            self._midi.cancel_learn()
+            return
+        self._midi.start_learn(TARGET_MASTER_VOLUME)
+
+    def _midi_clear_master(self) -> None:
+        if hasattr(self, "_midi"):
+            self._midi.clear_binding(TARGET_MASTER_VOLUME)
+
+    def _midi_refresh_inputs(self) -> None:
+        if hasattr(self, "_midi"):
+            self._midi.refresh()
+
+    def _on_midi_learn_changed(self, target: str) -> None:
+        knob = self.file_properties_panel.master_knob
+        knob.set_learning(target == TARGET_MASTER_VOLUME)
+
+    def _on_midi_binding_changed(self, _target: str) -> None:
+        binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
+        self.file_properties_panel.master_knob.set_midi_binding_label(
+            None if binding is None else binding.label()
+        )
+        self.save_config()
+
+    def _on_midi_cc(self, channel: int, cc: int, value: int) -> None:
+        if not hasattr(self, "_midi"):
+            return
+        binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
+        if binding is None or binding.cc != cc or binding.channel != channel:
+            return
+        volume = max(0.0, min(1.0, int(value) / 127.0))
+        self.file_properties_panel.set_master_volume(volume)
+        self._on_master_volume_changed(volume)
 
     def _setup_about_menu(self) -> None:
         menu = self.menuBar().addMenu("About")
@@ -2101,6 +2904,7 @@ class AudioPlayer(QMainWindow):
             getattr(self, "_view_file_properties_act", None),
             getattr(self, "_view_timeline_act", None),
             getattr(self, "_view_playlists_act", None),
+            getattr(self, "_view_video_mixer_act", None),
         )
         if not all(actions):
             return
@@ -2127,6 +2931,10 @@ class AudioPlayer(QMainWindow):
                 self._view_playlists_act,
                 not self.playlist_section.isHidden(),
             )
+        mixer_visible = True
+        if hasattr(self, "video_mixer"):
+            mixer_visible = not self.video_mixer.model.panel_collapsed
+        set_checked(self._view_video_mixer_act, mixer_visible)
 
     def _on_view_file_browser_toggled(self, checked: bool) -> None:
         if checked:
@@ -2155,6 +2963,14 @@ class AudioPlayer(QMainWindow):
             self.playlist_section.setVisible(checked)
             self.save_config()
 
+    def _on_view_video_mixer_toggled(self, checked: bool) -> None:
+        if not hasattr(self, "video_mixer"):
+            return
+        if checked:
+            self.video_mixer.expand_panel()
+        else:
+            self.video_mixer.collapse_panel()
+
     def _show_about_dialog(self) -> None:
         show_about_dialog(self)
 
@@ -2162,8 +2978,18 @@ class AudioPlayer(QMainWindow):
         item = playlist.itemAt(pos)
         if item is None:
             return
-        playlist.setCurrentItem(item)
+        if item not in playlist.selectedItems():
+            playlist.clearSelection()
+            item.setSelected(True)
+            playlist.setCurrentItem(item)
+        targets = playlist.selected_track_items() or [item]
         menu = QMenu(self)
+        copy_act = menu.addAction("Copy")
+        paste_act = menu.addAction("Paste")
+        clipboard = QApplication.clipboard()
+        mime = clipboard.mimeData() if clipboard is not None else None
+        paste_act.setEnabled(bool(mime and mime.hasFormat(TRACKS_CLIPBOARD_MIME)))
+        menu.addSeparator()
         move_act = menu.addAction("Move to project folder")
         path = get_item_file_path(item)
         if path and self.project.is_path_in_project(path):
@@ -2171,7 +2997,8 @@ class AudioPlayer(QMainWindow):
             move_act.setText("Already in project")
 
         color_menu = menu.addMenu("Mark color")
-        current_color = get_item_color(item)
+        current_colors = {get_item_color(target) for target in targets}
+        current_color = next(iter(current_colors)) if len(current_colors) == 1 else object()
         clear_act = color_menu.addAction("None")
         clear_act.setCheckable(True)
         clear_act.setChecked(current_color is None)
@@ -2182,13 +3009,43 @@ class AudioPlayer(QMainWindow):
             act.setChecked(current_color == hex_color)
             color_actions.append((act, hex_color))
 
+        scene_actions: list[tuple[object, str | None]] = []
+        mixer = getattr(self, "video_mixer", None)
+        if mixer is not None and mixer.model.scenes:
+            scene_menu = menu.addMenu("Video scene")
+            current_scenes = {get_item_mixer_scene_id(target) for target in targets}
+            current_scene = next(iter(current_scenes)) if len(current_scenes) == 1 else object()
+            none_act = scene_menu.addAction("None")
+            none_act.setCheckable(True)
+            none_act.setChecked(current_scene is None)
+            scene_actions.append((none_act, None))
+            for scene in mixer.model.scenes:
+                act = scene_menu.addAction(scene.name)
+                act.setCheckable(True)
+                act.setChecked(current_scene == scene.id)
+                scene_actions.append((act, scene.id))
+
         chosen = menu.exec(playlist.mapToGlobal(pos))
+        if chosen is copy_act:
+            self.copy_selected_playlist_tracks(playlist)
+            return
+        if chosen is paste_act and paste_act.isEnabled():
+            self.paste_playlist_tracks(playlist)
+            return
         if chosen is move_act and move_act.isEnabled():
             self.move_selected_track_to_project(playlist)
             return
         for act, hex_color in color_actions:
             if chosen is act:
-                set_item_color(item, hex_color)
+                for target in targets:
+                    set_item_color(target, hex_color)
+                playlist.viewport().update()
+                self.save_project()
+                return
+        for act, scene_id in scene_actions:
+            if chosen is act:
+                for target in targets:
+                    set_item_mixer_scene_id(target, scene_id)
                 playlist.viewport().update()
                 self.save_project()
                 return
@@ -2207,6 +3064,8 @@ class AudioPlayer(QMainWindow):
             self._track_gain_db[new_abs] = self._track_gain_db.pop(old_abs)
         if old_abs in self._track_lufs:
             self._track_lufs[new_abs] = self._track_lufs.pop(old_abs)
+        if old_abs in self._track_stem_state:
+            self._track_stem_state[new_abs] = self._track_stem_state.pop(old_abs)
         if self._eq_bound_path == old_abs:
             self._eq_bound_path = new_abs
 
@@ -2235,6 +3094,11 @@ class AudioPlayer(QMainWindow):
             self._track_gain_db[new_abs] = float(self._track_gain_db[old_abs])
         if old_abs in self._track_lufs and new_abs not in self._track_lufs:
             self._track_lufs[new_abs] = float(self._track_lufs[old_abs])
+        if old_abs in self._track_stem_state and new_abs not in self._track_stem_state:
+            data = self._track_stem_state[old_abs].to_dict()
+            cloned = TrackStemState.from_dict(data)
+            if cloned is not None:
+                self._track_stem_state[new_abs] = cloned
 
     def move_selected_track_to_project(self, playlist: PlaylistWidget) -> None:
         item = playlist.currentItem()
@@ -2359,7 +3223,11 @@ class AudioPlayer(QMainWindow):
             track_eq=dict(self._track_eq_state),
             track_gain_db=dict(self._track_gain_db),
             track_lufs=dict(self._track_lufs),
-            video_mixer=self._project_video_mixer,
+            track_stems={
+                path: state.to_dict()
+                for path, state in self._track_stem_state.items()
+            },
+            video_mixer=self._export_video_mixer_state(),
         )
 
     def save_project(self) -> None:
@@ -2382,6 +3250,27 @@ class AudioPlayer(QMainWindow):
         except Exception as exc:
             print(f"Error saving project: {exc}")
             QMessageBox.warning(self, "Project", f"Could not save project:\n{exc}")
+        finally:
+            self._saving_project = False
+
+    def save_video_mixer_only(self) -> None:
+        """Persist mixer state without playlist/analysis refresh (keeps air smooth)."""
+        if getattr(self, "_saving_project", False):
+            return
+        if not hasattr(self, "video_mixer") or self.video_mixer is None:
+            return
+        self._saving_project = True
+        try:
+            state = self.project.load_raw()
+            if state is None:
+                state = self._build_project_state()
+            else:
+                # Skip import_media_into_project here — can copy files and re-sync.
+                state.video_mixer = self.video_mixer.export_state()
+            self._project_video_mixer = state.video_mixer
+            self.project.save_raw(state)
+        except Exception as exc:
+            print(f"Error saving video mixer: {exc}")
         finally:
             self._saving_project = False
 
@@ -2420,6 +3309,8 @@ class AudioPlayer(QMainWindow):
                 self.file_browser.set_project_root(
                     str(self.project.root), self.project.name
                 )
+            if hasattr(self, "video_mixer") and self.video_mixer is not None:
+                self.video_mixer.bind_project_root(self.project.root)
             self._saving_project = True
             try:
                 state = self._build_project_state()
@@ -2529,9 +3420,22 @@ class AudioPlayer(QMainWindow):
             for path, value in getattr(state, "track_lufs", {}).items()
             if isinstance(value, (int, float))
         }
+        self._track_stem_state = {}
+        for path, data in getattr(state, "track_stems", {}).items():
+            stem = TrackStemState.from_dict(data if isinstance(data, dict) else None)
+            store_key = path if is_track_instance_id(path) else os.path.abspath(path)
+            if stem is not None:
+                self._track_stem_state[store_key] = stem
+            else:
+                file_path = None if is_track_instance_id(path) else path
+                cached = load_cached_stems(file_path) if file_path else None
+                if cached is not None:
+                    self._track_stem_state[store_key] = TrackStemState.from_paths(cached)
         self._eq_bound_path = None
+        self._eq_bound_item = None
         self._bind_eq_to_path(self._current_file_path)
         self._bind_gain_to_path(self._current_file_path)
+        self._bind_stems_to_path(self._current_file_path)
 
         self._playlist_titles.clear()
         self._playlist_id_counter = 0
@@ -2544,6 +3448,8 @@ class AudioPlayer(QMainWindow):
             column.load_column_state(column_states[i])
 
         self._rebuild_playlist_registry()
+        self._adopt_all_playlist_settings()
+        self._mark_playlist_stems_badges()
 
         if hasattr(self, "columns_spin"):
             self.columns_spin.setValue(state.playlist_columns)
@@ -2551,17 +3457,79 @@ class AudioPlayer(QMainWindow):
                 self.columns_stepper.set_value(state.playlist_columns)
 
         self._project_video_mixer = state.video_mixer
+        if hasattr(self, "video_mixer") and self.video_mixer is not None:
+            self.video_mixer.apply_project_state(state.video_mixer)
+
+    def _mark_playlist_stems_badges(self) -> None:
+        """Ensure playlist items show the stems badge when stem files exist."""
+        for playlist in getattr(self, "playlists", []) or []:
+            dirty = False
+            for row in range(playlist.count()):
+                item = playlist.item(row)
+                path = get_item_file_path(item)
+                if not path:
+                    continue
+                track_id = get_item_track_id(item)
+                key = os.path.abspath(path)
+                has = (
+                    (track_id and track_id in self._track_stem_state)
+                    or key in self._track_stem_state
+                    or load_cached_stems(key) is not None
+                )
+                if has and not item_has_stems(item):
+                    set_item_has_stems(item, True)
+                    dirty = True
+                elif has and track_id and track_id not in self._track_stem_state:
+                    cached = load_cached_stems(key)
+                    if cached is not None:
+                        self._track_stem_state[track_id] = TrackStemState.from_paths(cached)
+            if dirty:
+                playlist.viewport().update()
 
     def load_project(self) -> None:
         state = self.project.load_raw()
         if state is None:
             if hasattr(self, "file_browser"):
                 self.file_browser.set_project_root(str(self.project.root), self.project.name)
+            self._migrate_legacy_video_mixer_if_needed()
             return
+
+        migrated_mixer = False
+        if state.video_mixer is None:
+            legacy = self._legacy_video_mixer_dict()
+            if legacy is not None:
+                state.video_mixer = legacy
+                migrated_mixer = True
 
         self._apply_project_state(state)
         if hasattr(self, "file_browser"):
             self.file_browser.set_project_root(str(self.project.root), self.project.name)
+        if migrated_mixer:
+            self.save_project()
+
+    def _export_video_mixer_state(self) -> dict | None:
+        if hasattr(self, "video_mixer") and self.video_mixer is not None:
+            self.video_mixer.import_media_into_project()
+            self._project_video_mixer = self.video_mixer.export_state()
+        return self._project_video_mixer
+
+    def _legacy_video_mixer_dict(self) -> dict | None:
+        path = get_config_path("video_mixer.json")
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def _migrate_legacy_video_mixer_if_needed(self) -> None:
+        if not hasattr(self, "video_mixer") or self.video_mixer is None:
+            return
+        legacy = self._legacy_video_mixer_dict()
+        self.video_mixer.apply_project_state(legacy)
+        if legacy is not None:
+            self.save_project()
 
     def load_playlists(self):
         """Legacy no-op — playlists live in the project."""
@@ -2625,6 +3593,23 @@ class AudioPlayer(QMainWindow):
             if fade_mode in ("crossfade", "sequential", "high_cut"):
                 self._fade_mode = fade_mode
                 self._update_fade_mode_ui()
+
+            if "master_volume" in config:
+                try:
+                    self._playback_volume = max(
+                        0.0, min(1.0, float(config["master_volume"]))
+                    )
+                except (TypeError, ValueError):
+                    pass
+            if hasattr(self, "file_properties_panel"):
+                self.file_properties_panel.set_master_volume(self._playback_volume)
+
+            if "midi_bindings" in config and hasattr(self, "_midi"):
+                self._midi.set_bindings(config.get("midi_bindings"))
+                binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
+                self.file_properties_panel.master_knob.set_midi_binding_label(
+                    None if binding is None else binding.label()
+                )
 
             if "waveform_res_enabled" in config:
                 self._waveform_res_enabled = bool(config["waveform_res_enabled"])
@@ -2785,6 +3770,10 @@ class AudioPlayer(QMainWindow):
             "time_display_mode": self._time_display_mode,
             "fade_duration_ms": self.fade_duration_spin.value(),
             "fade_mode": self._fade_mode,
+            "master_volume": self._playback_volume,
+            "midi_bindings": (
+                self._midi.bindings_to_dict() if hasattr(self, "_midi") else {}
+            ),
             "high_cut_q": self._high_cut_q(),
             "target_lufs": self._target_lufs_value(),
             "waveform_res_enabled": self._waveform_res_enabled,
@@ -2795,6 +3784,10 @@ class AudioPlayer(QMainWindow):
             "track_eq": dict(self._track_eq_state),
             "track_gain_db": dict(self._track_gain_db),
             "track_lufs": dict(self._track_lufs),
+            "track_stems": {
+                path: state.to_dict()
+                for path, state in self._track_stem_state.items()
+            },
             "view_control_panel": (
                 not self.control_panel_section.isHidden()
                 if hasattr(self, "control_panel_section")
@@ -2905,9 +3898,13 @@ class AudioPlayer(QMainWindow):
         self.refresh_playlist_footer(playlist)
 
     def remove_from_playlist_widget(self, playlist: PlaylistWidget):
-        current_row = playlist.currentRow()
-        if current_row >= 0:
-            playlist.takeItem(current_row)
+        rows = playlist.selected_rows()
+        if not rows:
+            current_row = playlist.currentRow()
+            if current_row >= 0:
+                rows = [current_row]
+        for row in reversed(rows):
+            playlist.takeItem(row)
         self.refresh_playlist_footer(playlist)
 
     def clear_playlist_widget(self, playlist: PlaylistWidget):
@@ -2986,15 +3983,36 @@ class AudioPlayer(QMainWindow):
         file_path: str,
         waveform: AudioWaveform | None = None,
     ) -> None:
-        key = os.path.abspath(file_path)
         wf = waveform or self.waveform
-        # Never write another track's on-screen markers onto this path.
-        if wf is self.waveform and self._displayed_track_path:
-            if os.path.abspath(self._displayed_track_path) != key:
+        if wf is self.waveform:
+            key = self._displayed_track_key or self._settings_key(
+                item=self.current_playing_item, file_path=file_path
+            )
+            if self._displayed_track_key and key != self._displayed_track_key:
                 return
-        if wf is self.preview_waveform and self._preview_displayed_track_path:
-            if os.path.abspath(self._preview_displayed_track_path) != key:
+            if (
+                not self._displayed_track_key
+                and self._displayed_track_path
+                and os.path.abspath(self._displayed_track_path) != os.path.abspath(file_path)
+            ):
                 return
+        elif wf is self.preview_waveform:
+            key = self._preview_displayed_track_key or self._settings_key(
+                item=self._preview_item, file_path=file_path
+            )
+            if self._preview_displayed_track_key and key != self._preview_displayed_track_key:
+                return
+            if (
+                not self._preview_displayed_track_key
+                and self._preview_displayed_track_path
+                and os.path.abspath(self._preview_displayed_track_path)
+                != os.path.abspath(file_path)
+            ):
+                return
+        else:
+            key = os.path.abspath(file_path)
+        if not key:
+            return
         state = wf.get_timeline_state()
         self._track_timeline_state[key] = TimelineState(
             range_start_ms=state.range_start_ms,
@@ -3004,29 +4022,41 @@ class AudioPlayer(QMainWindow):
         )
 
     def _save_current_timeline_state(self) -> None:
-        if self._displayed_track_path:
-            self._save_timeline_for_path(self._displayed_track_path, self.waveform)
-        if self._preview_displayed_track_path:
-            self._save_timeline_for_path(
-                self._preview_displayed_track_path,
-                self.preview_waveform,
-            )
+        if self._displayed_track_path or self._displayed_track_key:
+            path = self._displayed_track_path or self._current_file_path
+            if path:
+                self._save_timeline_for_path(path, self.waveform)
+        if self._preview_displayed_track_path or self._preview_displayed_track_key:
+            path = self._preview_displayed_track_path or self._preview_file_path
+            if path:
+                self._save_timeline_for_path(path, self.preview_waveform)
             return
         key = self._timeline_state_key()
         if key:
             self._track_timeline_state[key] = self.waveform.get_timeline_state()
 
     def _timeline_state_key(self) -> str | None:
+        if self._displayed_track_key:
+            return self._displayed_track_key
+        if self.current_playing_item is not None:
+            return self._adopt_item_settings(self.current_playing_item)
         if self._displayed_track_path:
             return self._displayed_track_path
         if self._current_file_path:
             return os.path.abspath(self._current_file_path)
         _playlist_num, item = self.get_selected_track()
         if item:
-            path = get_item_file_path(item)
-            if path:
-                return os.path.abspath(path)
+            return self._adopt_item_settings(item)
         return None
+
+    def _timeline_lookup_key(self, file_path: str, item=None) -> str | None:
+        key = self._settings_key(item=item, file_path=file_path)
+        if key and key in self._track_timeline_state:
+            return key
+        abs_path = os.path.abspath(file_path) if file_path else None
+        if abs_path and abs_path in self._track_timeline_state:
+            return abs_path
+        return key
 
     def _default_timeline_state(self, duration: int) -> TimelineState:
         return TimelineState(
@@ -3037,8 +4067,10 @@ class AudioPlayer(QMainWindow):
         )
 
     def _restore_timeline_state(self, file_path: str, duration: int) -> None:
-        key = os.path.abspath(file_path)
-        state = self._track_timeline_state.get(key)
+        key = self._displayed_track_key or self._timeline_lookup_key(
+            file_path, self.current_playing_item
+        )
+        state = self._track_timeline_state.get(key) if key else None
         if state is None:
             self.waveform.set_timeline_state(self._default_timeline_state(duration))
             return
@@ -3072,9 +4104,13 @@ class AudioPlayer(QMainWindow):
 
     def _load_track_waveform_and_timeline(self, file_path: str) -> None:
         abs_path = os.path.abspath(file_path)
-        if self._displayed_track_path and self._displayed_track_path != abs_path:
+        next_key = self._adopt_item_settings(self.current_playing_item)
+        if self._displayed_track_key and next_key and self._displayed_track_key != next_key:
+            self._save_timeline_for_path(self._displayed_track_path or abs_path)
+        elif self._displayed_track_path and self._displayed_track_path != abs_path:
             self._save_timeline_for_path(self._displayed_track_path)
         self._displayed_track_path = abs_path
+        self._displayed_track_key = next_key
         self.waveform.set_waveform([])
         self._request_waveform(file_path)
         duration = get_audio_duration_ms(file_path) or 0
@@ -3126,8 +4162,18 @@ class AudioPlayer(QMainWindow):
             return
 
         abs_path = os.path.abspath(file_path)
-        same_track = self._preview_displayed_track_path == abs_path
+        preview_key = self._adopt_item_settings(item)
+        same_track = self._preview_displayed_track_key == preview_key
         if (
+            self._preview_displayed_track_key
+            and preview_key
+            and self._preview_displayed_track_key != preview_key
+        ):
+            self._save_timeline_for_path(
+                self._preview_displayed_track_path or abs_path,
+                self.preview_waveform,
+            )
+        elif (
             self._preview_displayed_track_path
             and self._preview_displayed_track_path != abs_path
         ):
@@ -3140,6 +4186,7 @@ class AudioPlayer(QMainWindow):
         self._preview_item = item
         self._preview_file_path = file_path
         self._preview_displayed_track_path = abs_path
+        self._preview_displayed_track_key = preview_key
         self._preview_range_end_latched = False
         self._preview_fade_out_started = False
 
@@ -3257,6 +4304,7 @@ class AudioPlayer(QMainWindow):
         self.current_playing_item = None
         self._current_file_path = None
         self._displayed_track_path = None
+        self._displayed_track_key = None
         self.waveform.set_waveform([])
         self.waveform.set_duration(0)
         self.waveform.set_position(0)
@@ -3276,6 +4324,7 @@ class AudioPlayer(QMainWindow):
         self._preview_item = None
         self._preview_file_path = None
         self._preview_displayed_track_path = None
+        self._preview_displayed_track_key = None
         self._clear_preview_playback()
         self.preview_waveform.set_waveform([])
         self.preview_waveform.set_duration(0)
@@ -3333,8 +4382,14 @@ class AudioPlayer(QMainWindow):
         duration: int,
         waveform: AudioWaveform,
     ) -> None:
-        key = os.path.abspath(file_path)
-        state = self._track_timeline_state.get(key)
+        item = self._preview_item if waveform is self.preview_waveform else self.current_playing_item
+        displayed_key = (
+            self._preview_displayed_track_key
+            if waveform is self.preview_waveform
+            else self._displayed_track_key
+        )
+        key = displayed_key or self._timeline_lookup_key(file_path, item)
+        state = self._track_timeline_state.get(key) if key else None
         if state is None:
             waveform.set_timeline_state(self._default_timeline_state(duration))
             return
@@ -3514,6 +4569,7 @@ class AudioPlayer(QMainWindow):
 
         self.current_playing_playlist = self._preview_playlist_num
         self.current_playing_item = self._preview_item
+        self._cue_mixer_scene_for_item(self._preview_item)
 
         return self.play_file(
             self._preview_file_path,
@@ -4365,6 +5421,32 @@ class AudioPlayer(QMainWindow):
         self._fade_out_started = False
         self._apply_fade_in()
 
+    def resume_with_volume_fade(self) -> None:
+        """Unpause air by ramping volume from silence (video bed released the device)."""
+        if self._current_file_path and self.player.duration() > 0:
+            self._restore_timeline_state(self._current_file_path, self.player.duration())
+        start_ms = self._playback_start_ms()
+        pos = self.player.position()
+        range_end = self._range_end_ms()
+        if pos < start_ms or (range_end > 0 and pos >= range_end):
+            self.waveform.set_position(start_ms)
+            self._seek_target_ms = start_ms if start_ms > 0 else None
+            self.player.setPosition(start_ms)
+            pos = start_ms
+        else:
+            self._seek_target_ms = None
+        target = self._volume_for_position(pos)
+        fade_ms = self._space_fade_duration_ms()
+        self.volume_fader.cancel()
+        self._set_output_volume(0.0)
+        self.player.play()
+        self.update_track_info_playing()
+        self._fade_out_started = False
+        if fade_ms > 0:
+            self.volume_fader.fade_to(target, fade_ms)
+        else:
+            self._set_output_volume(target)
+
     def play_file(
         self,
         file_path,
@@ -4436,7 +5518,12 @@ class AudioPlayer(QMainWindow):
             self._pending_playback_token = self._playback_token
             self._pending_playback_start = True
             self._pending_playback_player_idx = self._active_player_idx
-            is_new_track = self._displayed_track_path != abs_path
+            next_key = self._adopt_item_settings(self.current_playing_item)
+            is_new_track = (
+                self._displayed_track_key != next_key
+                if self._displayed_track_key
+                else self._displayed_track_path != abs_path
+            )
             needs_waveform = is_new_track or not self.waveform.waveform_data
             self.waveform.reset_view()
             if is_new_track:
@@ -4444,6 +5531,7 @@ class AudioPlayer(QMainWindow):
             elif needs_waveform:
                 self.waveform.set_waveform([])
             self._displayed_track_path = abs_path
+            self._displayed_track_key = next_key
             self._prepare_timeline_for_path(file_path)
             self._update_file_properties(file_path)
             self._pending_start_ms = (
@@ -4464,6 +5552,7 @@ class AudioPlayer(QMainWindow):
                 play_at = self._pending_start_ms
                 self._pending_playback_start = False
                 self._pending_start_ms = None
+                self._apply_stems_to_player(active, file_path)
                 self._start_playback_at(play_at, player_idx=self._active_player_idx)
                 self.update_track_info_playing()
                 if needs_waveform:
@@ -4677,6 +5766,7 @@ class AudioPlayer(QMainWindow):
 
         self.current_playing_playlist = playlist_num
         self.current_playing_item = item
+        self._cue_mixer_scene_for_item(item)
         return self.play_file(path, force_restart=True)
 
     def _preview_differs_from_track(self, path: str | None, item=None) -> bool:
@@ -5295,11 +6385,15 @@ class AudioPlayer(QMainWindow):
         self._browser_player.stop()
         self._save_current_timeline_state()
         self.bpm_detector.shutdown()
+        if hasattr(self, "_midi"):
+            self._midi.shutdown()
         self.waveform_loader.shutdown()
         self.preview_waveform_loader.shutdown()
         self.browser_waveform_loader.shutdown()
         if self._spectrum_timer is not None:
             self._spectrum_timer.stop()
+        if hasattr(self, "video_mixer") and self.video_mixer is not None:
+            self.video_mixer.shutdown()
         self.save_project()
         self.save_config()
         event.accept()

@@ -26,10 +26,13 @@ from app.analysis_cache import (
 )
 from app.config import get_config_path
 from app.constants import MAX_PLAYLISTS
+from app.playlist_io import is_track_instance_id
+from app.stems import set_stems_dir
 
 PROJECT_FILENAME = "project.json"
 MEDIA_DIRNAME = "media"
 ANALYSIS_DIRNAME = "analysis"
+STEMS_DIRNAME = "stems"
 SCENE_THUMBS_DIRNAME = "scene_thumbs"
 PROJECT_VERSION = 2
 
@@ -50,6 +53,7 @@ def ensure_project_dirs(root: Path | str) -> Path:
     root_path.mkdir(parents=True, exist_ok=True)
     (root_path / MEDIA_DIRNAME).mkdir(exist_ok=True)
     (root_path / ANALYSIS_DIRNAME).mkdir(exist_ok=True)
+    (root_path / STEMS_DIRNAME).mkdir(exist_ok=True)
     (root_path / SCENE_THUMBS_DIRNAME).mkdir(exist_ok=True)
     return root_path
 
@@ -64,6 +68,12 @@ def media_dir(root: Path | str) -> Path:
 
 def analysis_dir(root: Path | str) -> Path:
     return Path(root) / ANALYSIS_DIRNAME
+
+
+def stems_dir(root: Path | str) -> Path:
+    path = Path(root) / STEMS_DIRNAME
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def scene_thumbs_dir(root: Path | str) -> Path:
@@ -208,6 +218,7 @@ class ProjectState:
     track_eq: dict[str, dict] = field(default_factory=dict)
     track_gain_db: dict[str, float] = field(default_factory=dict)
     track_lufs: dict[str, float] = field(default_factory=dict)
+    track_stems: dict[str, dict] = field(default_factory=dict)
     video_mixer: dict | None = None
 
     @property
@@ -316,6 +327,38 @@ def _column_state_from_dict(entry: dict, root: Path) -> ProjectColumnState:
     return ProjectColumnState(tabs=tabs, active_tab=active)
 
 
+def _stem_dict_for_storage(data: dict, root: Path | str) -> dict:
+    payload = dict(data)
+    for key in ("vocals_path", "instrumental_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            payload[key] = to_project_path(value, root)
+    return payload
+
+
+def _stem_dict_from_storage(data: dict, root: Path | str) -> dict:
+    payload = dict(data)
+    for key in ("vocals_path", "instrumental_path"):
+        value = payload.get(key)
+        if isinstance(value, str) and value.strip():
+            abs_path, _ = resolve_project_path(value, root)
+            payload[key] = abs_path
+    return payload
+
+
+def _instance_key_for_storage(key: str, root: Path | str) -> str:
+    if is_track_instance_id(key):
+        return key
+    return to_project_path(key, root)
+
+
+def _instance_key_from_storage(key: str, root: Path | str) -> str:
+    if is_track_instance_id(key):
+        return key
+    abs_path, _ = resolve_project_path(str(key), root)
+    return abs_path
+
+
 def _playlist_dict_for_storage(pl: ProjectPlaylistState, root: Path) -> dict:
     return {
         "title": pl.title,
@@ -346,6 +389,7 @@ class ProjectManager:
 
     def _activate_analysis_cache(self) -> None:
         set_cache_dir(analysis_dir(self.root))
+        set_stems_dir(stems_dir(self.root))
 
     def open(self, root: Path | str) -> None:
         self.root = ensure_project_dirs(root)
@@ -388,7 +432,7 @@ class ProjectManager:
         if old == dest:
             self.name = (name or dest.name).strip() or self.name
             return
-        for dirname in (MEDIA_DIRNAME, ANALYSIS_DIRNAME, SCENE_THUMBS_DIRNAME):
+        for dirname in (MEDIA_DIRNAME, ANALYSIS_DIRNAME, STEMS_DIRNAME, SCENE_THUMBS_DIRNAME):
             src = old / dirname
             dst = dest / dirname
             if not src.exists():
@@ -439,15 +483,15 @@ class ProjectManager:
                 for col in columns
             ],
             "track_timelines": {
-                to_project_path(path, self.root): data
+                _instance_key_for_storage(path, self.root): data
                 for path, data in state.track_timelines.items()
             },
             "track_eq": {
-                to_project_path(path, self.root): data
+                _instance_key_for_storage(path, self.root): data
                 for path, data in state.track_eq.items()
             },
             "track_gain_db": {
-                to_project_path(path, self.root): float(value)
+                _instance_key_for_storage(path, self.root): float(value)
                 for path, value in state.track_gain_db.items()
                 if isinstance(value, (int, float))
             },
@@ -455,6 +499,13 @@ class ProjectManager:
                 to_project_path(path, self.root): float(value)
                 for path, value in state.track_lufs.items()
                 if isinstance(value, (int, float))
+            },
+            "track_stems": {
+                _instance_key_for_storage(path, self.root): _stem_dict_for_storage(
+                    data, self.root
+                )
+                for path, data in state.track_stems.items()
+                if isinstance(data, dict)
             },
             "video_mixer": (
                 mixer_dict_for_storage(state.video_mixer, self.root)
@@ -517,8 +568,7 @@ class ProjectManager:
             for key, value in raw_timelines.items():
                 if not isinstance(value, dict):
                     continue
-                abs_path, _ = resolve_project_path(str(key), root)
-                timelines[abs_path] = value
+                timelines[_instance_key_from_storage(str(key), root)] = value
 
         track_eq: dict[str, dict] = {}
         raw_eq = data.get("track_eq")
@@ -526,8 +576,7 @@ class ProjectManager:
             for key, value in raw_eq.items():
                 if not isinstance(value, dict):
                     continue
-                abs_path, _ = resolve_project_path(str(key), root)
-                track_eq[abs_path] = value
+                track_eq[_instance_key_from_storage(str(key), root)] = value
 
         track_gain_db: dict[str, float] = {}
         raw_gain = data.get("track_gain_db")
@@ -535,8 +584,7 @@ class ProjectManager:
             for key, value in raw_gain.items():
                 if not isinstance(value, (int, float)):
                     continue
-                abs_path, _ = resolve_project_path(str(key), root)
-                track_gain_db[abs_path] = float(value)
+                track_gain_db[_instance_key_from_storage(str(key), root)] = float(value)
 
         track_lufs: dict[str, float] = {}
         raw_lufs = data.get("track_lufs")
@@ -546,6 +594,16 @@ class ProjectManager:
                     continue
                 abs_path, _ = resolve_project_path(str(key), root)
                 track_lufs[abs_path] = float(value)
+
+        track_stems: dict[str, dict] = {}
+        raw_stems = data.get("track_stems")
+        if isinstance(raw_stems, dict):
+            for key, value in raw_stems.items():
+                if not isinstance(value, dict):
+                    continue
+                track_stems[_instance_key_from_storage(str(key), root)] = (
+                    _stem_dict_from_storage(value, root)
+                )
 
         video_mixer = data.get("video_mixer")
         if not isinstance(video_mixer, dict):
@@ -564,5 +622,6 @@ class ProjectManager:
             track_eq=track_eq,
             track_gain_db=track_gain_db,
             track_lufs=track_lufs,
+            track_stems=track_stems,
             video_mixer=video_mixer,
         )

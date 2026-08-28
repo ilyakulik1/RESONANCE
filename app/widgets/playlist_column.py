@@ -164,9 +164,19 @@ class PlaylistColumnPanel(QFrame):
             lambda: self._with_current(window.copy_playlist_tracks_to_project),
         )
         add_tool(
+            "bpm_all",
+            "Analyze all tracks (BPM + waveform + loudness)",
+            lambda: self._with_current(window.analyze_playlist_files),
+        )
+        add_tool(
             "bpm_one",
             "Re-analyze selected track (BPM + waveform)",
             lambda: self._with_current(window.analyze_selected_file),
+        )
+        add_tool(
+            "stems",
+            "Split selected track into stems (vocal / instrumental)",
+            lambda: self._with_current(window.separate_selected_stems),
         )
 
         toolbar_wrap_layout.addWidget(toolbar)

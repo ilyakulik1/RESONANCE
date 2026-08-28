@@ -275,7 +275,15 @@ class VideoMixerPanel(QWidget):
         screens_layout = QVBoxLayout(screens)
         screens_layout.setContentsMargins(0, 0, 0, 0)
         screens_layout.setSpacing(6)
-        screens_layout.addWidget(self._screen_label("MAIN SCREEN"))
+        main_cap = QHBoxLayout()
+        main_cap.setSpacing(4)
+        main_cap.addWidget(self._screen_label("MAIN SCREEN"), 1)
+        self.program_clock = QLabel("00:00:00")
+        self.program_clock.setObjectName("programClock")
+        self.program_clock.setToolTip("Timecode since this scene went to Main")
+        self.program_clock.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        main_cap.addWidget(self.program_clock)
+        screens_layout.addLayout(main_cap)
         self.main_gl = MainGLWidget(model, media_store, self)
         self.main_gl.setObjectName("mainScreen")
         self.main_gl.setMinimumHeight(80)
@@ -313,6 +321,12 @@ class VideoMixerPanel(QWidget):
         self.btn_rename_scene.setToolTip("Rename preview scene")
         self.btn_rename_scene.clicked.connect(self._rename_preview_scene)
         scenes_header.addWidget(self.btn_rename_scene)
+        self.btn_duplicate_scene = QToolButton()
+        self.btn_duplicate_scene.setObjectName("mixerToolBtn")
+        self.btn_duplicate_scene.setText("2×")
+        self.btn_duplicate_scene.setToolTip("Duplicate preview scene")
+        self.btn_duplicate_scene.clicked.connect(self._duplicate_preview_scene)
+        scenes_header.addWidget(self.btn_duplicate_scene)
         self.btn_delete_scene = QToolButton()
         self.btn_delete_scene.setObjectName("mixerToolBtn")
         self.btn_delete_scene.setText("−")
@@ -565,7 +579,7 @@ class VideoMixerPanel(QWidget):
 
     def _on_transform_changed(self, _layer_id: str) -> None:
         self.refresh_properties()
-        self.refresh_views()
+        self.preview_gl.update()
 
     def _on_layer_selected(self, layer_id: object) -> None:
         self.refresh_properties()
@@ -578,6 +592,14 @@ class VideoMixerPanel(QWidget):
         label.setObjectName("screenCaption")
         label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         return label
+
+    def set_program_clock_ms(self, ms: int) -> None:
+        total = max(0, int(ms) // 1000)
+        hours, rem = divmod(total, 3600)
+        minutes, seconds = divmod(rem, 60)
+        text = f"{hours:02d}:{minutes:02d}:{seconds:02d}"
+        if self.program_clock.text() != text:
+            self.program_clock.setText(text)
 
     def _prop_row(
         self,
@@ -723,6 +745,22 @@ class VideoMixerPanel(QWidget):
             return
         self._prompt_rename_scene(scene.id, scene.name)
 
+    def _duplicate_preview_scene(self) -> None:
+        source = self.model.preview_scene() or self.model.main_scene()
+        if source is None:
+            return
+        if len(self.model.scenes) >= MAX_SCENES:
+            QMessageBox.information(self, "Video Mixer", "Scene limit reached.")
+            return
+        source_id = source.id
+        scene = self.model.duplicate_scene(source_id)
+        if scene is None:
+            return
+        thumb = self._frozen_thumbs.get(source_id)
+        if thumb is not None and not thumb.isNull():
+            self.store_frozen_thumb(scene.id, thumb)
+        self.media_store.sync()
+
     def _delete_preview_scene(self) -> None:
         scene = self.model.preview_scene()
         if scene is None:
@@ -794,6 +832,7 @@ class VideoMixerPanel(QWidget):
         has_preview = self.model.preview_scene() is not None
         self.btn_delete_scene.setEnabled(has_preview and len(self.model.scenes) > 1)
         self.btn_rename_scene.setEnabled(has_preview)
+        self.btn_duplicate_scene.setEnabled(len(self.model.scenes) < MAX_SCENES)
         self.btn_clear_preview.setEnabled(has_preview)
         self.main_gl.update()
         self.preview_gl.update()

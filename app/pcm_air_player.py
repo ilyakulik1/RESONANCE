@@ -24,6 +24,7 @@ from PyQt6.QtMultimedia import (
 from app.eq_curve import log_freq_axis
 from app.eq_dsp import EqProcessor, HighCutSweep
 from app.eq_state import EqState
+from app.stems import STEM_INSTRUMENTAL, STEM_VOCALS
 
 _CHUNK_FRAMES = 2048
 _QUEUE_MAX_CHUNKS = 64  # deep buffer so video-start GIL spikes don't underrun air
@@ -38,6 +39,63 @@ _PREBUFFER_CHUNKS = 3
 _PREBUFFER_TIMEOUT_S = 0.08
 _PUT_TIMEOUT_S = 0.05
 _LOW_WATER_CHUNKS = 8  # below this: never sleep / skip spectrum
+
+
+class _StemWavReader:
+    """Sample-accurate stereo float reader for a stem WAV."""
+
+    def __init__(self, path: str):
+        import soundfile as sf
+
+        self._path = path
+        # soundfile needs a filesystem path; open after validating.
+        info = sf.info(path)
+        self.sample_rate = int(info.samplerate)
+        self.frames = int(info.frames)
+        self.channels = int(info.channels)
+        if self.frames <= 0 or self.sample_rate <= 0:
+            raise ValueError(f"Invalid stem WAV: {path}")
+        self._file = sf.SoundFile(path, mode="r")
+        self._pos = 0
+
+    def close(self) -> None:
+        try:
+            self._file.close()
+        except Exception:
+            pass
+
+    def seek_frame(self, frame: int) -> None:
+        frame = max(0, min(int(frame), self.frames))
+        try:
+            self._file.seek(frame)
+            self._pos = frame
+        except Exception:
+            self._pos = frame
+
+    def read_interleaved(self, n_frames: int, *, target_channels: int = 2) -> np.ndarray:
+        if n_frames <= 0:
+            return np.zeros(0, dtype=np.float32)
+        try:
+            data = self._file.read(n_frames, dtype="float32", always_2d=True)
+        except Exception:
+            data = np.zeros((0, max(1, self.channels)), dtype=np.float32)
+        got = int(data.shape[0])
+        self._pos += got
+        if got == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        if data.shape[1] == 1:
+            stereo = np.column_stack([data[:, 0], data[:, 0]])
+        else:
+            stereo = data[:, :2]
+        if got < n_frames:
+            pad = np.zeros((n_frames - got, 2), dtype=np.float32)
+            stereo = np.concatenate([stereo, pad], axis=0)
+        return stereo.reshape(-1).astype(np.float32, copy=False)
+
+    @property
+    def exhausted(self) -> bool:
+        return self._pos >= self.frames
 
 
 def _frame_to_stereo_interleaved(arr: np.ndarray) -> np.ndarray:
@@ -157,6 +215,25 @@ class PcmAirPlayer(QObject):
         self._eq = EqProcessor(channels=_TARGET_CHANNELS, sample_rate=44100.0)
         self._eq_state = EqState()
         self._track_gain = 1.0
+        self._stem_enabled = False
+        self._stem_paths: dict[str, str] = {}
+        self._stem_eq = {
+            STEM_VOCALS: EqProcessor(channels=_TARGET_CHANNELS, sample_rate=44100.0),
+            STEM_INSTRUMENTAL: EqProcessor(channels=_TARGET_CHANNELS, sample_rate=44100.0),
+        }
+        self._stem_eq_state = {
+            STEM_VOCALS: EqState(),
+            STEM_INSTRUMENTAL: EqState(),
+        }
+        self._stem_gain = {
+            STEM_VOCALS: 1.0,
+            STEM_INSTRUMENTAL: 1.0,
+        }
+        self._stem_pending = {
+            STEM_VOCALS: np.zeros(0, dtype=np.float32),
+            STEM_INSTRUMENTAL: np.zeros(0, dtype=np.float32),
+        }
+        self._stem_pair_queue: queue.Queue = queue.Queue(maxsize=_QUEUE_MAX_CHUNKS)
         self._high_cut = HighCutSweep(channels=_TARGET_CHANNELS, sample_rate=44100.0)
         self._high_cut_elapsed = QElapsedTimer()
         self._high_cut_duration_ms = 0
@@ -351,10 +428,77 @@ class PcmAirPlayer(QObject):
         self._eq.set_state(self._eq_state)
 
     def set_track_gain_db(self, gain_db: float) -> None:
-        """Per-track linear gain applied in the PCM path (after EQ)."""
+        """Per-track linear gain applied in the PCM path (after EQ / stem mix)."""
         from app.loudness import clamp_gain_db, db_to_linear
 
         self._track_gain = db_to_linear(clamp_gain_db(gain_db))
+
+    def set_stem_mix(
+        self,
+        *,
+        vocals_path: str,
+        instrumental_path: str,
+        vocals_eq: EqState | None = None,
+        instrumental_eq: EqState | None = None,
+        vocals_gain_db: float = 0.0,
+        instrumental_gain_db: float = 0.0,
+    ) -> None:
+        """Enable dual-stem playback. Master track gain stays independent."""
+        from app.loudness import db_to_linear
+        from app.stems import is_readable_stem_wav
+        from app.widgets.stem_fader import clamp_stem_gain_db
+
+        if not (
+            is_readable_stem_wav(vocals_path) and is_readable_stem_wav(instrumental_path)
+        ):
+            self.clear_stem_mix()
+            return
+
+        was = self._stem_enabled
+        old_paths = dict(self._stem_paths)
+        self._stem_enabled = True
+        self._stem_paths = {
+            STEM_VOCALS: vocals_path,
+            STEM_INSTRUMENTAL: instrumental_path,
+        }
+        self.set_stem_eq_state(STEM_VOCALS, vocals_eq)
+        self.set_stem_eq_state(STEM_INSTRUMENTAL, instrumental_eq)
+        self._stem_gain[STEM_VOCALS] = db_to_linear(clamp_stem_gain_db(vocals_gain_db))
+        self._stem_gain[STEM_INSTRUMENTAL] = db_to_linear(
+            clamp_stem_gain_db(instrumental_gain_db)
+        )
+        if (
+            was
+            and old_paths.get(STEM_VOCALS) == vocals_path
+            and old_paths.get(STEM_INSTRUMENTAL) == instrumental_path
+        ):
+            return
+        if self._path and self._playback_state != QMediaPlayer.PlaybackState.StoppedState:
+            autoplay = self._playback_state == QMediaPlayer.PlaybackState.PlayingState
+            self._restart_pipeline(start_ms=self._position_ms, autoplay=autoplay)
+
+    def clear_stem_mix(self) -> None:
+        was = self._stem_enabled
+        self._stem_enabled = False
+        self._stem_paths = {}
+        if was and self._path and self._playback_state != QMediaPlayer.PlaybackState.StoppedState:
+            autoplay = self._playback_state == QMediaPlayer.PlaybackState.PlayingState
+            self._restart_pipeline(start_ms=self._position_ms, autoplay=autoplay)
+
+    def set_stem_eq_state(self, stem_id: str, state: EqState | None) -> None:
+        if stem_id not in self._stem_eq:
+            return
+        eq_state = state or EqState()
+        self._stem_eq_state[stem_id] = eq_state
+        self._stem_eq[stem_id].set_state(eq_state)
+
+    def set_stem_gain_db(self, stem_id: str, gain_db: float) -> None:
+        from app.loudness import db_to_linear
+        from app.widgets.stem_fader import clamp_stem_gain_db
+
+        if stem_id not in self._stem_gain:
+            return
+        self._stem_gain[stem_id] = db_to_linear(clamp_stem_gain_db(gain_db))
 
     def start_high_cut_sweep(
         self,
@@ -462,6 +606,9 @@ class PcmAirPlayer(QObject):
         self._sample_rate = rate
         self._eq.set_sample_rate(float(self._sample_rate))
         self._eq.set_state(self._eq_state)
+        for stem_id, proc in self._stem_eq.items():
+            proc.set_sample_rate(float(self._sample_rate))
+            proc.set_state(self._stem_eq_state.get(stem_id) or EqState())
         self._high_cut.set_sample_rate(float(self._sample_rate))
 
         if self._sink is not None and getattr(self, "_sink_rate", None) == rate:
@@ -497,7 +644,16 @@ class PcmAirPlayer(QObject):
                 self._chunk_queue.get_nowait()
             except queue.Empty:
                 break
+        while True:
+            try:
+                self._stem_pair_queue.get_nowait()
+            except queue.Empty:
+                break
         self._float_pending = np.zeros(0, dtype=np.float32)
+        self._stem_pending = {
+            STEM_VOCALS: np.zeros(0, dtype=np.float32),
+            STEM_INSTRUMENTAL: np.zeros(0, dtype=np.float32),
+        }
         self._byte_pending.clear()
 
     def _stop_pipeline(self, *, destroy_sink: bool = False) -> None:
@@ -532,14 +688,133 @@ class PcmAirPlayer(QObject):
             except queue.Full:
                 continue
 
+    def _enqueue_stem_pair(
+        self,
+        vocals: np.ndarray,
+        instrumental: np.ndarray,
+        generation: int,
+    ) -> bool:
+        while True:
+            if self._decode_stop.is_set() or generation != self._generation:
+                return False
+            try:
+                self._stem_pair_queue.put(
+                    (generation, vocals, instrumental), timeout=_PUT_TIMEOUT_S
+                )
+                return True
+            except queue.Full:
+                continue
+
     def _wait_prebuffer(self, generation: int) -> None:
         deadline = time.monotonic() + _PREBUFFER_TIMEOUT_S
         while time.monotonic() < deadline:
             if generation != self._generation or self._decode_stop.is_set():
                 return
-            if self._chunk_queue.qsize() >= _PREBUFFER_CHUNKS:
+            ready = (
+                self._stem_pair_queue.qsize()
+                if self._stem_enabled
+                else self._chunk_queue.qsize()
+            )
+            if ready >= _PREBUFFER_CHUNKS:
                 return
             time.sleep(0.004)
+
+    def _decode_loop_stems(
+        self,
+        vocals_path: str,
+        instrumental_path: str,
+        start_ms: int,
+        generation: int,
+    ) -> None:
+        vocals_reader: _StemWavReader | None = None
+        inst_reader: _StemWavReader | None = None
+        try:
+            vocals_reader = _StemWavReader(vocals_path)
+            inst_reader = _StemWavReader(instrumental_path)
+            src_rate = int(vocals_reader.sample_rate) or int(inst_reader.sample_rate)
+            target_sr = max(1, int(self._sample_rate))
+            start_frame_src = int(max(0, start_ms) * src_rate / 1000.0)
+            vocals_reader.seek_frame(start_frame_src)
+            inst_reader.seek_frame(start_frame_src)
+
+            # Read in source-rate frames, resample to target if needed.
+            src_chunk = _CHUNK_FRAMES
+            if src_rate != target_sr:
+                src_chunk = max(64, int(round(_CHUNK_FRAMES * src_rate / target_sr)))
+
+            pending_v = np.zeros(0, dtype=np.float32)
+            pending_i = np.zeros(0, dtype=np.float32)
+            frame_samples = _CHUNK_FRAMES * _TARGET_CHANNELS
+
+            while not self._decode_stop.is_set() and generation == self._generation:
+                if vocals_reader.exhausted and inst_reader.exhausted and pending_v.size == 0:
+                    break
+                v = vocals_reader.read_interleaved(src_chunk)
+                i = inst_reader.read_interleaved(src_chunk)
+                if v.size == 0 and i.size == 0 and pending_v.size == 0:
+                    break
+                n = max(v.size, i.size)
+                if n:
+                    if v.size < n:
+                        v = np.pad(v, (0, n - v.size))
+                    if i.size < n:
+                        i = np.pad(i, (0, n - i.size))
+                    if src_rate != target_sr:
+                        v = self._resample_interleaved(v, src_rate, target_sr)
+                        i = self._resample_interleaved(i, src_rate, target_sr)
+                    pending_v = np.concatenate([pending_v, v]) if pending_v.size else v
+                    pending_i = np.concatenate([pending_i, i]) if pending_i.size else i
+
+                while pending_v.size >= frame_samples:
+                    if self._decode_stop.is_set() or generation != self._generation:
+                        return
+                    vb = pending_v[:frame_samples].copy()
+                    ib = pending_i[:frame_samples].copy()
+                    pending_v = pending_v[frame_samples:]
+                    pending_i = pending_i[frame_samples:]
+                    if not self._enqueue_stem_pair(vb, ib, generation):
+                        return
+                    self._frames_decoded += _CHUNK_FRAMES
+                    if self._stem_pair_queue.qsize() >= _DECODE_PACE_DEPTH:
+                        time.sleep(_DECODE_PACE_SLEEP_S)
+
+                if vocals_reader.exhausted and inst_reader.exhausted:
+                    break
+
+            if pending_v.size and not self._decode_stop.is_set() and generation == self._generation:
+                n = max(pending_v.size, pending_i.size)
+                if pending_v.size < n:
+                    pending_v = np.pad(pending_v, (0, n - pending_v.size))
+                if pending_i.size < n:
+                    pending_i = np.pad(pending_i, (0, n - pending_i.size))
+                self._enqueue_stem_pair(pending_v.copy(), pending_i.copy(), generation)
+
+            # EOF marker on both queues
+            if generation == self._generation:
+                try:
+                    self._stem_pair_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        except Exception:
+            pass
+        finally:
+            if vocals_reader is not None:
+                vocals_reader.close()
+            if inst_reader is not None:
+                inst_reader.close()
+
+    @staticmethod
+    def _resample_interleaved(interleaved: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
+        if src_rate == dst_rate or interleaved.size == 0:
+            return interleaved
+        frames = interleaved.reshape(-1, _TARGET_CHANNELS)
+        target_len = max(1, int(round(frames.shape[0] * dst_rate / src_rate)))
+        x_old = np.linspace(0.0, 1.0, frames.shape[0], endpoint=False)
+        x_new = np.linspace(0.0, 1.0, target_len, endpoint=False)
+        out = np.empty((target_len, _TARGET_CHANNELS), dtype=np.float32)
+        for c in range(_TARGET_CHANNELS):
+            out[:, c] = np.interp(x_new, x_old, frames[:, c]).astype(np.float32)
+        return out.reshape(-1)
 
     def _restart_pipeline(self, *, start_ms: int, autoplay: bool) -> None:
         if not self._path:
@@ -549,14 +824,45 @@ class PcmAirPlayer(QObject):
         self._decode_eof_generation = None
         self._ensure_sink()
         self._eq.reset()
+        for proc in self._stem_eq.values():
+            proc.reset()
         self._seek_frame = int(start_ms * self._sample_rate / 1000.0)
         self._frames_played = 0
         self._frames_decoded = 0
         self._position_ms = start_ms
         gen = self._generation
+        use_stems = False
+        if (
+            self._stem_enabled
+            and bool(self._stem_paths.get(STEM_VOCALS))
+            and bool(self._stem_paths.get(STEM_INSTRUMENTAL))
+            and os.path.isfile(self._stem_paths[STEM_VOCALS])
+            and os.path.isfile(self._stem_paths[STEM_INSTRUMENTAL])
+        ):
+            # Probe readers once — corrupt/empty stems fall back to original.
+            try:
+                probe_v = _StemWavReader(self._stem_paths[STEM_VOCALS])
+                probe_i = _StemWavReader(self._stem_paths[STEM_INSTRUMENTAL])
+                probe_v.close()
+                probe_i.close()
+                use_stems = True
+            except Exception:
+                self._stem_enabled = False
+                use_stems = False
+        if use_stems:
+            target = self._decode_loop_stems
+            args = (
+                self._stem_paths[STEM_VOCALS],
+                self._stem_paths[STEM_INSTRUMENTAL],
+                start_ms,
+                gen,
+            )
+        else:
+            target = self._decode_loop
+            args = (self._path, start_ms, gen)
         self._decode_thread = threading.Thread(
-            target=self._decode_loop,
-            args=(self._path, start_ms, gen),
+            target=target,
+            args=args,
             name="PcmAirDecode",
             daemon=True,
         )
@@ -683,7 +989,12 @@ class PcmAirPlayer(QObject):
         if not self._spectrum_enabled:
             return
         # Protect air against underrun when video decoder steals the GIL.
-        if self._chunk_queue.qsize() < _LOW_WATER_CHUNKS:
+        depth = (
+            self._stem_pair_queue.qsize()
+            if self._stem_enabled
+            else self._chunk_queue.qsize()
+        )
+        if depth < _LOW_WATER_CHUNKS:
             return
         self._chunks_since_spectrum += 1
         if self._chunks_since_spectrum < _SPECTRUM_CAPTURE_EVERY:
@@ -717,13 +1028,94 @@ class PcmAirPlayer(QObject):
             pass
 
     def _bytes_available(self) -> int:
+        if self._stem_enabled:
+            float_bytes = (
+                min(
+                    self._stem_pending[STEM_VOCALS].size,
+                    self._stem_pending[STEM_INSTRUMENTAL].size,
+                )
+                * 2
+            )
+            queued = (
+                self._stem_pair_queue.qsize()
+                * _CHUNK_FRAMES
+                * _TARGET_CHANNELS
+                * 2
+            )
+            return len(self._byte_pending) + float_bytes + queued
         float_bytes = int(self._float_pending.size) * 2  # after int16
         queued = self._chunk_queue.qsize() * _CHUNK_FRAMES * _TARGET_CHANNELS * 2
         return len(self._byte_pending) + float_bytes + queued
 
+    def _drain_stem_queues(self) -> bool:
+        """Pull dry stem pairs into pending buffers. Returns True on EOF."""
+        hit_eof = False
+        while (
+            min(
+                self._stem_pending[STEM_VOCALS].size,
+                self._stem_pending[STEM_INSTRUMENTAL].size,
+            )
+            * 2
+            < 8192
+        ):
+            try:
+                item = self._stem_pair_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                hit_eof = True
+                break
+            if len(item) == 3:
+                gen, vocals, instrumental = item
+                if gen != self._generation:
+                    continue
+            else:
+                vocals, instrumental = item
+            for stem_id, block in (
+                (STEM_VOCALS, vocals),
+                (STEM_INSTRUMENTAL, instrumental),
+            ):
+                pending = self._stem_pending[stem_id]
+                if pending.size:
+                    self._stem_pending[stem_id] = np.concatenate([pending, block])
+                else:
+                    self._stem_pending[stem_id] = block
+        return hit_eof
+
+    def _mix_stems(self, n_samples: int) -> np.ndarray | None:
+        """Take n interleaved samples from each stem, EQ+gain, sum."""
+        n_samples -= n_samples % _TARGET_CHANNELS
+        if n_samples <= 0:
+            return None
+        available = min(
+            self._stem_pending[STEM_VOCALS].size,
+            self._stem_pending[STEM_INSTRUMENTAL].size,
+        )
+        take = min(available, n_samples)
+        take -= take % _TARGET_CHANNELS
+        if take <= 0:
+            return None
+
+        mixed = None
+        for stem_id in (STEM_VOCALS, STEM_INSTRUMENTAL):
+            dry = self._stem_pending[stem_id][:take]
+            self._stem_pending[stem_id] = self._stem_pending[stem_id][take:]
+            wet = self._stem_eq[stem_id].process_interleaved(dry)
+            gain = float(self._stem_gain.get(stem_id, 1.0))
+            if gain != 1.0:
+                wet = wet * np.float32(gain)
+            if mixed is None:
+                mixed = wet
+            else:
+                mixed = mixed + wet
+        return mixed
+
     def _read_audio_bytes(self, maxlen: int) -> bytes:
         if maxlen <= 0:
             return b""
+
+        if self._stem_enabled and self._stem_paths:
+            return self._read_audio_bytes_stems(maxlen)
 
         # Refill float pending from dry decode queue.
         while self._float_pending.size * 2 < maxlen + 4096:
@@ -790,6 +1182,64 @@ class PcmAirPlayer(QObject):
             and not self._byte_pending
             and self._float_pending.size == 0
             and self._chunk_queue.empty()
+        ):
+            gen = self._generation
+            QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
+        return data
+
+    def _read_audio_bytes_stems(self, maxlen: int) -> bytes:
+        hit_eof = self._drain_stem_queues()
+        if hit_eof:
+            self._decode_eof_generation = int(self._generation)
+
+        need_samples = ((maxlen - len(self._byte_pending) + 3) // 4) * _TARGET_CHANNELS
+        need_samples = max(0, need_samples)
+        if need_samples > 0:
+            # Keep draining while we can fill.
+            while (
+                min(
+                    self._stem_pending[STEM_VOCALS].size,
+                    self._stem_pending[STEM_INSTRUMENTAL].size,
+                )
+                < need_samples
+            ):
+                if not self._drain_stem_queues():
+                    break
+            mixed = self._mix_stems(need_samples)
+            if mixed is not None and mixed.size:
+                wet = self._high_cut.process_interleaved(mixed)
+                gain = float(self._track_gain)
+                if gain != 1.0:
+                    wet = wet * np.float32(gain)
+                self._capture_spectrum(wet)
+                clipped = np.clip(wet, -1.0, 1.0)
+                pcm = (clipped * 32767.0).astype(np.int16)
+                self._byte_pending.extend(pcm.tobytes())
+                self._frames_played += mixed.size // _TARGET_CHANNELS
+
+        stems_empty = (
+            self._stem_pending[STEM_VOCALS].size == 0
+            and self._stem_pending[STEM_INSTRUMENTAL].size == 0
+            and self._stem_pair_queue.empty()
+        )
+
+        if not self._byte_pending:
+            if self._decode_eof_generation == self._generation and stems_empty:
+                gen = self._generation
+                QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
+            return bytes(min(maxlen, 4096))
+
+        take_b = min(len(self._byte_pending), maxlen)
+        take_b -= take_b % 4
+        if take_b <= 0:
+            return b""
+        data = bytes(self._byte_pending[:take_b])
+        del self._byte_pending[:take_b]
+
+        if (
+            getattr(self, "_decode_eof_generation", None) == self._generation
+            and not self._byte_pending
+            and stems_empty
         ):
             gen = self._generation
             QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))

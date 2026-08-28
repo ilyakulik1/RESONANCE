@@ -158,7 +158,7 @@ class LayerAudioStore:
 
     def sync(self) -> bool:
         """Update players; return True if Main currently has audible video."""
-        main = self.model.main_scene()
+        main = self.model.program_scene()
         wanted: set[str] = set()
         audible = False
         if main is not None:

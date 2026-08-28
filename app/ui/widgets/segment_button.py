@@ -1,5 +1,5 @@
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QButtonGroup, QHBoxLayout, QPushButton, QWidget
+from PyQt6.QtCore import QSize, Qt, pyqtSignal
+from PyQt6.QtWidgets import QButtonGroup, QHBoxLayout, QPushButton, QSizePolicy, QWidget
 
 
 class SegmentButtonGroup(QWidget):
@@ -27,14 +27,19 @@ class SegmentButtonGroup(QWidget):
             btn.setDefault(False)
             btn.setObjectName("segmentButton")
             btn.setProperty("segmentValue", value)
+            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, v=value: self._on_clicked(v))
             self._group.addButton(btn)
             self._buttons[value] = btn
             layout.addWidget(btn)
 
+        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         if options:
             self._buttons[options[0][0]].setChecked(True)
         self._update_styles()
+
+    def minimumSizeHint(self) -> QSize:
+        return self.sizeHint()
 
     def _on_clicked(self, value: str) -> None:
         self._update_styles()

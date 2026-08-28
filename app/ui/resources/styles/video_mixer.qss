@@ -11,6 +11,14 @@ QLabel#screenCaption {
     font-weight: bold;
 }
 
+QLabel#programClock {
+    color: {{colors.accent_red}};
+    font-size: {{typography.size_sm}};
+    font-weight: 700;
+    font-family: "Menlo", "Monaco", "Consolas", monospace;
+    min-width: 72px;
+}
+
 QFrame#screenResBar {
     background-color: {{colors.bg_surface}};
     border: 1px solid {{colors.border}};

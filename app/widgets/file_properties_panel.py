@@ -21,9 +21,13 @@ from app.loudness import (
     TARGET_LUFS_MIN,
 )
 from app.spectrum_feeder import read_audio_file_info
+from app.stems import STEM_IDS, STEM_INSTRUMENTAL, STEM_LABELS, STEM_VOCALS
 from app.ui.widgets.float_value_stepper import FloatValueStepper
 from app.ui.widgets.section_header import SectionHeader
+from app.ui.widgets.segment_button import SegmentButtonGroup
+from app.ui.widgets.volume_knob import VolumeKnob
 from app.widgets.parametric_eq_view import ParametricEqView
+from app.widgets.stem_fader import StemFader
 
 
 class FilePropertiesPanel(QFrame):
@@ -32,6 +36,9 @@ class FilePropertiesPanel(QFrame):
     eqChanged = pyqtSignal()
     gainChanged = pyqtSignal(float)
     targetLufsChanged = pyqtSignal(float)
+    masterVolumeChanged = pyqtSignal(float)  # 0.0 … 1.0
+    stemSelectionChanged = pyqtSignal(str)
+    stemGainChanged = pyqtSignal(str, float)  # stem_id, gain_db
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -41,6 +48,10 @@ class FilePropertiesPanel(QFrame):
 
         self._gain_loading = False
         self._target_loading = False
+        self._stem_loading = False
+        self._master_loading = False
+        self._stems_enabled = False
+        self._selected_stem = STEM_VOCALS
         self._target_lufs = TARGET_LUFS
         self._measured_lufs: float | None = None
 
@@ -49,11 +60,21 @@ class FilePropertiesPanel(QFrame):
         root.setSpacing(4)
 
         root.addWidget(SectionHeader("VOLUME"))
+        volume_row = QWidget()
+        volume_row.setObjectName("trackGainRow")
+        volume_layout = QHBoxLayout(volume_row)
+        volume_layout.setContentsMargins(4, 0, 4, 2)
+        volume_layout.setSpacing(8)
+
+        gain_col = QWidget()
+        gain_layout = QVBoxLayout(gain_col)
+        gain_layout.setContentsMargins(0, 0, 0, 0)
+        gain_layout.setSpacing(4)
+
         gain_row = QWidget()
-        gain_row.setObjectName("trackGainRow")
-        gain_layout = QHBoxLayout(gain_row)
-        gain_layout.setContentsMargins(4, 0, 4, 2)
-        gain_layout.setSpacing(8)
+        gain_row_layout = QHBoxLayout(gain_row)
+        gain_row_layout.setContentsMargins(0, 0, 0, 0)
+        gain_row_layout.setSpacing(8)
 
         gain_caption = QLabel("GAIN")
         gain_caption.setObjectName("trackLufsLabel")
@@ -95,14 +116,46 @@ class FilePropertiesPanel(QFrame):
         self.lufs_label.setObjectName("trackLufsLabel")
         self.lufs_label.setToolTip("Measured integrated loudness → target")
 
-        gain_layout.addWidget(gain_caption, 0)
-        gain_layout.addWidget(self.gain_stepper, 0)
-        gain_layout.addWidget(target_caption, 0)
-        gain_layout.addWidget(self.target_lufs_stepper, 0)
-        gain_layout.addWidget(self.lufs_label, 1)
-        root.addWidget(gain_row)
+        gain_row_layout.addWidget(gain_caption, 0)
+        gain_row_layout.addWidget(self.gain_stepper, 0)
+        gain_row_layout.addWidget(target_caption, 0)
+        gain_row_layout.addWidget(self.target_lufs_stepper, 0)
+        gain_row_layout.addWidget(self.lufs_label, 1)
+        gain_layout.addWidget(gain_row)
+        gain_layout.addStretch(1)
+
+        self.master_knob = VolumeKnob(self, value=0.7)
+        self.master_knob.volumeChanged.connect(self._on_master_knob)
+
+        volume_layout.addWidget(gain_col, 1)
+        volume_layout.addWidget(self.master_knob, 0, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        root.addWidget(volume_row)
+
+        self.stem_header = SectionHeader("STEMS")
+        root.addWidget(self.stem_header)
+
+        self.stem_row = QWidget()
+        self.stem_row.setObjectName("stemSelectRow")
+        stem_layout = QHBoxLayout(self.stem_row)
+        stem_layout.setContentsMargins(4, 0, 4, 2)
+        stem_layout.setSpacing(8)
+        self.stem_selector = SegmentButtonGroup(
+            [(STEM_VOCALS, STEM_LABELS[STEM_VOCALS]), (STEM_INSTRUMENTAL, STEM_LABELS[STEM_INSTRUMENTAL])],
+            self,
+        )
+        self.stem_selector.valueChanged.connect(self._on_stem_selected)
+        stem_layout.addWidget(self.stem_selector, 0)
+        stem_layout.addStretch(1)
+        root.addWidget(self.stem_row)
 
         root.addWidget(SectionHeader("EQUALIZER"))
+
+        eq_row = QWidget()
+        eq_row.setObjectName("eqWithFaderRow")
+        eq_row.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        eq_row_layout = QHBoxLayout(eq_row)
+        eq_row_layout.setContentsMargins(0, 0, 0, 0)
+        eq_row_layout.setSpacing(6)
 
         self.eq_body = QWidget()
         self.eq_body.setObjectName("eqSectionBody")
@@ -117,12 +170,26 @@ class FilePropertiesPanel(QFrame):
         self.eq_view.bandsChanged.connect(self.eqChanged.emit)
         self.eq_view.bypassChanged.connect(lambda _c: self.eqChanged.emit())
         eq_body_layout.addWidget(self.eq_view, 1)
-        root.addWidget(self.eq_body, 1)
+
+        self.stem_fader = StemFader(self)
+        self.stem_fader.gainChanged.connect(self._on_stem_fader)
+        self.stem_fader.set_caption("VOX")
+
+        eq_row_layout.addWidget(self.eq_body, 1)
+        eq_row_layout.addWidget(self.stem_fader, 0)
+        root.addWidget(eq_row, 1)
+
+        self.set_stems_enabled(False)
 
     def _on_gain_stepper(self, value: float) -> None:
         if self._gain_loading:
             return
         self.gainChanged.emit(float(value))
+
+    def _on_master_knob(self, volume: float) -> None:
+        if self._master_loading:
+            return
+        self.masterVolumeChanged.emit(float(volume))
 
     def _on_target_stepper(self, value: float) -> None:
         if self._target_loading:
@@ -131,8 +198,32 @@ class FilePropertiesPanel(QFrame):
         self._refresh_lufs_label()
         self.targetLufsChanged.emit(float(value))
 
+    def _on_stem_selected(self, value: str) -> None:
+        if self._stem_loading:
+            return
+        if value not in STEM_IDS:
+            return
+        self._selected_stem = value
+        self.stem_fader.set_caption("VOX" if value == STEM_VOCALS else "INST")
+        self.stemSelectionChanged.emit(value)
+
+    def _on_stem_fader(self, gain_db: float) -> None:
+        if self._stem_loading or not self._stems_enabled:
+            return
+        self.stemGainChanged.emit(self._selected_stem, float(gain_db))
+
     def gain_db(self) -> float:
         return float(self.gain_stepper.value())
+
+    def master_volume(self) -> float:
+        return float(self.master_knob.volume())
+
+    def set_master_volume(self, volume: float) -> None:
+        self._master_loading = True
+        try:
+            self.master_knob.set_volume(float(volume))
+        finally:
+            self._master_loading = False
 
     def target_lufs(self) -> float:
         return float(self.target_lufs_stepper.value())
@@ -180,6 +271,45 @@ class FilePropertiesPanel(QFrame):
 
     def set_bypassed(self, bypassed: bool) -> None:
         self.eq_view.set_bypass(bool(bypassed))
+
+    def stems_enabled(self) -> bool:
+        return self._stems_enabled
+
+    def selected_stem(self) -> str:
+        return self._selected_stem
+
+    def set_stems_enabled(self, enabled: bool) -> None:
+        self._stems_enabled = bool(enabled)
+        self.stem_header.setVisible(self._stems_enabled)
+        self.stem_row.setVisible(self._stems_enabled)
+        self.stem_fader.setVisible(self._stems_enabled)
+        if not self._stems_enabled:
+            self.stem_fader.set_enabled_fader(False)
+        else:
+            self.stem_fader.set_enabled_fader(True)
+
+    def set_stem_ui(
+        self,
+        *,
+        selected: str,
+        gain_db: float,
+    ) -> None:
+        self._stem_loading = True
+        try:
+            stem = selected if selected in STEM_IDS else STEM_VOCALS
+            self._selected_stem = stem
+            self.stem_selector.set_value(stem)
+            self.stem_fader.set_caption("VOX" if stem == STEM_VOCALS else "INST")
+            self.stem_fader.set_gain_db(float(gain_db))
+        finally:
+            self._stem_loading = False
+
+    def set_stem_gain_db(self, gain_db: float) -> None:
+        self._stem_loading = True
+        try:
+            self.stem_fader.set_gain_db(float(gain_db))
+        finally:
+            self._stem_loading = False
 
 
 class PreviewPropertiesPanel(QFrame):

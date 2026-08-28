@@ -1,4 +1,6 @@
+import json
 import os
+import sys
 
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QRect, QEvent
 from PyQt6.QtGui import (
@@ -10,6 +12,7 @@ from PyQt6.QtGui import (
     QDropEvent,
     QFont,
     QFocusEvent,
+    QKeySequence,
     QPainter,
     QPen,
     QColor,
@@ -27,6 +30,8 @@ from PyQt6.QtWidgets import (
 
 from app.audio_utils import is_audio_file
 from app.playlist_io import (
+    clone_playlist_item,
+    ensure_item_track_id,
     get_item_file_path,
     get_item_duration,
     set_item_duration,
@@ -73,9 +78,21 @@ class _DropLineOverlay(QWidget):
         painter.end()
 
 
+def is_copy_drop_modifier(modifiers: Qt.KeyboardModifier) -> bool:
+    """Option/Alt copies on every platform; Ctrl copies on Windows/Linux."""
+    if modifiers & Qt.KeyboardModifier.AltModifier:
+        return True
+    if sys.platform != "darwin" and modifiers & Qt.KeyboardModifier.ControlModifier:
+        return True
+    return False
+
+
 class PlaylistWidget(QListWidget):
     """Виджет плейлиста с поддержкой drag & drop и сортировки"""
     itemDropped = pyqtSignal(int, int, int, int)  # from_playlist, from_row, to_playlist, to_row
+    itemDuplicated = pyqtSignal(object, object)  # src item, dst item
+    copyRequested = pyqtSignal()
+    pasteRequested = pyqtSignal()
     focused = pyqtSignal(int)
     selectionNavigated = pyqtSignal(object)
     tracksChanged = pyqtSignal()
@@ -93,7 +110,7 @@ class PlaylistWidget(QListWidget):
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragDrop)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
-        self.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.setObjectName("playlistList")
         self.setFont(QFont(get_token("typography.font_family_ui", "Arial"), 10))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -199,7 +216,17 @@ class PlaylistWidget(QListWidget):
     def _drop_row_at(self, pos) -> int:
         return self._drop_row_at_viewport(self._cursor_viewport_pos())
 
-    def _make_drag_pixmap(self, row: int) -> tuple[QPixmap, QRect]:
+    def selected_rows(self) -> list[int]:
+        rows = sorted({index.row() for index in self.selectedIndexes()})
+        return [row for row in rows if 0 <= row < self.count() and self.item(row) is not None]
+
+    def selected_track_items(self) -> list[QListWidgetItem]:
+        return [self.item(row) for row in self.selected_rows() if self.item(row) is not None]
+
+    def _make_drag_pixmap(self, rows: list[int]) -> tuple[QPixmap, QRect]:
+        if not rows:
+            return QPixmap(), QRect()
+        row = rows[0]
         rect = self.visualItemRect(self.item(row))
         size = rect.size()
         if size.isEmpty():
@@ -208,17 +235,26 @@ class PlaylistWidget(QListWidget):
             index = self.model().index(row, 0)
             size = self.itemDelegate().sizeHint(option, index)
 
-        pixmap = QPixmap(size)
+        extra = 0 if len(rows) == 1 else 10
+        pixmap = QPixmap(size.width(), size.height() + extra)
         pixmap.fill(Qt.GlobalColor.transparent)
 
         painter = QPainter(pixmap)
         option = QStyleOptionViewItem()
         option.initFrom(self)
-        option.rect = QRect(0, 0, size.width(), size.height())
+        option.rect = QRect(0, extra, size.width(), size.height())
         option.state |= QStyle.StateFlag.State_Enabled
-        if self.currentRow() == row:
-            option.state |= QStyle.StateFlag.State_Selected
+        option.state |= QStyle.StateFlag.State_Selected
         self.itemDelegate().paint(painter, option, self.model().index(row, 0))
+        if len(rows) > 1:
+            badge_w = 28
+            badge_h = 16
+            badge = QRect(size.width() - badge_w - 6, 2, badge_w, badge_h)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor(get_token("colors.accent", "#3897fd")))
+            painter.drawRoundedRect(badge, 8, 8)
+            painter.setPen(QColor("#ffffff"))
+            painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), str(len(rows)))
         painter.end()
         return pixmap, rect
 
@@ -280,6 +316,7 @@ class PlaylistWidget(QListWidget):
         item = QListWidgetItem(name)
         item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
         item.setFont(self.font())
+        ensure_item_track_id(item)
         self._remember_item_path(item, file_path)
         if file_exists is not None:
             set_item_file_missing(item, not file_exists)
@@ -340,33 +377,39 @@ class PlaylistWidget(QListWidget):
                 playlist._clear_drop_indicator()
 
     def startDrag(self, supportedActions):
-        indexes = self.selectedIndexes()
-        if not indexes:
-            return
-        row = indexes[0].row()
-        item = self.item(row)
-        if item is None:
+        rows = self.selected_rows()
+        if not rows:
             return
 
         mime = QMimeData()
-        mime.setData(TRACK_MIME, f"{self.playlist_num}:{row}".encode())
+        payload = json.dumps({"playlist": self.playlist_num, "rows": rows})
+        mime.setData(TRACK_MIME, payload.encode())
 
         drag = QDrag(self)
         drag.setMimeData(mime)
 
-        pixmap, rect = self._make_drag_pixmap(row)
+        pixmap, rect = self._make_drag_pixmap(rows)
         if not pixmap.isNull() and not rect.isEmpty():
             cursor_vp = self._cursor_viewport_pos()
             hot = cursor_vp - rect.topLeft()
             hot.setX(max(0, min(hot.x(), rect.width() - 1)))
-            hot.setY(max(0, min(hot.y(), rect.height() - 1)))
+            hot.setY(max(0, min(hot.y(), pixmap.height() - 1)))
             drag.setPixmap(pixmap)
             drag.setHotSpot(hot)
 
-        item.setHidden(True)
-        self.viewport().update()
-        drag.exec(Qt.DropAction.MoveAction)
-        item.setHidden(False)
+        hidden_items: list[QListWidgetItem] = []
+        copy_drag = is_copy_drop_modifier(QApplication.keyboardModifiers())
+        if not copy_drag:
+            for row in rows:
+                item = self.item(row)
+                if item is not None:
+                    item.setHidden(True)
+                    hidden_items.append(item)
+            self.viewport().update()
+
+        drag.exec(Qt.DropAction.CopyAction | Qt.DropAction.MoveAction, Qt.DropAction.MoveAction)
+        for item in hidden_items:
+            item.setHidden(False)
         self.viewport().update()
         self._clear_drop_indicator()
         if self._playlists:
@@ -374,8 +417,12 @@ class PlaylistWidget(QListWidget):
                 playlist._clear_drop_indicator()
 
     def dragEnterEvent(self, event: QDragEnterEvent):
-        if self._accepts_drag(event.mimeData()):
-            event.acceptProposedAction()
+        if not self._accepts_drag(event.mimeData()):
+            event.ignore()
+            return
+        if event.mimeData().hasFormat(TRACK_MIME) and is_copy_drop_modifier(event.modifiers()):
+            event.setDropAction(Qt.DropAction.CopyAction)
+        event.accept()
 
     def dragMoveEvent(self, event: QDragMoveEvent):
         if not self._accepts_drag(event.mimeData()):
@@ -384,7 +431,13 @@ class PlaylistWidget(QListWidget):
 
         self._update_drop_indicator(event.position())
         self._clear_other_drop_indicators()
-        event.acceptProposedAction()
+        if event.mimeData().hasFormat(TRACK_MIME) and is_copy_drop_modifier(
+            event.modifiers()
+        ):
+            event.setDropAction(Qt.DropAction.CopyAction)
+        elif event.mimeData().hasFormat(TRACK_MIME):
+            event.setDropAction(Qt.DropAction.MoveAction)
+        event.accept()
 
     def dragLeaveEvent(self, event: QDragLeaveEvent):
         self._clear_drop_indicator()
@@ -406,43 +459,140 @@ class PlaylistWidget(QListWidget):
             return
 
         if event.mimeData().hasFormat(TRACK_MIME):
-            payload = bytes(event.mimeData().data(TRACK_MIME)).decode()
-            try:
-                source_playlist_num, source_row = map(int, payload.split(":", 1))
-            except ValueError:
+            parsed = self._parse_track_mime(
+                bytes(event.mimeData().data(TRACK_MIME)).decode()
+            )
+            if parsed is None:
                 return
-
+            source_playlist_num, source_rows = parsed
             source_playlist = self._resolve_playlist(source_playlist_num)
             if source_playlist is None:
                 return
-            if source_row < 0 or source_row >= source_playlist.count():
+
+            copy = is_copy_drop_modifier(event.modifiers()) or is_copy_drop_modifier(
+                QApplication.keyboardModifiers()
+            )
+            if not copy and event.dropAction() == Qt.DropAction.CopyAction:
+                copy = True
+
+            first_row = source_rows[0] if source_rows else -1
+            moved = self._drop_tracks(
+                source_playlist,
+                source_rows,
+                target_row,
+                copy=copy,
+            )
+            if not moved:
+                event.accept()
                 return
 
-            if source_playlist is self and target_row in (source_row, source_row + 1):
-                event.acceptProposedAction()
-                return
-
-            item = source_playlist.takeItem(source_row)
-            if item is None:
-                return
-
-            if source_playlist is self and source_row < target_row:
-                target_row -= 1
-            target_row = max(0, min(target_row, self.count()))
-
-            self.insertItem(target_row, item)
-            self._adopt_item(item)
-            self.setCurrentItem(item)
             self.itemDropped.emit(
                 source_playlist_num,
-                source_row,
+                first_row,
                 self.playlist_num,
                 target_row,
             )
-            event.acceptProposedAction()
+            self.tracksChanged.emit()
+            if source_playlist is not self:
+                source_playlist.tracksChanged.emit()
+            event.setDropAction(
+                Qt.DropAction.CopyAction if copy else Qt.DropAction.MoveAction
+            )
+            event.accept()
             return
 
         super().dropEvent(event)
+
+    @staticmethod
+    def _parse_track_mime(payload: str) -> tuple[int, list[int]] | None:
+        text = (payload or "").strip()
+        if not text:
+            return None
+        if text.startswith("{"):
+            try:
+                data = json.loads(text)
+                playlist_num = int(data["playlist"])
+                rows = sorted({int(row) for row in (data.get("rows") or [])})
+            except (TypeError, ValueError, KeyError, json.JSONDecodeError):
+                return None
+            return playlist_num, rows
+        try:
+            playlist_num, row = map(int, text.split(":", 1))
+        except ValueError:
+            return None
+        return playlist_num, [row]
+
+    def _drop_tracks(
+        self,
+        source: "PlaylistWidget",
+        rows: list[int],
+        target_row: int,
+        *,
+        copy: bool,
+    ) -> bool:
+        rows = [
+            row
+            for row in rows
+            if 0 <= row < source.count() and source.item(row) is not None
+        ]
+        if not rows:
+            return False
+
+        if (
+            not copy
+            and source is self
+            and len(rows) == 1
+            and target_row in (rows[0], rows[0] + 1)
+        ):
+            return False
+
+        if copy:
+            clones: list[tuple[QListWidgetItem, QListWidgetItem]] = []
+            for row in rows:
+                src_item = source.item(row)
+                if src_item is None:
+                    continue
+                dst_item = clone_playlist_item(src_item)
+                clones.append((src_item, dst_item))
+            if not clones:
+                return False
+            insert_at = max(0, min(target_row, self.count()))
+            inserted: list[QListWidgetItem] = []
+            for offset, (src_item, dst_item) in enumerate(clones):
+                self.insertItem(insert_at + offset, dst_item)
+                self._adopt_item(dst_item)
+                inserted.append(dst_item)
+                self.itemDuplicated.emit(src_item, dst_item)
+            self._select_items(inserted)
+            return True
+
+        taken: list[QListWidgetItem] = []
+        for row in reversed(rows):
+            item = source.takeItem(row)
+            if item is None:
+                continue
+            item.setHidden(False)
+            taken.append(item)
+        taken.reverse()
+        if not taken:
+            return False
+        insert_at = target_row
+        if source is self:
+            insert_at -= sum(1 for row in rows if row < target_row)
+        insert_at = max(0, min(insert_at, self.count()))
+        for offset, item in enumerate(taken):
+            self.insertItem(insert_at + offset, item)
+            self._adopt_item(item)
+            item.setHidden(False)
+        self._select_items(taken)
+        return True
+
+    def _select_items(self, items: list[QListWidgetItem]) -> None:
+        self.clearSelection()
+        for item in items:
+            item.setSelected(True)
+        if items:
+            self.setCurrentItem(items[-1])
 
     def add_file(self, file_path, row: int | None = None):
         if not file_path:
@@ -453,6 +603,14 @@ class PlaylistWidget(QListWidget):
         return item
 
     def keyPressEvent(self, event):
+        if self._is_copy_shortcut(event):
+            self.copyRequested.emit()
+            event.accept()
+            return
+        if self._is_paste_shortcut(event):
+            self.pasteRequested.emit()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_F2):
             item = self.currentItem()
             if item:
@@ -467,6 +625,26 @@ class PlaylistWidget(QListWidget):
                     self.selectionNavigated.emit(item)
             return
         super().keyPressEvent(event)
+
+    @staticmethod
+    def _is_copy_shortcut(event) -> bool:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            return True
+        return (
+            event.key() == Qt.Key.Key_C
+            and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            and not bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        )
+
+    @staticmethod
+    def _is_paste_shortcut(event) -> bool:
+        if event.matches(QKeySequence.StandardKey.Paste):
+            return True
+        return (
+            event.key() == Qt.Key.Key_V
+            and bool(event.modifiers() & Qt.KeyboardModifier.ControlModifier)
+            and not bool(event.modifiers() & Qt.KeyboardModifier.ShiftModifier)
+        )
 
     def move_item_up(self):
         """Переместить выбранный элемент вверх"""

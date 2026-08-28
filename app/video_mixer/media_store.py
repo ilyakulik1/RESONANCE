@@ -92,8 +92,7 @@ class LayerMedia:
             if not self.decoder.at_eof:
                 self.decoder.set_playing(bool(layer.playing))
             return
-        if layer.playback == "stop" and self.decoder.at_eof:
-            layer.playing = False
+        if layer.playback == "stop" and self.decoder.at_eof and not layer.playing:
             self.decoder.set_playing(False)
             return
         self.decoder.set_playing(bool(layer.playing))
@@ -267,6 +266,8 @@ class MediaStore:
     def _apply_suspend(self) -> None:
         preview = self.model.preview_scene()
         preview_ids = {layer.id for layer in preview.layers} if preview else set()
+        program = self.model.program_scene()
+        program_ids = {layer.id for layer in program.layers} if program else set()
         for layer_id, media in self._media.items():
             if media.decoder is None:
                 continue
@@ -275,10 +276,9 @@ class MediaStore:
                 continue
             if self._all_suspended:
                 media.decoder.set_playing(False)
-            elif self._preview_suspended and layer_id in preview_ids:
+            elif self._preview_suspended and layer_id in preview_ids and layer_id not in program_ids:
                 media.decoder.set_playing(False)
-            elif layer.playback == "stop" and media.decoder.at_eof:
-                layer.playing = False
+            elif layer.playback == "stop" and media.decoder.at_eof and not layer.playing:
                 media.decoder.set_playing(False)
             else:
                 media.decoder.set_playing(bool(layer.playing))
@@ -293,6 +293,7 @@ class MediaStore:
             self.model.main_scene(),
             self.model.preview_scene(),
             self.model.pending_main_scene(),
+            self.model.program_scene(),
         ):
             if scene is None:
                 continue
@@ -329,16 +330,19 @@ class MediaStore:
 
     def tick(self, dt_ms: int = 33) -> bool:
         changed = False
+        seen: set[str] = set()
         for scene in (
             self.model.main_scene(),
             self.model.preview_scene(),
             self.model.pending_main_scene(),
+            self.model.program_scene(),
         ):
             if scene is None:
                 continue
             for layer in scene.layers:
-                if layer.file_missing:
+                if layer.file_missing or layer.id in seen:
                     continue
+                seen.add(layer.id)
                 media = self._media.get(layer.id)
                 if media is not None and media.tick(layer, dt_ms):
                     changed = True
@@ -349,6 +353,7 @@ class MediaStore:
             self.model.main_scene(),
             self.model.preview_scene(),
             self.model.pending_main_scene(),
+            self.model.program_scene(),
         ):
             if scene is None:
                 continue

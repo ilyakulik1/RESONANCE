@@ -14,6 +14,7 @@ ICON_ALIASES: dict[str, tuple[str, ...]] = {
     "up": ("up", "UP"),
     "bpm_all": ("gear", "bpm_all", "analyze bpm"),
     "bpm_one": ("gear", "bpm_one", "analyze bpm (1)"),
+    "stems": ("stems",),
     "back": ("back",),
     "home": ("home",),
     "refresh": ("refresh",),

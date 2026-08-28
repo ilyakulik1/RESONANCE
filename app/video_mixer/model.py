@@ -194,6 +194,10 @@ class MixerModel(QObject):
         self.main_scene_id: str = self.scenes[0].id
         self.preview_scene_id: str | None = self.scenes[0].id
         self.pending_main_scene_id: str | None = None
+        # Frozen look for Main/output: preview edits (transform, visibility)
+        # do not show until the scene is taken to Main again.
+        self.program_look: Scene | None = None
+        self.capture_program_look()
         self.selected_layer_id: str | None = None
         self.output_screen_name: str | None = None
         self.panel_collapsed: bool = False
@@ -222,6 +226,21 @@ class MixerModel(QObject):
     def main_scene(self) -> Scene | None:
         scene = self.scene_by_id(self.main_scene_id)
         return scene or (self.scenes[0] if self.scenes else None)
+
+    def program_scene(self) -> Scene | None:
+        """Scene look currently committed to Main / physical output."""
+        return self.program_look or self.main_scene()
+
+    def capture_program_look(self) -> None:
+        """Commit the current main scene look (visibility / transform) to program."""
+        scene = self.scene_by_id(self.main_scene_id) or (
+            self.scenes[0] if self.scenes else None
+        )
+        if scene is None:
+            self.program_look = None
+            return
+        copied = Scene.from_dict(scene.to_dict())
+        self.program_look = copied
 
     def preview_scene(self) -> Scene | None:
         """Preview may be unloaded (None) to save decode load."""
@@ -262,6 +281,7 @@ class MixerModel(QObject):
         if not any(s.id == scene_id for s in self.scenes):
             return
         self.main_scene_id = scene_id
+        self.capture_program_look()
         self.sceneActivated.emit(scene_id)
         self.changed.emit()
 
@@ -304,6 +324,42 @@ class MixerModel(QObject):
         self.set_preview_scene(scene.id)
         return scene
 
+    def _unique_scene_name(self, base: str) -> str:
+        existing = {scene.name for scene in self.scenes}
+        candidate = f"{base} copy"
+        if candidate not in existing:
+            return candidate
+        n = 2
+        while f"{base} copy {n}" in existing:
+            n += 1
+        return f"{base} copy {n}"
+
+    def duplicate_scene(self, scene_id: str | None = None) -> Scene | None:
+        """Deep-copy a scene (layers + transforms) with new ids."""
+        if len(self.scenes) >= MAX_SCENES:
+            return None
+        source = self.scene_by_id(scene_id) or self.preview_scene()
+        if source is None:
+            return None
+        data = source.to_dict()
+        data["id"] = _new_id()
+        data["name"] = self._unique_scene_name(source.name)
+        raw_layers = data.get("layers")
+        if isinstance(raw_layers, list):
+            for item in raw_layers:
+                if isinstance(item, dict):
+                    item["id"] = _new_id()
+        scene = Scene.from_dict(data)
+        if scene is None:
+            return None
+        insert_at = next(
+            (i + 1 for i, s in enumerate(self.scenes) if s.id == source.id),
+            len(self.scenes),
+        )
+        self.scenes.insert(insert_at, scene)
+        self.set_preview_scene(scene.id)
+        return scene
+
     def rename_scene(self, scene_id: str, name: str) -> None:
         text = name.strip()
         if not text:
@@ -323,7 +379,8 @@ class MixerModel(QObject):
 
         self.scenes = [s for s in self.scenes if s.id != scene_id]
         fallback = self.scenes[0].id
-        if self.main_scene_id == scene_id:
+        was_main = self.main_scene_id == scene_id
+        if was_main:
             self.main_scene_id = fallback
         if self.preview_scene_id == scene_id:
             self.preview_scene_id = fallback
@@ -331,6 +388,8 @@ class MixerModel(QObject):
             self.layerSelected.emit(self.selected_layer_id)
         if self.pending_main_scene_id == scene_id:
             self.pending_main_scene_id = None
+        if was_main:
+            self.capture_program_look()
         self.changed.emit()
         return True
 
@@ -470,7 +529,7 @@ class MixerModel(QObject):
         self.changed.emit()
 
     def main_scene_has_audible_video(self) -> bool:
-        scene = self.main_scene()
+        scene = self.program_scene()
         if scene is None:
             return False
         for layer in scene.layers:
@@ -620,6 +679,7 @@ class MixerModel(QObject):
         else:
             self.selected_layer_id = scene.layers[-1].id if scene and scene.layers else None
 
+        self.capture_program_look()
         self.changed.emit()
         if self.preview_scene_id:
             self.sceneActivated.emit(self.preview_scene_id)
