@@ -105,7 +105,7 @@ Output:
 - **macOS:** `dist/MyAudioPlayer.app`
 - **Windows / Linux:** `dist/MyAudioPlayer/`
 
-The packaged binary is named `MyAudioPlayer`; the product name in the UI is **Decibel Player**.
+The packaged binary is named `MyAudioPlayer`; the product name in the UI is **RESONANCE**.
 
 ## License
 
