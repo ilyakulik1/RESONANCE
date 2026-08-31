@@ -9,8 +9,9 @@ from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton, QSizePolicy,
 
 from app.project import import_track_into_project, is_under_project
 from app.video_mixer.layer_audio import LayerAudioStore
+from app.video_mixer.mapping_window import MappingWindow
 from app.video_mixer.media_store import MediaStore
-from app.video_mixer.model import MixerModel, Scene
+from app.video_mixer.model import MixerModel, Scene, TRANSITION_PRESET_SHORTCUTS
 from app.video_mixer.output_window import OutputWindow
 from app.video_mixer.panel import VideoMixerPanel
 from app.video_mixer.scene_render import render_scene_thumb
@@ -31,9 +32,14 @@ class VideoMixerController(QObject):
         # Warm decode workers before any Take so video starts without spawn lag.
         ensure_pool()
         self.media_store = MediaStore(self.model)
-        self.layer_audio = LayerAudioStore(self.model)
+        self.layer_audio = LayerAudioStore(
+            self.model,
+            output_device=self._resolve_air_audio_output,
+            master_volume=float(getattr(window, "_playback_volume", 1.0)),
+        )
         self.panel = VideoMixerPanel(self.model, self.media_store)
         self.output_window = OutputWindow(self.model, self.media_store)
+        self.mapping_window = MappingWindow(self.model, self.media_store)
         self._views_dirty = True
         self.main_splitter: QSplitter | None = None
         self._left_column: QWidget | None = None
@@ -63,14 +69,18 @@ class VideoMixerController(QObject):
         self.panel.collapseRequested.connect(self.collapse_panel)
         self.panel.openOutputRequested.connect(self.show_output_menu)
         self.panel.fullscreenRequested.connect(self.open_fullscreen_output)
+        self.panel.mappingRequested.connect(self.open_mapping_window)
         self.panel.mainSceneRequested.connect(self.take_scene_to_main)
         self.panel.clearPreviewRequested.connect(self.clear_preview)
         self.panel.transition_ms.valueChanged.connect(self._on_transition_setting)
+        self.panel.transitionPresetChanged.connect(self._on_transition_preset_changed)
         self.panel.panel_splitter.splitterMoved.connect(self._on_panel_splitter_moved)
         self.panel.bottom_splitter.splitterMoved.connect(self._on_panel_splitter_moved)
         self.model.changed.connect(self._on_model_changed)
         self.model.layerTransformChanged.connect(self._on_transform_changed)
         self.model.playbackChanged.connect(self._on_playback_changed)
+        self.model.outputMappingChanged.connect(self._on_output_mapping_changed)
+        self.mapping_window.closed.connect(self._on_mapping_window_closed)
 
         self._clock = QTimer(self)
         self._clock.setInterval(self._tick_ms)
@@ -98,6 +108,30 @@ class VideoMixerController(QObject):
 
         shortcut = QShortcut(QKeySequence("Ctrl+Shift+O"), window)
         shortcut.activated.connect(self.open_output_default)
+
+        self._transition_shortcuts: list[QShortcut] = []
+        for sequence, preset_ms in TRANSITION_PRESET_SHORTCUTS:
+            sc = QShortcut(QKeySequence(sequence), window)
+            sc.setContext(Qt.ShortcutContext.WindowShortcut)
+            sc.activated.connect(lambda ms=preset_ms: self.set_transition_preset(ms))
+            self._transition_shortcuts.append(sc)
+
+    def _resolve_air_audio_output(self):
+        from app.audio_devices import find_audio_output
+
+        window = self.window
+        device_id = getattr(window, "_air_output_device_id", None)
+        blocked = bool(getattr(window, "_air_no_output", False))
+        return find_audio_output(device_id), blocked
+
+    def apply_output_device(self) -> None:
+        self.layer_audio.apply_output_device()
+
+    def set_master_volume(self, volume: float) -> None:
+        self.layer_audio.set_master_volume(volume)
+
+    def set_transition_preset(self, ms: int) -> None:
+        self.panel.apply_transition_preset(ms)
 
     def bind_project_root(self, root: Path | str | None) -> None:
         self.model.project_root = Path(root) if root is not None else None
@@ -226,20 +260,33 @@ class VideoMixerController(QObject):
 
     def _on_transition_setting(self, value: float = 0.0) -> None:
         self.model.set_transition_ms(int(value))
+        self.panel.sync_transition_presets()
+        self._schedule_save()
+
+    def _on_transition_preset_changed(self, ms: int) -> None:
+        self.model.set_transition_ms(int(ms))
+        self.panel.sync_transition_presets()
         self._schedule_save()
 
     def _capture_program_outgoing(self):
         outgoing = self.panel.main_gl.capture_current()
         output_outgoing = None
+        mapping_outgoing = None
         if self.output_window.isVisible():
             output_outgoing = self.output_window.gl_widget.capture_current()
-        return outgoing, output_outgoing
+        if self.mapping_window.isVisible():
+            mapping_outgoing = self.mapping_window.canvas.capture_current()
+        return outgoing, output_outgoing, mapping_outgoing
 
-    def _start_program_crossfade(self, outgoing, output_outgoing) -> None:
+    def _start_program_crossfade(self, outgoing, output_outgoing, mapping_outgoing=None) -> None:
         self.panel.main_gl.start_crossfade(self.model.transition_ms, outgoing)
         if output_outgoing is not None:
             self.output_window.gl_widget.start_crossfade(
                 self.model.transition_ms, output_outgoing
+            )
+        if mapping_outgoing is not None:
+            self.mapping_window.canvas.start_crossfade(
+                self.model.transition_ms, mapping_outgoing
             )
 
     def take_scene_to_main(self, scene_id: str) -> None:
@@ -248,9 +295,9 @@ class VideoMixerController(QObject):
             return
         if scene_id == self.model.main_scene_id and not self._transitioning:
             # Same scene on Main: fade in the current preview look (transform / vis).
-            outgoing, output_outgoing = self._capture_program_outgoing()
+            outgoing, output_outgoing, mapping_outgoing = self._capture_program_outgoing()
             self.model.capture_program_look()
-            self._start_program_crossfade(outgoing, output_outgoing)
+            self._start_program_crossfade(outgoing, output_outgoing, mapping_outgoing)
             self._start_program_clock()
             self._views_dirty = True
             return
@@ -316,14 +363,14 @@ class VideoMixerController(QObject):
             restart_ids = restart_ids | armed
 
         # Snapshot live Main, then switch and crossfade.
-        outgoing, output_outgoing = self._capture_program_outgoing()
+        outgoing, output_outgoing, mapping_outgoing = self._capture_program_outgoing()
         self.model.pending_main_scene_id = None
         self.model.set_main_scene(scene_id)
         self.media_store.sync()
         if scene is not None:
             self._kick_scene_videos(scene, restart_ids)
         self.media_store.tick(self._tick_ms)
-        self._start_program_crossfade(outgoing, output_outgoing)
+        self._start_program_crossfade(outgoing, output_outgoing, mapping_outgoing)
         self._start_program_clock()
         self._take_scene_id = None
         self._take_restart_ids = set()
@@ -406,6 +453,29 @@ class VideoMixerController(QObject):
                 self._clock.start()
         except Exception as exc:
             QMessageBox.warning(self.window, "Video Mixer", f"Cannot open output:\n{exc}")
+
+    def open_mapping_window(self) -> None:
+        self.output_window.gl_widget.show_mapping_handles = True
+        self.mapping_window.show()
+        self.mapping_window.raise_()
+        self.mapping_window.activateWindow()
+        self._views_dirty = True
+        if not self._clock.isActive():
+            self._clock.start()
+
+    def _on_mapping_window_closed(self) -> None:
+        self.output_window.gl_widget.show_mapping_handles = False
+        if self.output_window.isVisible():
+            self.output_window.refresh()
+        self._schedule_save()
+
+    def _on_output_mapping_changed(self) -> None:
+        self._views_dirty = True
+        if self.mapping_window.isVisible():
+            self.mapping_window.refresh()
+        if self.output_window.isVisible():
+            self.output_window.refresh()
+        self._schedule_save()
 
     def show_output_menu(self) -> None:
         """Legacy: open fullscreen on selected combo screen."""
@@ -577,6 +647,8 @@ class VideoMixerController(QObject):
                 self._views_dirty = False
             if self.output_window.isVisible() and need_draw:
                 self.output_window.refresh()
+            if self.mapping_window.isVisible() and need_draw:
+                self.mapping_window.refresh()
             if ready and self._preload_deadline_ms <= 0:
                 self._finish_take_to_main()
             elif self._preload_deadline_ms <= -2000:
@@ -587,6 +659,10 @@ class VideoMixerController(QObject):
         if self.output_window.isVisible():
             transitioning = (
                 self.output_window.gl_widget.tick_transition(self._tick_ms) or transitioning
+            )
+        if self.mapping_window.isVisible():
+            transitioning = (
+                self.mapping_window.canvas.tick_transition(self._tick_ms) or transitioning
             )
         frame_changed = self.media_store.tick(self._tick_ms)
         self._sync_layer_audio()
@@ -608,6 +684,8 @@ class VideoMixerController(QObject):
 
         if self.output_window.isVisible() and need_draw:
             self.output_window.refresh()
+        if self.mapping_window.isVisible() and need_draw:
+            self.mapping_window.refresh()
 
     def shutdown(self) -> None:
         self._clock.stop()
@@ -625,6 +703,11 @@ class VideoMixerController(QObject):
             self.output_window.release()
         except Exception:
             pass
+        try:
+            self.mapping_window.release()
+        except Exception:
+            pass
         self.layer_audio.release_all()
         self.media_store.release_all()
         self.output_window.hide()
+        self.mapping_window.hide()

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -19,7 +20,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from app.constants import MAX_PLAYLISTS
+from app.constants import MAX_PLAYLISTS, FADE_PRESETS_MS, FADE_PRESET_SHORTCUTS, fade_preset_label
 from app.ui.icon_loader import icon_size, load_icon
 from app.ui.tokens import get_token_int
 from app.ui.widgets.section_header import SectionHeader
@@ -285,15 +286,46 @@ class MainWindowUi:
             editable=True,
         )
         window.fade_duration_spin = window.fade_duration_stepper.spin_box()
+        shortcut_hint = ", ".join(seq for seq, _ms in FADE_PRESET_SHORTCUTS)
         window.fade_duration_spin.setToolTip(
-            "Transition duration for Space/Stop and track changes "
-            "(volume fade or high-cut, depending on FADE MODE)"
+            "Air fade for Space/Stop and track changes "
+            f"(volume fade or high-cut, depending on FADE MODE) · {shortcut_hint}"
         )
         fade_ms_unit = QLabel("MS")
         fade_ms_unit.setObjectName("fadeMsLabel")
         fade_ms_layout.addWidget(window.fade_duration_stepper)
         fade_ms_layout.addWidget(fade_ms_unit)
-        add_labeled("FADE", fade_ms_wrap)
+
+        fade_col = QWidget()
+        fade_col_layout = QVBoxLayout(fade_col)
+        fade_col_layout.setContentsMargins(0, 0, 0, 0)
+        fade_col_layout.setSpacing(2)
+        fade_col_layout.addWidget(fade_ms_wrap)
+        preset_row = QHBoxLayout()
+        preset_row.setContentsMargins(0, 0, 0, 0)
+        preset_row.setSpacing(2)
+        window._air_fade_preset_group = QButtonGroup(window)
+        window._air_fade_preset_group.setExclusive(True)
+        window._air_fade_preset_buttons: dict[int, QPushButton] = {}
+        for index, ms in enumerate(FADE_PRESETS_MS):
+            btn = QPushButton(fade_preset_label(ms))
+            btn.setObjectName("segmentButton")
+            btn.setCheckable(True)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setAutoDefault(False)
+            btn.setDefault(False)
+            btn.setFixedHeight(max(16, control_row_height - 8))
+            if index < len(FADE_PRESET_SHORTCUTS):
+                shortcut, _preset = FADE_PRESET_SHORTCUTS[index]
+                btn.setToolTip(f"Air fade {ms} ms · {shortcut}")
+            else:
+                btn.setToolTip(f"Air fade {ms} ms")
+            btn.clicked.connect(lambda _checked=False, value=ms: window.apply_fade_preset(value))
+            window._air_fade_preset_group.addButton(btn)
+            window._air_fade_preset_buttons[ms] = btn
+            preset_row.addWidget(btn)
+        fade_col_layout.addLayout(preset_row)
+        add_labeled("FADE", fade_col)
 
         res_wrap = QWidget()
         res_wrap.setFixedHeight(control_row_height)

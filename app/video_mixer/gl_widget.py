@@ -287,8 +287,181 @@ class MainGLWidget(MixerCanvasWidget):
         painter.end()
 
 
+def mapping_dest_polygon(mapping, width: int, height: int) -> "QPolygonF":
+    from PyQt6.QtGui import QPolygonF
+
+    w = float(max(1, width))
+    h = float(max(1, height))
+    pts = []
+    for x, y in mapping.corners():
+        pts.append(QPointF(x * w, y * h))
+    return QPolygonF(pts)
+
+
+def letterbox_norm_corners(model: MixerModel, width: int, height: int) -> list[tuple[float, float]]:
+    """Normalized corners of the letterboxed canvas rect inside a viewport."""
+    vw = max(1, width)
+    vh = max(1, height)
+    scale, ox, oy = view_params(model, vw, vh)
+    cw = float(model.canvas_width) * scale
+    ch = float(model.canvas_height) * scale
+    return [
+        (ox / vw, oy / vh),
+        ((ox + cw) / vw, oy / vh),
+        ((ox + cw) / vw, (oy + ch) / vh),
+        (ox / vw, (oy + ch) / vh),
+    ]
+
+
 class OutputGLWidget(MainGLWidget):
-    """Physical output view with the same Main crossfade."""
+    """Physical output with Main crossfade and optional projection mapping warp."""
+
+    def __init__(self, model: MixerModel, media_store: MediaStore, parent=None):
+        super().__init__(model, media_store, parent)
+        self.show_mapping_handles = False
+        self._canvas_plate: QPixmap | None = None
+
+    def _render_canvas_content(self, target: QPixmap | None = None) -> QPixmap:
+        """Program look at canvas resolution (fills the pixmap, no letterbox)."""
+        cw = max(1, int(self.model.canvas_width))
+        ch = max(1, int(self.model.canvas_height))
+        plate = target
+        if plate is None or plate.isNull() or plate.width() != cw or plate.height() != ch:
+            plate = QPixmap(cw, ch)
+        plate.fill(QColor("#000000"))
+        painter = QPainter(plate)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        scene = self._paint_scene()
+        if scene is not None:
+            for layer in scene.layers:
+                if not layer.visible or layer.file_missing:
+                    continue
+                media = self.media_store.get(layer.id)
+                if media is None or media.width <= 0:
+                    continue
+                t = layer.transform
+                painter.save()
+                painter.translate(t.x, t.y)
+                painter.rotate(t.rotation)
+                painter.scale(t.scale_x, t.scale_y)
+                painter.translate(-t.anchor_x * media.width, -t.anchor_y * media.height)
+                if media.pixmap is not None and not media.pixmap.isNull():
+                    painter.drawPixmap(0, 0, media.pixmap)
+                elif media.frame is not None:
+                    image = frame_to_qimage(media.frame)
+                    if image is not None and not image.isNull():
+                        painter.drawImage(0, 0, image)
+                painter.restore()
+        painter.end()
+        return plate
+
+    def _draw_mapped(self, painter: QPainter, plate: QPixmap) -> None:
+        from PyQt6.QtGui import QPolygonF, QTransform
+
+        mapping = self.model.output_mapping
+        vw = max(1, self.width())
+        vh = max(1, self.height())
+        if plate.isNull():
+            return
+        if not mapping.enabled or mapping.is_identity():
+            scale, ox, oy = view_params(self.model, vw, vh)
+            dest = QRectF(ox, oy, self.model.canvas_width * scale, self.model.canvas_height * scale)
+            painter.drawPixmap(dest.toRect(), plate)
+            return
+
+        src = QPolygonF(
+            [
+                QPointF(0.0, 0.0),
+                QPointF(float(plate.width()), 0.0),
+                QPointF(float(plate.width()), float(plate.height())),
+                QPointF(0.0, float(plate.height())),
+            ]
+        )
+        dst = mapping_dest_polygon(mapping, vw, vh)
+        xform = QTransform()
+        if not QTransform.quadToQuad(src, dst, xform):
+            painter.drawPixmap(self.rect(), plate)
+            return
+        painter.save()
+        painter.setTransform(xform, combine=True)
+        painter.drawPixmap(0, 0, plate)
+        painter.restore()
+
+    def _draw_mapping_overlay(self, painter: QPainter) -> None:
+        mapping = self.model.output_mapping
+        vw = max(1, self.width())
+        vh = max(1, self.height())
+        corners = mapping.corners() if (mapping.enabled and not mapping.is_identity()) else letterbox_norm_corners(
+            self.model, vw, vh
+        )
+        pts = [QPointF(x * vw, y * vh) for x, y in corners]
+        pen = QPen(QColor("#ffcc33"))
+        pen.setWidth(2)
+        painter.setPen(pen)
+        for i in range(4):
+            painter.drawLine(pts[i], pts[(i + 1) % 4])
+        painter.setBrush(QColor("#ffcc33"))
+        painter.setPen(QPen(QColor("#000000")))
+        for pt in pts:
+            painter.drawRect(QRectF(pt.x() - _HANDLE / 2, pt.y() - _HANDLE / 2, _HANDLE, _HANDLE))
+
+    def capture_current(self) -> QPixmap:
+        """Snapshot of what is currently shown (for crossfade)."""
+        dpr = max(1.0, float(self.devicePixelRatioF()))
+        width = max(1, round(self.width() * dpr))
+        height = max(1, round(self.height() * dpr))
+        plate = QPixmap(width, height)
+        plate.setDevicePixelRatio(1.0)
+        plate.fill(QColor("#000000"))
+        painter = QPainter(plate)
+        painter.scale(dpr, dpr)
+        content = self._render_canvas_content(self._canvas_plate)
+        self._canvas_plate = content
+        self._draw_mapped(painter, content)
+        painter.end()
+        plate.setDevicePixelRatio(dpr)
+        return plate
+
+    def paintEvent(self, event: QPaintEvent) -> None:
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
+        painter.fillRect(self.rect(), QColor("#000000"))
+
+        fading = self._fade_from is not None and (self._fade_t < 1.0 or self._hold_outgoing)
+        if fading and not self._fade_from.isNull():
+            # Outgoing was captured already mapped into widget space.
+            painter.setOpacity(1.0)
+            painter.drawPixmap(self.rect(), self._fade_from)
+            if not self._hold_outgoing and self._fade_t > 0.0:
+                content = self._render_canvas_content(self._canvas_plate)
+                self._canvas_plate = content
+                painter.setOpacity(self._fade_t)
+                # Draw incoming into an intermediate mapped plate for correct dissolve.
+                dpr = max(1.0, float(self.devicePixelRatioF()))
+                iw = max(1, round(self.width() * dpr))
+                ih = max(1, round(self.height() * dpr))
+                incoming = self._fade_incoming
+                if incoming is None or incoming.isNull() or incoming.width() != iw or incoming.height() != ih:
+                    incoming = QPixmap(iw, ih)
+                incoming.setDevicePixelRatio(1.0)
+                incoming.fill(QColor("#000000"))
+                ip = QPainter(incoming)
+                ip.scale(dpr, dpr)
+                self._draw_mapped(ip, content)
+                ip.end()
+                incoming.setDevicePixelRatio(dpr)
+                self._fade_incoming = incoming
+                painter.drawPixmap(self.rect(), incoming)
+            painter.setOpacity(1.0)
+        else:
+            content = self._render_canvas_content(self._canvas_plate)
+            self._canvas_plate = content
+            self._draw_mapped(painter, content)
+
+        if self.show_mapping_handles:
+            self._draw_mapping_overlay(painter)
+        painter.end()
 
 
 class PreviewGLWidget(MixerCanvasWidget):

@@ -227,6 +227,12 @@ QToolButton#mixerToolBtn:hover {
     background-color: {{colors.bg_control_hover}};
 }
 
+QToolButton#mixerToolBtn:checked,
+QToolButton#mixerToolBtn[segmentActive="true"] {
+    background-color: {{colors.accent}};
+    color: {{colors.text_on_accent}};
+}
+
 QToolButton#mixerFullscreenBtn {
     background-color: {{colors.bg_control}};
     color: {{colors.text_primary}};

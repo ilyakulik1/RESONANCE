@@ -4,7 +4,7 @@ import os
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QPoint, QMimeData
-from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QKeyEvent, QAction, QKeySequence
+from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QFont, QKeyEvent, QAction, QKeySequence, QShortcut
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow,
@@ -24,9 +24,15 @@ from app.audio_devices import (
 from app.audio_utils import is_audio_file
 from app.bpm_detector import BpmDetector
 from app.config import get_config_path
-from app.constants import APP_NAME, MAX_PLAYLISTS
+from app.constants import APP_NAME, MAX_PLAYLISTS, FADE_PRESET_SHORTCUTS, fade_preset_label
 from app.eq_state import EqState
-from app.midi import MidiHub, TARGET_MASTER_VOLUME, midi_available
+from app.midi import (
+    MidiHub,
+    TARGET_MASTER_VOLUME,
+    TARGET_ON_AIR,
+    TARGET_STOP,
+    midi_available,
+)
 from app.pcm_air_player import PcmAirPlayer
 from app.ui.about_dialog import show_about_dialog
 from app.ui.main_window_ui import MainWindowUi
@@ -291,7 +297,12 @@ class AudioPlayer(QMainWindow):
         self.resize(1280, 1150)
         self.load_project()
         self.load_config()
+        self._setup_fade_preset_shortcuts()
+        self._sync_air_fade_presets()
         self._set_output_volume(self._playback_volume)
+        mixer = getattr(self, "video_mixer", None)
+        if mixer is not None:
+            mixer.set_master_volume(self._playback_volume)
         self._set_preview_output_volume(self._preview_playback_volume)
         self._apply_browser_output_volume(self._browser_playback_volume)
         self.refresh_playlist_display()
@@ -379,6 +390,9 @@ class AudioPlayer(QMainWindow):
         if self._air_no_output:
             for output in self._outputs:
                 output.setMuted(True)
+            mixer = getattr(self, "video_mixer", None)
+            if mixer is not None:
+                mixer.apply_output_device()
             return
         device = find_audio_output(device_id)
         for output in self._outputs:
@@ -389,6 +403,9 @@ class AudioPlayer(QMainWindow):
         else:
             for output in self._outputs:
                 output.setVolume(self._playback_volume)
+        mixer = getattr(self, "video_mixer", None)
+        if mixer is not None:
+            mixer.apply_output_device()
 
     def _apply_preview_output_from_id(self, device_id: bytes | None) -> None:
         self._preview_no_output = is_no_output_device(device_id)
@@ -462,6 +479,34 @@ class AudioPlayer(QMainWindow):
 
     def setup_shortcuts(self):
         QApplication.instance().installEventFilter(self)
+
+    def _setup_fade_preset_shortcuts(self) -> None:
+        for sequence, preset_ms in FADE_PRESET_SHORTCUTS:
+            shortcut = QShortcut(QKeySequence(sequence), self)
+            shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
+            shortcut.activated.connect(lambda ms=preset_ms: self.apply_fade_preset(ms))
+
+    def apply_fade_preset(self, ms: int) -> None:
+        ms = max(0, min(5000, int(ms)))
+        self.fade_duration_spin.blockSignals(True)
+        self.fade_duration_spin.setValue(ms)
+        self.fade_duration_spin.blockSignals(False)
+        self._sync_air_fade_presets()
+
+    def _sync_air_fade_presets(self) -> None:
+        buttons = getattr(self, "_air_fade_preset_buttons", None)
+        if not buttons:
+            return
+        current = int(self.fade_duration_spin.value())
+        for preset_ms, btn in buttons.items():
+            active = preset_ms == current
+            btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(False)
+            btn.setProperty("segmentActive", active)
+            style = btn.style()
+            style.unpolish(btn)
+            style.polish(btn)
 
     def _is_editing_playlist(self) -> bool:
         for playlist in self.playlists:
@@ -1197,6 +1242,9 @@ class AudioPlayer(QMainWindow):
             self._apply_timeline_volume(self.player.position())
         else:
             self._set_output_volume(volume)
+        mixer = getattr(self, "video_mixer", None)
+        if mixer is not None:
+            mixer.set_master_volume(volume)
         if not hasattr(self, "_master_volume_save_timer"):
             self._master_volume_save_timer = QTimer(self)
             self._master_volume_save_timer.setSingleShot(True)
@@ -2813,10 +2861,29 @@ class AudioPlayer(QMainWindow):
         self._midi.ccReceived.connect(self._on_midi_cc)
         self._midi.learnChanged.connect(self._on_midi_learn_changed)
         self._midi.bindingChanged.connect(self._on_midi_binding_changed)
+        self._midi.buttonTriggered.connect(self._on_midi_button_triggered)
         knob = self.file_properties_panel.master_knob
         knob.midiLearnRequested.connect(self._midi_learn_master)
         knob.midiLearnCancelRequested.connect(self._midi.cancel_learn)
         knob.midiClearRequested.connect(self._midi_clear_master)
+        self._midi_button_meta = {
+            TARGET_ON_AIR: (
+                self.btn_space,
+                "Load preview to air (same as Space key)",
+            ),
+            TARGET_STOP: (
+                self.btn_stop,
+                "Stop",
+            ),
+        }
+        for target, (button, base_tip) in self._midi_button_meta.items():
+            if button is None:
+                continue
+            button.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            button.customContextMenuRequested.connect(
+                lambda pos, t=target, b=button: self._show_midi_button_menu(b, t, pos)
+            )
+            self._refresh_midi_button_ui(target, base_tip)
         self._midi.start()
 
     def _setup_midi_menu(self) -> None:
@@ -2828,6 +2895,27 @@ class AudioPlayer(QMainWindow):
         self._midi_clear_act = QAction("Clear Master Volume mapping", self)
         self._midi_clear_act.triggered.connect(self._midi_clear_master)
         menu.addAction(self._midi_clear_act)
+        menu.addSeparator()
+        self._midi_learn_on_air_act = QAction("Learn ON AIR", self)
+        self._midi_learn_on_air_act.triggered.connect(
+            lambda: self._midi_learn_button(TARGET_ON_AIR)
+        )
+        menu.addAction(self._midi_learn_on_air_act)
+        self._midi_clear_on_air_act = QAction("Clear ON AIR mapping", self)
+        self._midi_clear_on_air_act.triggered.connect(
+            lambda: self._midi_clear_button(TARGET_ON_AIR)
+        )
+        menu.addAction(self._midi_clear_on_air_act)
+        self._midi_learn_stop_act = QAction("Learn Stop", self)
+        self._midi_learn_stop_act.triggered.connect(
+            lambda: self._midi_learn_button(TARGET_STOP)
+        )
+        menu.addAction(self._midi_learn_stop_act)
+        self._midi_clear_stop_act = QAction("Clear Stop mapping", self)
+        self._midi_clear_stop_act.triggered.connect(
+            lambda: self._midi_clear_button(TARGET_STOP)
+        )
+        menu.addAction(self._midi_clear_stop_act)
         menu.addSeparator()
         refresh = QAction("Refresh MIDI inputs", self)
         refresh.triggered.connect(self._midi_refresh_inputs)
@@ -2846,14 +2934,25 @@ class AudioPlayer(QMainWindow):
         self._midi_learn_act.setText(
             "Cancel MIDI Learn" if learning else "Learn Master Volume"
         )
+        for target, clear_act, learn_act, label in (
+            (TARGET_ON_AIR, self._midi_clear_on_air_act, self._midi_learn_on_air_act, "ON AIR"),
+            (TARGET_STOP, self._midi_clear_stop_act, self._midi_learn_stop_act, "Stop"),
+        ):
+            binding = self._midi.binding_for(target) if hasattr(self, "_midi") else None
+            if binding is None:
+                clear_act.setText(f"Clear {label} mapping")
+                clear_act.setEnabled(False)
+            else:
+                clear_act.setText(f"Clear {label} ({binding.label()})")
+                clear_act.setEnabled(True)
+            learn_act.setText(
+                "Cancel MIDI Learn"
+                if learning and self._midi.learn_target == target
+                else f"Learn {label}"
+            )
 
     def _midi_learn_master(self) -> None:
-        if not midi_available():
-            QMessageBox.warning(
-                self,
-                "MIDI",
-                "MIDI support needs python-rtmidi.\nInstall with: pip install python-rtmidi",
-            )
+        if not self._ensure_midi_available():
             return
         if not hasattr(self, "_midi"):
             return
@@ -2862,9 +2961,76 @@ class AudioPlayer(QMainWindow):
             return
         self._midi.start_learn(TARGET_MASTER_VOLUME)
 
+    def _midi_learn_button(self, target: str) -> None:
+        if not self._ensure_midi_available():
+            return
+        if not hasattr(self, "_midi"):
+            return
+        if self._midi.learn_target == target:
+            self._midi.cancel_learn()
+            return
+        if self._midi.learn_target:
+            self._midi.cancel_learn()
+        self._midi.start_learn(target)
+
     def _midi_clear_master(self) -> None:
         if hasattr(self, "_midi"):
             self._midi.clear_binding(TARGET_MASTER_VOLUME)
+
+    def _midi_clear_button(self, target: str) -> None:
+        if hasattr(self, "_midi"):
+            self._midi.clear_binding(target)
+
+    def _ensure_midi_available(self) -> bool:
+        if midi_available():
+            return True
+        QMessageBox.warning(
+            self,
+            "MIDI",
+            "MIDI support needs python-rtmidi.\nInstall with: pip install python-rtmidi",
+        )
+        return False
+
+    def _show_midi_button_menu(self, button, target: str, pos) -> None:
+        menu = QMenu(button)
+        learning = hasattr(self, "_midi") and self._midi.learn_target == target
+        if learning:
+            menu.addAction("Cancel MIDI Learn", self._midi.cancel_learn)
+        else:
+            menu.addAction(
+                "MIDI Learn…",
+                lambda: self._midi_learn_button(target),
+            )
+            binding = self._midi.binding_for(target) if hasattr(self, "_midi") else None
+            clear = menu.addAction("Clear MIDI mapping")
+            clear.setEnabled(binding is not None)
+            clear.triggered.connect(lambda: self._midi_clear_button(target))
+        menu.exec(button.mapToGlobal(pos))
+
+    def _refresh_midi_button_ui(self, target: str, base_tooltip: str) -> None:
+        meta = getattr(self, "_midi_button_meta", {}).get(target)
+        if meta is None:
+            return
+        button, _base = meta
+        if button is None:
+            return
+        binding = self._midi.binding_for(target) if hasattr(self, "_midi") else None
+        learning = hasattr(self, "_midi") and self._midi.learn_target == target
+        button.setProperty("midiLearn", learning)
+        style = button.style()
+        style.unpolish(button)
+        style.polish(button)
+        if learning:
+            tip = f"{base_tooltip} · нажмите MIDI-кнопку (Note) или CC"
+        elif binding is not None:
+            tip = f"{base_tooltip} · MIDI {binding.label()} · right-click to reassign"
+        else:
+            tip = f"{base_tooltip} · right-click for MIDI Learn"
+        button.setToolTip(tip)
+
+    def _refresh_all_midi_button_ui(self) -> None:
+        for target, (_, base_tip) in getattr(self, "_midi_button_meta", {}).items():
+            self._refresh_midi_button_ui(target, base_tip)
 
     def _midi_refresh_inputs(self) -> None:
         if hasattr(self, "_midi"):
@@ -2873,19 +3039,35 @@ class AudioPlayer(QMainWindow):
     def _on_midi_learn_changed(self, target: str) -> None:
         knob = self.file_properties_panel.master_knob
         knob.set_learning(target == TARGET_MASTER_VOLUME)
+        self._refresh_all_midi_button_ui()
 
-    def _on_midi_binding_changed(self, _target: str) -> None:
-        binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
-        self.file_properties_panel.master_knob.set_midi_binding_label(
-            None if binding is None else binding.label()
-        )
+    def _on_midi_binding_changed(self, target: str) -> None:
+        if target == TARGET_MASTER_VOLUME:
+            binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
+            self.file_properties_panel.master_knob.set_midi_binding_label(
+                None if binding is None else binding.label()
+            )
+        if target in getattr(self, "_midi_button_meta", {}):
+            _, base_tip = self._midi_button_meta[target]
+            self._refresh_midi_button_ui(target, base_tip)
         self.save_config()
+
+    def _on_midi_button_triggered(self, target: str) -> None:
+        if target == TARGET_ON_AIR:
+            self.handle_space()
+        elif target == TARGET_STOP:
+            self.stop()
 
     def _on_midi_cc(self, channel: int, cc: int, value: int) -> None:
         if not hasattr(self, "_midi"):
             return
         binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
-        if binding is None or binding.cc != cc or binding.channel != channel:
+        if (
+            binding is None
+            or binding.kind != "cc"
+            or binding.number != cc
+            or binding.channel != channel
+        ):
             return
         volume = max(0.0, min(1.0, int(value) / 127.0))
         self.file_properties_panel.set_master_volume(volume)
@@ -3582,6 +3764,7 @@ class AudioPlayer(QMainWindow):
 
             if "fade_duration_ms" in config:
                 self.fade_duration_spin.setValue(config["fade_duration_ms"])
+                self._sync_air_fade_presets()
 
             if "high_cut_q" in config and hasattr(self, "high_cut_q_stepper"):
                 try:
@@ -3610,6 +3793,7 @@ class AudioPlayer(QMainWindow):
                 self.file_properties_panel.master_knob.set_midi_binding_label(
                     None if binding is None else binding.label()
                 )
+                self._refresh_all_midi_button_ui()
 
             if "waveform_res_enabled" in config:
                 self._waveform_res_enabled = bool(config["waveform_res_enabled"])

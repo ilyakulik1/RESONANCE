@@ -5,6 +5,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QDragEnterEvent, QDropEvent, QMouseEvent, QPixmap, QResizeEvent
 from PyQt6.QtWidgets import (
+    QButtonGroup,
     QComboBox,
     QFrame,
     QGridLayout,
@@ -31,7 +32,13 @@ from app.video_mixer.gl_widget import MainGLWidget, PreviewGLWidget
 from app.video_mixer.layer_list import LayerListWidget
 from app.video_mixer.media_store import MediaStore
 from app.video_mixer.media_utils import is_media_file
-from app.video_mixer.model import MixerModel, MAX_SCENES
+from app.video_mixer.model import (
+    MixerModel,
+    MAX_SCENES,
+    TRANSITION_PRESETS_MS,
+    TRANSITION_PRESET_SHORTCUTS,
+    transition_preset_label,
+)
 
 
 def _format_ms(ms: int) -> str:
@@ -174,6 +181,8 @@ class VideoMixerPanel(QWidget):
     mainSceneRequested = pyqtSignal(str)
     clearPreviewRequested = pyqtSignal()
     fullscreenRequested = pyqtSignal()
+    mappingRequested = pyqtSignal()
+    transitionPresetChanged = pyqtSignal(int)
 
     def __init__(self, model: MixerModel, media_store: MediaStore, parent=None):
         super().__init__(parent)
@@ -231,11 +240,24 @@ class VideoMixerPanel(QWidget):
         self.btn_fullscreen.setMinimumWidth(88)
         self.btn_fullscreen.clicked.connect(self.fullscreenRequested.emit)
         out_layout.addWidget(self.btn_fullscreen)
+        self.btn_mapping = QToolButton()
+        self.btn_mapping.setObjectName("mixerFullscreenBtn")
+        self.btn_mapping.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.btn_mapping.setText("Map")
+        self.btn_mapping.setToolTip("Projection mapping — transform main screen on output")
+        self.btn_mapping.setMinimumWidth(56)
+        self.btn_mapping.clicked.connect(self.mappingRequested.emit)
+        out_layout.addWidget(self.btn_mapping)
         # Keep legacy name for controller menu fallback
         self.btn_output = self.btn_fullscreen
         root.addWidget(out_bar)
 
         # SCREEN resolution + transition duration
+        screen_section = QWidget()
+        screen_section_layout = QVBoxLayout(screen_section)
+        screen_section_layout.setContentsMargins(0, 0, 0, 0)
+        screen_section_layout.setSpacing(4)
+
         screen_bar = QFrame()
         screen_bar.setObjectName("screenResBar")
         screen_layout = QHBoxLayout(screen_bar)
@@ -262,13 +284,50 @@ class VideoMixerPanel(QWidget):
         self.transition_ms = FloatValueStepper(
             self, 0, 10000, float(self.model.transition_ms), step=50, decimals=0, value_width=56
         )
-        self.transition_ms.setToolTip("Crossfade duration in milliseconds")
+        shortcut_hint = ", ".join(seq for seq, _ms in TRANSITION_PRESET_SHORTCUTS)
+        self.transition_ms.setToolTip(
+            f"Video scene crossfade in milliseconds · presets: {shortcut_hint}"
+        )
         screen_layout.addWidget(self.transition_ms)
         ms_label = QLabel("ms")
         ms_label.setObjectName("propAxis")
         screen_layout.addWidget(ms_label)
         screen_layout.addStretch(1)
-        root.addWidget(screen_bar)
+        screen_section_layout.addWidget(screen_bar)
+
+        preset_bar = QFrame()
+        preset_bar.setObjectName("screenResBar")
+        preset_layout = QHBoxLayout(preset_bar)
+        preset_layout.setContentsMargins(4, 0, 4, 4)
+        preset_layout.setSpacing(4)
+        preset_title = QLabel("FADE PRESETS")
+        preset_title.setObjectName("propTitle")
+        preset_layout.addWidget(preset_title)
+        self._transition_preset_group = QButtonGroup(self)
+        self._transition_preset_group.setExclusive(True)
+        self._transition_preset_buttons: dict[int, QToolButton] = {}
+        for index, ms in enumerate(TRANSITION_PRESETS_MS):
+            btn = QToolButton()
+            btn.setObjectName("mixerToolBtn")
+            btn.setCheckable(True)
+            btn.setAutoRaise(True)
+            btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            btn.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+            btn.setText(transition_preset_label(ms))
+            btn.setMinimumWidth(40)
+            if index < len(TRANSITION_PRESET_SHORTCUTS):
+                shortcut, _preset = TRANSITION_PRESET_SHORTCUTS[index]
+                btn.setToolTip(f"Transition {ms} ms · {shortcut}")
+            else:
+                btn.setToolTip(f"Transition {ms} ms")
+            btn.clicked.connect(lambda _checked=False, value=ms: self.apply_transition_preset(value))
+            self._transition_preset_group.addButton(btn)
+            self._transition_preset_buttons[ms] = btn
+            preset_layout.addWidget(btn)
+        preset_layout.addStretch(1)
+        screen_section_layout.addWidget(preset_bar)
+        self.sync_transition_presets()
+        root.addWidget(screen_section)
 
         # MAIN + PREVIEW in resizable top section
         screens = QWidget()
@@ -666,6 +725,31 @@ class VideoMixerPanel(QWidget):
         if self._updating_props:
             return
         self.model.set_transition_ms(int(value))
+        self.sync_transition_presets()
+
+    def apply_transition_preset(self, ms: int) -> None:
+        ms = max(0, min(10000, int(ms)))
+        self._updating_props = True
+        try:
+            self.transition_ms.set_value(float(ms))
+            self.model.set_transition_ms(ms)
+        finally:
+            self._updating_props = False
+        self.sync_transition_presets()
+        self.transitionPresetChanged.emit(ms)
+
+    def sync_transition_presets(self) -> None:
+        current = int(self.model.transition_ms)
+        for preset_ms, btn in self._transition_preset_buttons.items():
+            active = preset_ms == current
+            btn.blockSignals(True)
+            btn.setChecked(active)
+            btn.blockSignals(False)
+            btn.setProperty("segmentActive", active)
+            style = btn.style()
+            style.unpolish(btn)
+            style.polish(btn)
+        self.update()
 
     def _fit_selected(self, mode: str) -> None:
         layer = self.model.selected_layer()
@@ -888,6 +972,7 @@ class VideoMixerPanel(QWidget):
         self.canvas_w.set_value(float(self.model.canvas_width))
         self.canvas_h.set_value(float(self.model.canvas_height))
         self.transition_ms.set_value(float(self.model.transition_ms))
+        self.sync_transition_presets()
         enabled = layer is not None
         for w in (
             self.pos_x,

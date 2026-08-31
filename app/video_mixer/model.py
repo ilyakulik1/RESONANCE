@@ -9,6 +9,7 @@ from typing import Literal
 from PyQt6.QtCore import QObject, pyqtSignal
 
 from app.config import get_config_path
+from app.constants import FADE_PRESETS_MS, VIDEO_TRANSITION_PRESET_SHORTCUTS, fade_preset_label
 from app.video_mixer.media_utils import media_kind
 
 PlaybackMode = Literal["loop", "stop"]
@@ -20,6 +21,10 @@ DEFAULT_CANVAS_WIDTH = 1920
 DEFAULT_CANVAS_HEIGHT = 1080
 MAX_SCENES = 64
 DEFAULT_LOOP_FADE_MS = 400
+DEFAULT_TRANSITION_MS = 400
+TRANSITION_PRESETS_MS = FADE_PRESETS_MS
+TRANSITION_PRESET_SHORTCUTS = VIDEO_TRANSITION_PRESET_SHORTCUTS
+transition_preset_label = fade_preset_label
 
 
 def _new_id() -> str:
@@ -51,6 +56,110 @@ class LayerTransform:
             scale_y=float(data.get("scale_y", 1.0)),
             anchor_x=float(data.get("anchor_x", 0.5)),
             anchor_y=float(data.get("anchor_y", 0.5)),
+        )
+
+
+@dataclass
+class OutputMapping:
+    """Projection map of the main canvas onto the physical output (normalized 0..1).
+
+    Corners are TL, TR, BR, BL in output-window space. Identity = full screen.
+    """
+
+    tl: tuple[float, float] = (0.0, 0.0)
+    tr: tuple[float, float] = (1.0, 0.0)
+    br: tuple[float, float] = (1.0, 1.0)
+    bl: tuple[float, float] = (0.0, 1.0)
+    enabled: bool = True
+
+    @staticmethod
+    def identity() -> OutputMapping:
+        return OutputMapping()
+
+    def corners(self) -> list[tuple[float, float]]:
+        return [self.tl, self.tr, self.br, self.bl]
+
+    def set_corner(self, index: int, x: float, y: float) -> None:
+        pt = (float(x), float(y))
+        if index == 0:
+            self.tl = pt
+        elif index == 1:
+            self.tr = pt
+        elif index == 2:
+            self.br = pt
+        elif index == 3:
+            self.bl = pt
+
+    def is_identity(self, eps: float = 1e-4) -> bool:
+        expected = [(0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0)]
+        for (ax, ay), (bx, by) in zip(self.corners(), expected):
+            if abs(ax - bx) > eps or abs(ay - by) > eps:
+                return False
+        return True
+
+    def reset(self) -> None:
+        self.tl = (0.0, 0.0)
+        self.tr = (1.0, 0.0)
+        self.br = (1.0, 1.0)
+        self.bl = (0.0, 1.0)
+
+    def scale_about_center(self, factor: float) -> None:
+        """Uniform scale of the mapped quad around its centroid."""
+        factor = max(0.05, float(factor))
+        pts = self.corners()
+        cx = sum(p[0] for p in pts) / 4.0
+        cy = sum(p[1] for p in pts) / 4.0
+        scaled = [((x - cx) * factor + cx, (y - cy) * factor + cy) for x, y in pts]
+        self.tl, self.tr, self.br, self.bl = scaled  # type: ignore[misc]
+
+    def scale_x_about_center(self, factor: float) -> None:
+        """Horizontal scale around the quad centroid."""
+        factor = max(0.05, float(factor))
+        pts = self.corners()
+        cx = sum(p[0] for p in pts) / 4.0
+        scaled = [((x - cx) * factor + cx, y) for x, y in pts]
+        self.tl, self.tr, self.br, self.bl = scaled  # type: ignore[misc]
+
+    def scale_y_about_center(self, factor: float) -> None:
+        """Vertical scale around the quad centroid."""
+        factor = max(0.05, float(factor))
+        pts = self.corners()
+        cy = sum(p[1] for p in pts) / 4.0
+        scaled = [(x, (y - cy) * factor + cy) for x, y in pts]
+        self.tl, self.tr, self.br, self.bl = scaled  # type: ignore[misc]
+
+    def translate(self, dx: float, dy: float) -> None:
+        self.tl = (self.tl[0] + dx, self.tl[1] + dy)
+        self.tr = (self.tr[0] + dx, self.tr[1] + dy)
+        self.br = (self.br[0] + dx, self.br[1] + dy)
+        self.bl = (self.bl[0] + dx, self.bl[1] + dy)
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "tl": list(self.tl),
+            "tr": list(self.tr),
+            "br": list(self.br),
+            "bl": list(self.bl),
+        }
+
+    @staticmethod
+    def _pair(data: dict, key: str, default: tuple[float, float]) -> tuple[float, float]:
+        raw = data.get(key, default)
+        if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+            return float(raw[0]), float(raw[1])
+        return default
+
+    @classmethod
+    def from_dict(cls, data: dict | None) -> OutputMapping:
+        if not isinstance(data, dict):
+            return cls.identity()
+        return cls(
+            tl=cls._pair(data, "tl", (0.0, 0.0)),
+            tr=cls._pair(data, "tr", (1.0, 0.0)),
+            br=cls._pair(data, "br", (1.0, 1.0)),
+            bl=cls._pair(data, "bl", (0.0, 1.0)),
+            enabled=bool(data.get("enabled", True)),
         )
 
 
@@ -184,6 +293,7 @@ class MixerModel(QObject):
     layerSelected = pyqtSignal(object)  # layer id or None
     layerTransformChanged = pyqtSignal(str)
     playbackChanged = pyqtSignal(str)
+    outputMappingChanged = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -200,9 +310,10 @@ class MixerModel(QObject):
         self.capture_program_look()
         self.selected_layer_id: str | None = None
         self.output_screen_name: str | None = None
+        self.output_mapping: OutputMapping = OutputMapping.identity()
         self.panel_collapsed: bool = False
         self.panel_width: int = 360
-        self.transition_ms: int = 400
+        self.transition_ms: int = DEFAULT_TRANSITION_MS
         self.preload_ms: int = 200
         self.splitter_main: list[int] | None = None
         self.splitter_panel: list[int] | None = None
@@ -526,6 +637,11 @@ class MixerModel(QObject):
         if layer is None:
             return
         layer.muted = bool(muted)
+        if self.program_look is not None:
+            for prog_layer in self.program_look.layers:
+                if prog_layer.id == layer_id:
+                    prog_layer.muted = bool(muted)
+                    break
         self.changed.emit()
 
     def main_scene_has_audible_video(self) -> bool:
@@ -552,6 +668,37 @@ class MixerModel(QObject):
             if hasattr(t, key):
                 setattr(t, key, float(value))
         self.layerTransformChanged.emit(layer_id)
+
+    def set_output_mapping(self, mapping: OutputMapping, *, emit_changed: bool = True) -> None:
+        self.output_mapping = mapping
+        self.outputMappingChanged.emit()
+        if emit_changed:
+            self.changed.emit()
+
+    def update_output_mapping_corner(self, index: int, x: float, y: float) -> None:
+        self.output_mapping.set_corner(index, x, y)
+        self.outputMappingChanged.emit()
+
+    def reset_output_mapping(self) -> None:
+        self.output_mapping.reset()
+        self.outputMappingChanged.emit()
+        self.changed.emit()
+
+    def scale_output_mapping(self, factor: float) -> None:
+        self.output_mapping.scale_about_center(factor)
+        self.outputMappingChanged.emit()
+
+    def scale_output_mapping_x(self, factor: float) -> None:
+        self.output_mapping.scale_x_about_center(factor)
+        self.outputMappingChanged.emit()
+
+    def scale_output_mapping_y(self, factor: float) -> None:
+        self.output_mapping.scale_y_about_center(factor)
+        self.outputMappingChanged.emit()
+
+    def translate_output_mapping(self, dx: float, dy: float) -> None:
+        self.output_mapping.translate(dx, dy)
+        self.outputMappingChanged.emit()
 
     def set_playback(self, layer_id: str, mode: PlaybackMode) -> None:
         layer = self.find_layer(layer_id)
@@ -605,6 +752,7 @@ class MixerModel(QObject):
             "active_scene_id": self.preview_scene_id,
             "selected_layer_id": self.selected_layer_id,
             "output_screen_name": self.output_screen_name,
+            "output_mapping": self.output_mapping.to_dict(),
             "panel_collapsed": self.panel_collapsed,
             "panel_width": self.panel_width,
             "transition_ms": self.transition_ms,
@@ -621,9 +769,10 @@ class MixerModel(QObject):
         self.output_screen_name = data.get("output_screen_name")
         if isinstance(self.output_screen_name, str) and not self.output_screen_name:
             self.output_screen_name = None
+        self.output_mapping = OutputMapping.from_dict(data.get("output_mapping"))
         self.panel_collapsed = bool(data.get("panel_collapsed", False))
         self.panel_width = int(data.get("panel_width", 360))
-        self.transition_ms = max(0, min(10000, int(data.get("transition_ms", 400))))
+        self.transition_ms = max(0, min(10000, int(data.get("transition_ms", DEFAULT_TRANSITION_MS))))
         self.preload_ms = max(0, min(5000, int(data.get("preload_ms", 200))))
         self.pending_main_scene_id = None
 
