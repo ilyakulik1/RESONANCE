@@ -1,0 +1,16 @@
+{
+  "name": "RESONANCE Remote",
+  "short_name": "RESONANCE",
+  "display": "standalone",
+  "background_color": "#141414",
+  "theme_color": "#141414",
+  "start_url": "/",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

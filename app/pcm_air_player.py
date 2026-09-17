@@ -229,6 +229,8 @@ class PcmAirPlayer(QObject):
             STEM_VOCALS: 1.0,
             STEM_INSTRUMENTAL: 1.0,
         }
+        # +1 keep vocals polarity, -1 invert. None until the first audible chunk.
+        self._stem_vocals_sign: np.float32 | None = None
         self._stem_pending = {
             STEM_VOCALS: np.zeros(0, dtype=np.float32),
             STEM_INSTRUMENTAL: np.zeros(0, dtype=np.float32),
@@ -239,6 +241,10 @@ class PcmAirPlayer(QObject):
         self._high_cut_duration_ms = 0
         self._high_cut_on_complete = None
         self._high_cut_ui_active = False
+        self._master_fx = None
+        self._master_fx_copy = 0
+        self._master_eq = None
+        self._master_eq_state: EqState | None = None
 
         self._sample_rate = 44100
         self._sink: QAudioSink | None = None
@@ -422,6 +428,26 @@ class PcmAirPlayer(QObject):
         self._set_playback_state(QMediaPlayer.PlaybackState.StoppedState)
         self.positionChanged.emit(0)
 
+    def set_master_fx(self, host, copy_index: int = 0) -> None:
+        """Attach a MasterFxHost copy that runs after track EQ / stems / gain."""
+        self._master_fx = host
+        self._master_fx_copy = int(copy_index)
+
+    def set_master_eq(self, eq_processor: EqProcessor, state_dict: dict | None = None) -> None:
+        """Attach the shared EqProcessor for master EQ processing."""
+        self._master_eq = eq_processor
+        if state_dict and isinstance(state_dict, dict) and state_dict.get("bands"):
+            self._master_eq_state = EqState.from_dict(state_dict)
+        else:
+            self._master_eq_state = None
+
+    def refresh_master_eq(self) -> None:
+        """Refresh master EQ state from the shared processor."""
+        if self._master_eq is not None and self._master_eq._filters:
+            # Create a state from current filters by reading coefficients
+            # This is a fallback; real state should come from UI
+            pass
+
     def set_eq_state(self, state: EqState | None) -> None:
         """Live coefficient swap — no pipeline restart."""
         self._eq_state = state or EqState()
@@ -488,7 +514,8 @@ class PcmAirPlayer(QObject):
     def set_stem_eq_state(self, stem_id: str, state: EqState | None) -> None:
         if stem_id not in self._stem_eq:
             return
-        eq_state = state or EqState()
+        # Copy so Vocal / Inst never share the live UI EqState object.
+        eq_state = EqState.from_dict((state or EqState()).to_dict())
         self._stem_eq_state[stem_id] = eq_state
         self._stem_eq[stem_id].set_state(eq_state)
 
@@ -610,6 +637,12 @@ class PcmAirPlayer(QObject):
             proc.set_sample_rate(float(self._sample_rate))
             proc.set_state(self._stem_eq_state.get(stem_id) or EqState())
         self._high_cut.set_sample_rate(float(self._sample_rate))
+        if self._master_fx is not None:
+            self._master_fx.set_sample_rate(float(self._sample_rate))
+        if self._master_eq is not None:
+            self._master_eq.set_sample_rate(float(self._sample_rate))
+            if self._master_eq_state is not None:
+                self._master_eq.set_state(self._master_eq_state)
 
         if self._sink is not None and getattr(self, "_sink_rate", None) == rate:
             try:
@@ -654,6 +687,7 @@ class PcmAirPlayer(QObject):
             STEM_VOCALS: np.zeros(0, dtype=np.float32),
             STEM_INSTRUMENTAL: np.zeros(0, dtype=np.float32),
         }
+        self._stem_vocals_sign = None
         self._byte_pending.clear()
 
     def _stop_pipeline(self, *, destroy_sink: bool = False) -> None:
@@ -747,11 +781,21 @@ class PcmAirPlayer(QObject):
             frame_samples = _CHUNK_FRAMES * _TARGET_CHANNELS
 
             while not self._decode_stop.is_set() and generation == self._generation:
-                if vocals_reader.exhausted and inst_reader.exhausted and pending_v.size == 0:
+                if (
+                    vocals_reader.exhausted
+                    and inst_reader.exhausted
+                    and pending_v.size == 0
+                    and pending_i.size == 0
+                ):
                     break
                 v = vocals_reader.read_interleaved(src_chunk)
                 i = inst_reader.read_interleaved(src_chunk)
-                if v.size == 0 and i.size == 0 and pending_v.size == 0:
+                if (
+                    v.size == 0
+                    and i.size == 0
+                    and pending_v.size == 0
+                    and pending_i.size == 0
+                ):
                     break
                 n = max(v.size, i.size)
                 if n:
@@ -765,7 +809,12 @@ class PcmAirPlayer(QObject):
                     pending_v = np.concatenate([pending_v, v]) if pending_v.size else v
                     pending_i = np.concatenate([pending_i, i]) if pending_i.size else i
 
-                while pending_v.size >= frame_samples:
+                # Wait until both stems have a full frame. Slicing a short
+                # instrumental buffer desyncs the pair and the minus vanishes.
+                while (
+                    pending_v.size >= frame_samples
+                    and pending_i.size >= frame_samples
+                ):
                     if self._decode_stop.is_set() or generation != self._generation:
                         return
                     vb = pending_v[:frame_samples].copy()
@@ -781,7 +830,11 @@ class PcmAirPlayer(QObject):
                 if vocals_reader.exhausted and inst_reader.exhausted:
                     break
 
-            if pending_v.size and not self._decode_stop.is_set() and generation == self._generation:
+            if (
+                (pending_v.size or pending_i.size)
+                and not self._decode_stop.is_set()
+                and generation == self._generation
+            ):
                 n = max(pending_v.size, pending_i.size)
                 if pending_v.size < n:
                     pending_v = np.pad(pending_v, (0, n - pending_v.size))
@@ -826,6 +879,10 @@ class PcmAirPlayer(QObject):
         self._eq.reset()
         for proc in self._stem_eq.values():
             proc.reset()
+        if self._master_fx is not None:
+            self._master_fx.reset_copy(self._master_fx_copy)
+        if self._master_eq is not None:
+            self._master_eq.reset()
         self._seek_frame = int(start_ms * self._sample_rate / 1000.0)
         self._frames_played = 0
         self._frames_decoded = 0
@@ -1082,6 +1139,23 @@ class PcmAirPlayer(QObject):
                     self._stem_pending[stem_id] = block
         return hit_eof
 
+    @staticmethod
+    def _vocals_mix_sign(vocals: np.ndarray, instrumental: np.ndarray) -> np.float32:
+        """Pick vocals polarity so the pair sums instead of cancelling.
+
+        UVR MDX Inst HQ 5 often writes the secondary stem inverted. On tracks
+        like Sexy Makeba that makes vocals ≈ −instrumental, and 0 dB + 0 dB
+        plays as near-silence.
+        """
+        if vocals.size == 0 or instrumental.size == 0:
+            return np.float32(1.0)
+        energy = float(np.mean(np.square(vocals))) + float(np.mean(np.square(instrumental)))
+        if energy < 1e-8:
+            return np.float32(1.0)
+        sum_e = float(np.mean(np.square(vocals + instrumental)))
+        diff_e = float(np.mean(np.square(vocals - instrumental)))
+        return np.float32(-1.0 if diff_e > sum_e * 1.05 else 1.0)
+
     def _mix_stems(self, n_samples: int) -> np.ndarray | None:
         """Take n interleaved samples from each stem, EQ+gain, sum."""
         n_samples -= n_samples % _TARGET_CHANNELS
@@ -1096,7 +1170,7 @@ class PcmAirPlayer(QObject):
         if take <= 0:
             return None
 
-        mixed = None
+        processed: dict[str, np.ndarray] = {}
         for stem_id in (STEM_VOCALS, STEM_INSTRUMENTAL):
             dry = self._stem_pending[stem_id][:take]
             self._stem_pending[stem_id] = self._stem_pending[stem_id][take:]
@@ -1104,43 +1178,91 @@ class PcmAirPlayer(QObject):
             gain = float(self._stem_gain.get(stem_id, 1.0))
             if gain != 1.0:
                 wet = wet * np.float32(gain)
-            if mixed is None:
-                mixed = wet
-            else:
-                mixed = mixed + wet
+            processed[stem_id] = wet
+
+        vocals = processed[STEM_VOCALS]
+        instrumental = processed[STEM_INSTRUMENTAL]
+        if self._stem_vocals_sign is None:
+            v_e = float(np.mean(np.square(vocals)))
+            i_e = float(np.mean(np.square(instrumental)))
+            if v_e > 1e-8 and i_e > 1e-8:
+                self._stem_vocals_sign = self._vocals_mix_sign(vocals, instrumental)
+        if self._stem_vocals_sign is not None and self._stem_vocals_sign < 0:
+            vocals = -vocals
+        mixed = vocals + instrumental
+        # Two 0 dBFS stems sum past 1.0; hard-clip in _emit_wet_pcm then
+        # buries the instrumental under the vocals. Peak-limit instead.
+        if mixed.size:
+            peak = float(np.max(np.abs(mixed)))
+            if peak > 0.99:
+                mixed = mixed * np.float32(0.99 / peak)
         return mixed
 
-    def _read_audio_bytes(self, maxlen: int) -> bytes:
-        if maxlen <= 0:
-            return b""
+    def prefetch_pcm_ms(self, milliseconds: int) -> None:
+        """Render extra output so a later GIL stall does not underrun.
 
+        Releases the audio lock between chunks so QAudioSink can keep pulling.
+        """
+        if self._sample_rate <= 0 or milliseconds <= 0:
+            return
+        if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        target = int(self._sample_rate * milliseconds / 1000.0) * _TARGET_CHANNELS * 2
+        for _ in range(48):
+            with self._lock:
+                if len(self._byte_pending) >= target:
+                    return
+                before = len(self._byte_pending)
+                self._produce_pcm(max(8192, target - before))
+                grew = len(self._byte_pending) > before
+            if not grew:
+                return
+            time.sleep(0)
+
+    def _produce_pcm(self, extra_bytes: int) -> None:
+        """Append processed Int16 to byte_pending without consuming it."""
+        if extra_bytes <= 0:
+            return
         if self._stem_enabled and self._stem_paths:
-            return self._read_audio_bytes_stems(maxlen)
+            hit_eof = self._drain_stem_queues()
+            if hit_eof:
+                self._decode_eof_generation = int(self._generation)
+            need_samples = ((extra_bytes + 3) // 4) * _TARGET_CHANNELS
+            need_samples = max(0, need_samples)
+            if need_samples <= 0:
+                return
+            while (
+                min(
+                    self._stem_pending[STEM_VOCALS].size,
+                    self._stem_pending[STEM_INSTRUMENTAL].size,
+                )
+                < need_samples
+            ):
+                if not self._drain_stem_queues():
+                    break
+            mixed = self._mix_stems(need_samples)
+            if mixed is not None and mixed.size:
+                wet = self._high_cut.process_interleaved(mixed)
+                gain = float(self._track_gain)
+                if gain != 1.0:
+                    wet = wet * np.float32(gain)
+                self._emit_wet_pcm(wet)
+            return
 
-        # Refill float pending from dry decode queue.
+        maxlen = len(self._byte_pending) + extra_bytes
         while self._float_pending.size * 2 < maxlen + 4096:
             try:
                 item = self._chunk_queue.get_nowait()
             except queue.Empty:
                 break
             if item is None:
-                # Remember which generation hit EOF; finish only after buffers drain.
                 self._decode_eof_generation = int(self._generation)
-                if (
-                    self._float_pending.size == 0
-                    and not self._byte_pending
-                    and self._chunk_queue.empty()
-                ):
-                    gen = self._decode_eof_generation
-                    QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
                 break
             if self._float_pending.size:
                 self._float_pending = np.concatenate([self._float_pending, item])
             else:
                 self._float_pending = item
-
-        # Convert enough float frames → EQ → int16 into byte_pending.
-        need_samples = ((maxlen - len(self._byte_pending) + 3) // 4) * _TARGET_CHANNELS
+        need_samples = ((extra_bytes + 3) // 4) * _TARGET_CHANNELS
         need_samples = max(0, need_samples)
         if need_samples > 0 and self._float_pending.size > 0:
             take = min(self._float_pending.size, need_samples)
@@ -1153,11 +1275,31 @@ class PcmAirPlayer(QObject):
                 gain = float(self._track_gain)
                 if gain != 1.0:
                     wet = wet * np.float32(gain)
-                self._capture_spectrum(wet)
-                clipped = np.clip(wet, -1.0, 1.0)
-                pcm = (clipped * 32767.0).astype(np.int16)
-                self._byte_pending.extend(pcm.tobytes())
-                self._frames_played += take // _TARGET_CHANNELS
+                self._emit_wet_pcm(wet)
+
+    def _emit_wet_pcm(self, wet: np.ndarray) -> None:
+        """Spectrum (pre-FX) → master EQ → Int16."""
+        frames = int(wet.size) // _TARGET_CHANNELS
+        self._capture_spectrum(wet)
+        # Apply master EQ
+        if self._master_eq is not None:
+            wet = self._master_eq.process_interleaved(wet)
+        clipped = np.clip(wet, -1.0, 1.0)
+        pcm = (clipped * 32767.0).astype(np.int16)
+        self._byte_pending.extend(pcm.tobytes())
+        self._frames_played += frames
+
+    def _read_audio_bytes(self, maxlen: int) -> bytes:
+        if maxlen <= 0:
+            return b""
+        with self._lock:
+            return self._read_audio_bytes_locked(maxlen)
+
+    def _read_audio_bytes_locked(self, maxlen: int) -> bytes:
+        if self._stem_enabled and self._stem_paths:
+            return self._read_audio_bytes_stems(maxlen)
+
+        self._produce_pcm(max(0, maxlen - len(self._byte_pending) + 4096))
 
         if not self._byte_pending:
             if (
@@ -1188,34 +1330,7 @@ class PcmAirPlayer(QObject):
         return data
 
     def _read_audio_bytes_stems(self, maxlen: int) -> bytes:
-        hit_eof = self._drain_stem_queues()
-        if hit_eof:
-            self._decode_eof_generation = int(self._generation)
-
-        need_samples = ((maxlen - len(self._byte_pending) + 3) // 4) * _TARGET_CHANNELS
-        need_samples = max(0, need_samples)
-        if need_samples > 0:
-            # Keep draining while we can fill.
-            while (
-                min(
-                    self._stem_pending[STEM_VOCALS].size,
-                    self._stem_pending[STEM_INSTRUMENTAL].size,
-                )
-                < need_samples
-            ):
-                if not self._drain_stem_queues():
-                    break
-            mixed = self._mix_stems(need_samples)
-            if mixed is not None and mixed.size:
-                wet = self._high_cut.process_interleaved(mixed)
-                gain = float(self._track_gain)
-                if gain != 1.0:
-                    wet = wet * np.float32(gain)
-                self._capture_spectrum(wet)
-                clipped = np.clip(wet, -1.0, 1.0)
-                pcm = (clipped * 32767.0).astype(np.int16)
-                self._byte_pending.extend(pcm.tobytes())
-                self._frames_played += mixed.size // _TARGET_CHANNELS
+        self._produce_pcm(max(0, maxlen - len(self._byte_pending) + 4096))
 
         stems_empty = (
             self._stem_pending[STEM_VOCALS].size == 0

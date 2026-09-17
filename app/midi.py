@@ -16,7 +16,27 @@ VIRTUAL_PORT_NAME = "RESONANCE"
 TARGET_MASTER_VOLUME = "master_volume"
 TARGET_ON_AIR = "on_air"
 TARGET_STOP = "stop"
-BUTTON_TARGETS = frozenset({TARGET_ON_AIR, TARGET_STOP})
+TARGET_FADE_SEQ = "fade_seq"
+TARGET_FADE_XFADE = "fade_xfade"
+TARGET_FADE_HCUT = "fade_hcut"
+TARGET_FADE_PRESET_PREV = "fade_preset_prev"
+TARGET_FADE_PRESET_NEXT = "fade_preset_next"
+FADE_MODE_TAKE_TARGETS = {
+    TARGET_FADE_SEQ: "sequential",
+    TARGET_FADE_XFADE: "crossfade",
+    TARGET_FADE_HCUT: "high_cut",
+}
+BUTTON_TARGETS = frozenset(
+    {
+        TARGET_ON_AIR,
+        TARGET_STOP,
+        TARGET_FADE_SEQ,
+        TARGET_FADE_XFADE,
+        TARGET_FADE_HCUT,
+        TARGET_FADE_PRESET_PREV,
+        TARGET_FADE_PRESET_NEXT,
+    }
+)
 _LEARN_TIMEOUT_MS = 12000
 _SCAN_MS = 2000
 
@@ -84,7 +104,7 @@ class MidiHub(QObject):
     noteReceived = pyqtSignal(int, int, int)  # channel, note, velocity 0–127
     learnChanged = pyqtSignal(str)  # target id, or "" when idle
     bindingChanged = pyqtSignal(str)  # target id
-    buttonTriggered = pyqtSignal(str)  # on_air / stop
+    buttonTriggered = pyqtSignal(str)  # on_air / stop / fade takes / fade presets
 
     def __init__(self, parent: QObject | None = None):
         super().__init__(parent)

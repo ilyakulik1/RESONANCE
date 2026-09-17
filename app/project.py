@@ -15,9 +15,14 @@ import copy
 import json
 import os
 import shutil
+import threading
+import time
 import unicodedata
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from PyQt6.QtCore import QObject, pyqtSignal
 
 from app.analysis_cache import (
     copy_cache_file_for_path,
@@ -293,6 +298,8 @@ def _resolve_tracks(raw_tracks, root: Path) -> list[dict]:
             continue
         stored_path = track.get("path") or track.get("file")
         if not stored_path:
+            item = dict(track)
+            resolved.append(item)
             continue
         abs_path, exists = resolve_project_path(str(stored_path), root)
         item = dict(track)
@@ -375,13 +382,243 @@ def _playlist_dict_for_storage(pl: ProjectPlaylistState, root: Path) -> dict:
     }
 
 
+def _payload_from_state(state: ProjectState, root: Path, name: str) -> dict:
+    columns = list(state.columns) if state.columns else empty_project_columns()
+    while len(columns) < MAX_PLAYLISTS:
+        columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
+    columns = columns[:MAX_PLAYLISTS]
+    return {
+        "version": PROJECT_VERSION,
+        "name": name or state.name or root.name,
+        "playlist_columns": state.playlist_columns,
+        "columns": [
+            {
+                "active_tab": col.active_tab,
+                "tabs": [_playlist_dict_for_storage(tab, root) for tab in col.tabs]
+                or [_playlist_dict_for_storage(ProjectPlaylistState(), root)],
+            }
+            for col in columns
+        ],
+        "track_timelines": {
+            _instance_key_for_storage(path, root): data
+            for path, data in state.track_timelines.items()
+        },
+        "track_eq": {
+            _instance_key_for_storage(path, root): data
+            for path, data in state.track_eq.items()
+        },
+        "track_gain_db": {
+            _instance_key_for_storage(path, root): float(value)
+            for path, value in state.track_gain_db.items()
+            if isinstance(value, (int, float))
+        },
+        "track_lufs": {
+            to_project_path(path, root): float(value)
+            for path, value in state.track_lufs.items()
+            if isinstance(value, (int, float))
+        },
+        "track_stems": {
+            _instance_key_for_storage(path, root): _stem_dict_for_storage(data, root)
+            for path, data in state.track_stems.items()
+            if isinstance(data, dict)
+        },
+        "video_mixer": (
+            mixer_dict_for_storage(state.video_mixer, root)
+            if isinstance(state.video_mixer, dict)
+            else None
+        ),
+    }
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    """Write JSON off the GUI thread; yield GIL between chunks so air can run."""
+    tmp = path.with_name(path.name + ".tmp")
+    encoder = json.JSONEncoder(indent=2, ensure_ascii=False)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            for index, chunk in enumerate(encoder.iterencode(payload)):
+                f.write(chunk)
+                if index % 16 == 0:
+                    time.sleep(0)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+class ProjectSaveSignals(QObject):
+    failed = pyqtSignal(str)
+
+
+@dataclass
+class _FullSaveJob:
+    path: Path
+    root: Path
+    name: str
+    state: ProjectState
+    analysis_paths: list[str] = field(default_factory=list)
+
+    def run(self) -> None:
+        state = copy.deepcopy(self.state)
+        time.sleep(0)
+        payload = _payload_from_state(state, self.root, self.name)
+        time.sleep(0)
+        ensure_project_dirs(self.root)
+        _write_json_atomic(self.path, payload)
+        dest = analysis_dir(self.root)
+        seen: set[str] = set()
+        for file_path in self.analysis_paths:
+            if not file_path:
+                continue
+            abs_path = os.path.abspath(file_path)
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+            copy_cache_file_for_path(abs_path, dest)
+
+
+@dataclass
+class _MixerSaveJob:
+    path: Path
+    root: Path
+    mixer: dict
+
+    def run(self) -> None:
+        if not self.path.is_file():
+            return
+        ensure_project_dirs(self.root)
+        with open(self.path, "r", encoding="utf-8") as f:
+            loaded = json.load(f)
+        data = loaded if isinstance(loaded, dict) else {}
+        time.sleep(0)
+        data["video_mixer"] = mixer_dict_for_storage(self.mixer, self.root)
+        _write_json_atomic(self.path, data)
+
+
+class _ProjectWriter:
+    """Single background thread; coalesces consecutive saves to the same file."""
+
+    def __init__(self, signals: ProjectSaveSignals):
+        self._signals = signals
+        self._cond = threading.Condition()
+        self._jobs: deque[_FullSaveJob | _MixerSaveJob] = deque()
+        self._stop = False
+        self._running = False
+        self._thread = threading.Thread(
+            target=self._loop, name="project-save", daemon=True
+        )
+        self._thread.start()
+
+    def submit(self, job: _FullSaveJob | _MixerSaveJob) -> None:
+        with self._cond:
+            self._coalesce(job)
+            self._cond.notify_all()
+
+    def drop_pending(self) -> None:
+        with self._cond:
+            self._jobs.clear()
+            self._cond.notify_all()
+
+    def wait(self) -> None:
+        with self._cond:
+            while self._jobs or self._running:
+                self._cond.wait()
+
+    def shutdown(self) -> None:
+        self.wait()
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+        self._thread.join(timeout=8)
+
+    def _coalesce(self, job: _FullSaveJob | _MixerSaveJob) -> None:
+        if self._jobs and self._jobs[-1].path == job.path:
+            last = self._jobs[-1]
+            if isinstance(job, _FullSaveJob):
+                self._jobs[-1] = job
+            elif isinstance(last, _FullSaveJob):
+                last.state.video_mixer = job.mixer
+            else:
+                self._jobs[-1] = job
+            return
+        self._jobs.append(job)
+
+    def _loop(self) -> None:
+        while True:
+            with self._cond:
+                while not self._jobs and not self._stop:
+                    self._running = False
+                    self._cond.notify_all()
+                    self._cond.wait()
+                if self._stop and not self._jobs:
+                    self._running = False
+                    self._cond.notify_all()
+                    return
+                job = self._jobs.popleft()
+                self._running = True
+            try:
+                job.run()
+            except Exception as exc:
+                print(f"Error saving project: {exc}")
+                try:
+                    self._signals.failed.emit(str(exc))
+                except Exception:
+                    pass
+            with self._cond:
+                if not self._jobs:
+                    self._running = False
+                    self._cond.notify_all()
+
+
+def copy_project_trees(src_root: Path | str, dest_root: Path | str) -> Path:
+    """Copy media/analysis/stems/thumbs from one project folder to another.
+
+    Safe to call from a worker thread. Does not change the active project root.
+    """
+    src = Path(src_root).resolve()
+    dest = ensure_project_dirs(dest_root).resolve()
+    if src == dest:
+        return dest
+    for dirname in (MEDIA_DIRNAME, ANALYSIS_DIRNAME, STEMS_DIRNAME, SCENE_THUMBS_DIRNAME):
+        from_dir = src / dirname
+        to_dir = dest / dirname
+        if not from_dir.exists():
+            continue
+        if to_dir.exists():
+            shutil.rmtree(to_dir, ignore_errors=True)
+        try:
+            shutil.copytree(from_dir, to_dir)
+        except OSError:
+            ensure_project_dirs(dest)
+            if from_dir.exists():
+                shutil.copytree(from_dir, to_dir, dirs_exist_ok=True)
+        time.sleep(0)
+    return dest
+
+
 class ProjectManager:
     """Owns the active project root and persists project.json + analysis."""
 
     def __init__(self, root: Path | str | None = None):
         self.root = ensure_project_dirs(root or default_project_root())
         self.name = self.root.name if self.root.name != "default_project" else "Project"
+        self.save_signals = ProjectSaveSignals()
+        self._writer = _ProjectWriter(self.save_signals)
         self._activate_analysis_cache()
+
+    def flush_save(self) -> None:
+        """Block until queued project.json writes finish."""
+        self._writer.wait()
+
+    def cancel_pending_saves(self) -> None:
+        """Drop queued writes (in-flight write still finishes)."""
+        self._writer.drop_pending()
+
+    def shutdown_writer(self) -> None:
+        self._writer.shutdown()
 
     @property
     def project_file(self) -> Path:
@@ -392,18 +629,24 @@ class ProjectManager:
         set_stems_dir(stems_dir(self.root))
 
     def open(self, root: Path | str) -> None:
+        self.flush_save()
         self.root = ensure_project_dirs(root)
         self.name = self.root.name
         self._activate_analysis_cache()
 
     def create_new(self, root: Path | str, name: str | None = None) -> None:
+        self.flush_save()
         self.root = ensure_project_dirs(root)
         self.name = (name or self.root.name).strip() or "Project"
         self._activate_analysis_cache()
-        self.save_raw(ProjectState(name=self.name, columns=empty_project_columns()))
+        self.save_raw(
+            ProjectState(name=self.name, columns=empty_project_columns()),
+            wait=True,
+        )
 
     def create_untitled(self) -> None:
         """Start a fresh unnamed project in the app config directory."""
+        self.flush_save()
         root = untitled_project_root()
         if root.exists():
             for child in root.iterdir():
@@ -417,7 +660,10 @@ class ProjectManager:
         self.root = ensure_project_dirs(root)
         self.name = "Untitled"
         self._activate_analysis_cache()
-        self.save_raw(ProjectState(name=self.name, columns=empty_project_columns()))
+        self.save_raw(
+            ProjectState(name=self.name, columns=empty_project_columns()),
+            wait=True,
+        )
 
     def is_untitled(self) -> bool:
         try:
@@ -425,29 +671,17 @@ class ProjectManager:
         except OSError:
             return False
 
-    def relocate_to(self, target: Path | str, *, name: str | None = None) -> None:
-        """Move project working files into ``target`` (used by Save As from Untitled)."""
-        old = self.root.resolve()
-        dest = ensure_project_dirs(target).resolve()
-        if old == dest:
-            self.name = (name or dest.name).strip() or self.name
-            return
-        for dirname in (MEDIA_DIRNAME, ANALYSIS_DIRNAME, STEMS_DIRNAME, SCENE_THUMBS_DIRNAME):
-            src = old / dirname
-            dst = dest / dirname
-            if not src.exists():
-                continue
-            if dst.exists():
-                shutil.rmtree(dst, ignore_errors=True)
-            try:
-                shutil.copytree(src, dst)
-            except OSError:
-                ensure_project_dirs(dest)
-                if src.exists():
-                    shutil.copytree(src, dst, dirs_exist_ok=True)
-        self.root = dest
-        self.name = (name or dest.name).strip() or "Project"
+    def adopt_root(self, target: Path | str, *, name: str | None = None) -> None:
+        """Point at an already-copied project folder without copying files."""
+        self.root = ensure_project_dirs(target)
+        self.name = (name or self.root.name).strip() or "Project"
         self._activate_analysis_cache()
+
+    def relocate_to(self, target: Path | str, *, name: str | None = None) -> None:
+        """Copy working files into ``target`` and switch the active root."""
+        self.flush_save()
+        dest = copy_project_trees(self.root, target)
+        self.adopt_root(dest, name=name)
 
     def is_path_in_project(self, file_path: str) -> bool:
         return is_under_project(file_path, self.root)
@@ -458,64 +692,50 @@ class ProjectManager:
     def export_analysis_for_paths(self, file_paths: list[str]) -> int:
         dest = analysis_dir(self.root)
         count = 0
+        seen: set[str] = set()
         for path in file_paths:
-            if path and copy_cache_file_for_path(path, dest):
+            if not path:
+                continue
+            abs_path = os.path.abspath(path)
+            if abs_path in seen:
+                continue
+            seen.add(abs_path)
+            if copy_cache_file_for_path(abs_path, dest):
                 count += 1
         return count
 
-    def save_raw(self, state: ProjectState) -> None:
-        ensure_project_dirs(self.root)
-        columns = list(state.columns) if state.columns else empty_project_columns()
-        while len(columns) < MAX_PLAYLISTS:
-            columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
-        columns = columns[:MAX_PLAYLISTS]
+    def save_raw(
+        self,
+        state: ProjectState,
+        *,
+        wait: bool = False,
+        analysis_paths: list[str] | None = None,
+    ) -> None:
+        name = state.name or self.name
+        self.name = name
+        self._writer.submit(
+            _FullSaveJob(
+                path=self.project_file,
+                root=Path(self.root),
+                name=name,
+                state=state,
+                analysis_paths=list(analysis_paths or ()),
+            )
+        )
+        if wait:
+            self.flush_save()
 
-        payload = {
-            "version": PROJECT_VERSION,
-            "name": state.name or self.name,
-            "playlist_columns": state.playlist_columns,
-            "columns": [
-                {
-                    "active_tab": col.active_tab,
-                    "tabs": [_playlist_dict_for_storage(tab, self.root) for tab in col.tabs]
-                    or [_playlist_dict_for_storage(ProjectPlaylistState(), self.root)],
-                }
-                for col in columns
-            ],
-            "track_timelines": {
-                _instance_key_for_storage(path, self.root): data
-                for path, data in state.track_timelines.items()
-            },
-            "track_eq": {
-                _instance_key_for_storage(path, self.root): data
-                for path, data in state.track_eq.items()
-            },
-            "track_gain_db": {
-                _instance_key_for_storage(path, self.root): float(value)
-                for path, value in state.track_gain_db.items()
-                if isinstance(value, (int, float))
-            },
-            "track_lufs": {
-                to_project_path(path, self.root): float(value)
-                for path, value in state.track_lufs.items()
-                if isinstance(value, (int, float))
-            },
-            "track_stems": {
-                _instance_key_for_storage(path, self.root): _stem_dict_for_storage(
-                    data, self.root
-                )
-                for path, data in state.track_stems.items()
-                if isinstance(data, dict)
-            },
-            "video_mixer": (
-                mixer_dict_for_storage(state.video_mixer, self.root)
-                if isinstance(state.video_mixer, dict)
-                else None
-            ),
-        }
-        self.name = payload["name"]
-        with open(self.project_file, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+    def save_mixer_patch(self, mixer: dict, *, wait: bool = False) -> None:
+        """Queue a mixer-only JSON patch (no playlist walk on the GUI thread)."""
+        self._writer.submit(
+            _MixerSaveJob(
+                path=self.project_file,
+                root=Path(self.root),
+                mixer=mixer,
+            )
+        )
+        if wait:
+            self.flush_save()
 
     def load_raw(self) -> ProjectState | None:
         path = self.project_file

@@ -1,5 +1,7 @@
 from PyQt6.QtCore import QSize, Qt, pyqtSignal
-from PyQt6.QtWidgets import QButtonGroup, QHBoxLayout, QPushButton, QSizePolicy, QWidget
+from PyQt6.QtWidgets import QButtonGroup, QPushButton, QSizePolicy, QWidget
+
+from app.ui.widgets.flow_layout import FlowLayout
 
 
 class SegmentButtonGroup(QWidget):
@@ -12,9 +14,13 @@ class SegmentButtonGroup(QWidget):
         self._options = options
         self._buttons: dict[str, QPushButton] = {}
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(4)
+        policy = QSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Preferred)
+        policy.setHeightForWidth(True)
+        self.setSizePolicy(policy)
+
+        layout = FlowLayout(self)
+        layout.setHorizontalSpacing(4)
+        layout.setVerticalSpacing(2)
 
         self._group = QButtonGroup(self)
         self._group.setExclusive(True)
@@ -27,19 +33,24 @@ class SegmentButtonGroup(QWidget):
             btn.setDefault(False)
             btn.setObjectName("segmentButton")
             btn.setProperty("segmentValue", value)
-            btn.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
             btn.clicked.connect(lambda checked, v=value: self._on_clicked(v))
             self._group.addButton(btn)
             self._buttons[value] = btn
             layout.addWidget(btn)
 
-        self.setSizePolicy(QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed)
         if options:
             self._buttons[options[0][0]].setChecked(True)
         self._update_styles()
 
+    def button_for(self, value: str) -> QPushButton | None:
+        return self._buttons.get(value)
+
     def minimumSizeHint(self) -> QSize:
-        return self.sizeHint()
+        layout = self.layout()
+        if layout is not None:
+            return layout.minimumSize()
+        return super().minimumSizeHint()
 
     def _on_clicked(self, value: str) -> None:
         self._update_styles()

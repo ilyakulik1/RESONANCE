@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#141414">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="mobile-web-app-capable" content="yes">
+  <title>RESONANCE Remote</title>
+  <link rel="manifest" href="/manifest.json">
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <link rel="apple-touch-icon" href="/icon.svg">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"></span>
+        <span class="brand-name">RESONANCE</span>
+      </div>
+      <div id="conn" class="conn offline" title="Connection">
+        <span class="conn-dot"></span>
+        <span id="conn-label">offline</span>
+      </div>
+    </header>
+
+    <main class="content">
+      <section class="now-playing" id="now-playing">
+        <div class="now-kicker" id="air-kicker">AIR</div>
+        <h1 class="now-title" id="air-title">No track</h1>
+        <div class="now-sub" id="preview-line">Preview —</div>
+        <div class="seek-wrap">
+          <input id="seek" type="range" min="0" max="1000" value="0" aria-label="Seek">
+          <div class="times">
+            <span id="time-elapsed">00:00</span>
+            <span id="time-remain">00:00</span>
+          </div>
+        </div>
+        <div class="volume-row">
+          <span class="row-label">MASTER</span>
+          <input id="volume" type="range" min="0" max="100" value="70" aria-label="Master volume">
+          <span id="volume-value" class="row-value">70%</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-label">FADE MODE</div>
+        <div class="seg" id="fade-mode" role="group">
+          <button type="button" data-mode="sequential">SEQ</button>
+          <button type="button" data-mode="crossfade">XFADE</button>
+          <button type="button" data-mode="high_cut">HCUT</button>
+        </div>
+        <div class="fade-row">
+          <span class="row-label">FADE</span>
+          <div class="stepper">
+            <button type="button" id="fade-down" aria-label="Shorter fade">−</button>
+            <span id="fade-ms" class="stepper-value">1500</span>
+            <button type="button" id="fade-up" aria-label="Longer fade">+</button>
+          </div>
+          <span class="row-value">MS</span>
+        </div>
+        <input id="fade-slider" type="range" min="0" max="5000" step="50" value="1500" aria-label="Fade duration">
+        <div class="chips" id="fade-presets"></div>
+        <div class="q-row hidden" id="q-row">
+          <span class="row-label">RES</span>
+          <input id="high-cut-q" type="range" min="50" max="2000" value="71" aria-label="High-cut Q">
+          <span id="q-value" class="row-value">0.71</span>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-label">PLAYBACK MODE</div>
+        <div class="seg" id="playback-mode" role="group">
+          <button type="button" data-mode="loop">LOOP</button>
+          <button type="button" data-mode="next">NEXT</button>
+          <button type="button" data-mode="stop">STOP</button>
+        </div>
+        <label class="advance">
+          <input type="checkbox" id="advance">
+          <span>ADVANCE after ON AIR</span>
+        </label>
+      </section>
+
+      <section class="panel playlists-panel">
+        <div class="panel-head">
+          <div class="panel-label">PLAYLISTS</div>
+          <div class="playlist-tools">
+            <button type="button" id="tab-add" class="ghost">+ TAB</button>
+            <button type="button" id="tab-rename" class="ghost">RENAME</button>
+            <button type="button" id="tab-delete" class="ghost danger">DELETE</button>
+          </div>
+        </div>
+        <div class="chips" id="column-tabs"></div>
+        <div class="chips" id="playlist-tabs"></div>
+        <ul id="tracks" class="tracks"></ul>
+      </section>
+    </main>
+
+    <footer class="dock">
+      <div class="dock-row">
+        <button type="button" id="btn-prev" class="icon-btn" aria-label="Previous">⏮</button>
+        <button type="button" id="btn-play" class="icon-btn" aria-label="Play / Pause">▶</button>
+        <button type="button" id="btn-onair" class="onair">ON AIR</button>
+        <button type="button" id="btn-stop" class="icon-btn stop" aria-label="Stop">■</button>
+        <button type="button" id="btn-next" class="icon-btn" aria-label="Next">⏭</button>
+      </div>
+    </footer>
+  </div>
+
+  <div id="sheet" class="sheet hidden" hidden>
+    <div class="sheet-backdrop" id="sheet-backdrop"></div>
+    <div class="sheet-card">
+      <div class="sheet-title" id="sheet-title">Track</div>
+      <button type="button" data-act="play">Take to air</button>
+      <button type="button" data-act="select">Cue / select</button>
+      <button type="button" data-act="up">Move up</button>
+      <button type="button" data-act="down">Move down</button>
+      <button type="button" data-act="top">Move to top</button>
+      <button type="button" data-act="bottom">Move to bottom</button>
+      <button type="button" class="danger" data-act="remove">Remove</button>
+      <button type="button" class="ghost" id="sheet-close">Cancel</button>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

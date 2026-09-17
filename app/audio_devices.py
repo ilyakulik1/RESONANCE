@@ -47,11 +47,7 @@ def populate_audio_output_combo(combo: QComboBox, *, saved_device_id: bytes | No
     combo.addItem(NO_OUTPUT_LABEL, NO_OUTPUT_DEVICE_ID)
 
     devices = QMediaDevices.audioOutputs()
-    default_device = QMediaDevices.defaultAudioOutput()
-    selected_index = 1 if devices else 0
-
-    if is_no_output_device(saved_device_id):
-        selected_index = 0
+    selected_index = 0
 
     for index, device in enumerate(devices):
         label = device.description()
@@ -59,9 +55,11 @@ def populate_audio_output_combo(combo: QComboBox, *, saved_device_id: bytes | No
             label = f"{label} (Default)"
         combo.addItem(label, device.id().data())
         item_index = index + 1
-        if saved_device_id and device.id().data() == saved_device_id:
-            selected_index = item_index
-        elif saved_device_id is None and device == default_device:
+        if (
+            saved_device_id
+            and not is_no_output_device(saved_device_id)
+            and device.id().data() == saved_device_id
+        ):
             selected_index = item_index
 
     combo.setCurrentIndex(selected_index)

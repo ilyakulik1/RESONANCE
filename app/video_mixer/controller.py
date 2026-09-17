@@ -44,8 +44,11 @@ class VideoMixerController(QObject):
         self.main_splitter: QSplitter | None = None
         self._left_column: QWidget | None = None
         self._transitioning = False
+        self._visual_fading = False
         self._take_scene_id: str | None = None
         self._take_restart_ids: set[str] = set()
+        self._take_queue: list[tuple[str, bool]] = []
+        self._hold_take_for_air = False
         self._air_paused_for_video = False
         self._preload_deadline_ms = 0
         self._tick_ms = 33
@@ -124,6 +127,16 @@ class VideoMixerController(QObject):
         blocked = bool(getattr(window, "_air_no_output", False))
         return find_audio_output(device_id), blocked
 
+    def _prefetch_air_pcm(self, milliseconds: int = 280) -> None:
+        """Fill the air sink before a GUI stall (image decode / Take)."""
+        players = getattr(self.window, "_players", None)
+        if not players:
+            return
+        for player in players:
+            prefetch = getattr(player, "prefetch_pcm_ms", None)
+            if callable(prefetch):
+                prefetch(milliseconds)
+
     def apply_output_device(self) -> None:
         self.layer_audio.apply_output_device()
 
@@ -162,6 +175,12 @@ class VideoMixerController(QObject):
             self._apply_collapsed_state(self.model.panel_collapsed)
             self._program_clock_running = False
             self._update_program_clock()
+            self._transitioning = False
+            self._visual_fading = False
+            self._take_scene_id = None
+            self._take_restart_ids = set()
+            self._take_queue.clear()
+            self._hold_take_for_air = False
             self._views_dirty = True
             self.panel.refresh_all()
         finally:
@@ -289,39 +308,133 @@ class VideoMixerController(QObject):
                 self.model.transition_ms, mapping_outgoing
             )
 
-    def take_scene_to_main(self, scene_id: str) -> None:
-        """Preload next scene while Main keeps playing, then crossfade."""
+    def take_scene_to_main(self, scene_id: str, *, hold: bool = False) -> None:
+        """Preload next scene while Main keeps playing, then crossfade.
+
+        hold=True keeps the current Main on screen (and does not restart the
+        program clock) until commit_held_take() — used so a linked scene waits
+        for the incoming air track after high-cut / fade-out.
+        """
         if not any(s.id == scene_id for s in self.model.scenes):
             return
-        if scene_id == self.model.main_scene_id and not self._transitioning:
+
+        busy = self._transitioning or self._visual_fading or self._is_program_crossfading()
+        if busy:
+            if hold and self._transitioning and not self._visual_fading:
+                # Air cue still in preload: retarget pending, don't start a second dissolve.
+                self._hold_take_for_air = True
+                self._retarget_pending_take(scene_id)
+                return
+            self._enqueue_take(scene_id, hold=hold)
+            return
+
+        self._hold_take_for_air = bool(hold)
+        if scene_id == self.model.main_scene_id:
+            if hold:
+                # Same scene: wait for air before restarting clock / On Main=START.
+                self._transitioning = True
+                self._take_scene_id = scene_id
+                self._take_restart_ids = set()
+                self._preload_deadline_ms = 0
+                self._views_dirty = True
+                return
             # Same scene on Main: fade in the current preview look (transform / vis).
             outgoing, output_outgoing, mapping_outgoing = self._capture_program_outgoing()
             self.model.capture_program_look()
             self._start_program_crossfade(outgoing, output_outgoing, mapping_outgoing)
             self._start_program_clock()
+            self._begin_visual_fade()
             self._views_dirty = True
             return
+
+        self._begin_pending_take(scene_id)
+
+    def _enqueue_take(self, scene_id: str, *, hold: bool = False) -> None:
+        if scene_id == self._take_scene_id:
+            if hold:
+                self._hold_take_for_air = True
+            return
+        if self._visual_fading and scene_id == self.model.main_scene_id and not hold:
+            return
+        if self._take_queue and self._take_queue[-1][0] == scene_id:
+            self._take_queue[-1] = (scene_id, hold)
+            return
+        self._take_queue.append((scene_id, hold))
+
+    def _retarget_pending_take(self, scene_id: str) -> None:
         scene = self.model.scene_by_id(scene_id)
         restart_ids = self._arm_scene_videos_for_program(scene) if scene is not None else set()
-        if self._transitioning:
-            self._take_scene_id = scene_id
-            self._take_restart_ids = restart_ids
-            self.model.pending_main_scene_id = scene_id
-            self.media_store.sync()
-            if scene is not None:
-                self._kick_scene_videos(scene, restart_ids)
-            return
+        self._prefetch_air_pcm()
+        self._take_scene_id = scene_id
+        self._take_restart_ids = restart_ids
+        self.model.pending_main_scene_id = scene_id
+        self.media_store.sync()
+        if scene is not None:
+            self._kick_scene_videos(scene, restart_ids)
 
+    def _begin_pending_take(self, scene_id: str) -> None:
+        scene = self.model.scene_by_id(scene_id)
+        restart_ids = self._arm_scene_videos_for_program(scene) if scene is not None else set()
+        self._prefetch_air_pcm()
         self._transitioning = True
         self._take_scene_id = scene_id
         self._take_restart_ids = restart_ids
-        # Keep live Main playing — do NOT freeze/hold during preload.
         self.model.pending_main_scene_id = scene_id
         self.media_store.sync()
         if scene is not None:
             self._kick_scene_videos(scene, restart_ids)
         self._preload_deadline_ms = max(0, int(self.model.preload_ms))
         self._views_dirty = True
+
+    def _is_program_crossfading(self) -> bool:
+        if self.panel.main_gl.is_crossfading():
+            return True
+        if self.output_window.isVisible() and self.output_window.gl_widget.is_crossfading():
+            return True
+        if self.mapping_window.isVisible() and self.mapping_window.canvas.is_crossfading():
+            return True
+        return False
+
+    def _begin_visual_fade(self) -> None:
+        if self._is_program_crossfading():
+            self._visual_fading = True
+            return
+        self._visual_fading = False
+        self._start_next_queued_take()
+
+    def _start_next_queued_take(self) -> None:
+        while self._take_queue:
+            next_id, hold = self._take_queue.pop(0)
+            if not any(s.id == next_id for s in self.model.scenes):
+                continue
+            self.take_scene_to_main(next_id, hold=hold)
+            return
+
+    def commit_held_take(self) -> bool:
+        """Put a hold-preloaded scene on Main. True if a hold was active."""
+        if not self._hold_take_for_air:
+            return False
+        self._hold_take_for_air = False
+        if not self._transitioning or not self._take_scene_id:
+            return True
+        ready = self.media_store.scene_media_ready(self._take_scene_id)
+        if ready and self._preload_deadline_ms <= 0:
+            self._finish_take_to_main()
+        return True
+
+    def cancel_held_take(self) -> None:
+        """Drop a hold without switching Main (air transition aborted)."""
+        if not self._hold_take_for_air:
+            return
+        self._hold_take_for_air = False
+        if not self._transitioning:
+            return
+        self._transitioning = False
+        self._take_scene_id = None
+        self._take_restart_ids = set()
+        self.model.pending_main_scene_id = None
+        if not self._visual_fading:
+            self._start_next_queued_take()
 
     def _arm_scene_videos_for_program(self, scene: Scene) -> set[str]:
         """Revive STOP clips and honor On Main = START. Returns layer ids to seek."""
@@ -352,8 +465,11 @@ class VideoMixerController(QObject):
         scene_id = self._take_scene_id
         if scene_id is None:
             self._transitioning = False
+            self._visual_fading = False
             self.model.pending_main_scene_id = None
             self._take_restart_ids = set()
+            self._hold_take_for_air = False
+            self._start_next_queued_take()
             return
 
         scene = self.model.scene_by_id(scene_id)
@@ -363,6 +479,7 @@ class VideoMixerController(QObject):
             restart_ids = restart_ids | armed
 
         # Snapshot live Main, then switch and crossfade.
+        self._prefetch_air_pcm()
         outgoing, output_outgoing, mapping_outgoing = self._capture_program_outgoing()
         self.model.pending_main_scene_id = None
         self.model.set_main_scene(scene_id)
@@ -374,7 +491,9 @@ class VideoMixerController(QObject):
         self._start_program_clock()
         self._take_scene_id = None
         self._take_restart_ids = set()
+        self._hold_take_for_air = False
         self._transitioning = False
+        self._begin_visual_fade()
         self._views_dirty = True
 
     def refresh_output_screens(self) -> None:
@@ -609,17 +728,19 @@ class VideoMixerController(QObject):
             state = self.window.player.playbackState()
             if audible:
                 if state == QMediaPlayer.PlaybackState.PlayingState:
-                    self.window.pause()
+                    self.window.pause_with_volume_fade()
                     self._air_paused_for_video = True
                 return
             if not self._air_paused_for_video:
                 return
             self._air_paused_for_video = False
-            if state != QMediaPlayer.PlaybackState.PausedState:
-                return
             if not getattr(self.window, "_current_file_path", None):
                 return
-            self.window.resume_with_volume_fade()
+            if state in (
+                QMediaPlayer.PlaybackState.PlayingState,
+                QMediaPlayer.PlaybackState.PausedState,
+            ):
+                self.window.resume_with_volume_fade()
         except Exception:
             pass
 
@@ -636,6 +757,9 @@ class VideoMixerController(QObject):
         self._update_program_clock()
         # Preload next scene while Main keeps playing live
         if self._transitioning and self._take_scene_id:
+            if self.media_store.has_unloaded_hot_media():
+                self.media_store.sync()
+                self._views_dirty = True
             frame_changed = self.media_store.tick(self._tick_ms)
             self._sync_layer_audio()
             ready = self.media_store.scene_media_ready(self._take_scene_id)
@@ -649,6 +773,8 @@ class VideoMixerController(QObject):
                 self.output_window.refresh()
             if self.mapping_window.isVisible() and need_draw:
                 self.mapping_window.refresh()
+            if self._hold_take_for_air:
+                return
             if ready and self._preload_deadline_ms <= 0:
                 self._finish_take_to_main()
             elif self._preload_deadline_ms <= -2000:
@@ -664,6 +790,14 @@ class VideoMixerController(QObject):
             transitioning = (
                 self.mapping_window.canvas.tick_transition(self._tick_ms) or transitioning
             )
+        if self._visual_fading and not transitioning:
+            self._visual_fading = False
+            self._start_next_queued_take()
+            if self._transitioning and self._take_scene_id:
+                return
+        if self.media_store.has_unloaded_hot_media():
+            self.media_store.sync()
+            self._views_dirty = True
         frame_changed = self.media_store.tick(self._tick_ms)
         self._sync_layer_audio()
         need_draw = frame_changed or self._views_dirty or transitioning

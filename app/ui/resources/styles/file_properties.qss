@@ -159,3 +159,53 @@ QSlider#stemFaderSlider::add-page:vertical {
     background: {{colors.accent}};
     border-radius: 4px;
 }
+
+QLabel#masterFxHint {
+    color: {{colors.text_muted}};
+    font-size: {{typography.size_xs}};
+}
+
+QLabel#masterFxName {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_xs}};
+}
+
+QWidget#masterFxRow {
+    background-color: {{colors.bg_surface}};
+    border: 1px solid {{colors.border}};
+}
+
+QPushButton#masterFxBtn {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_primary}};
+    border: none;
+    min-width: 22px;
+    min-height: {{sizes.button_min_height}};
+    padding: 1px 5px;
+    font-size: {{typography.size_xs}};
+}
+
+QPushButton#masterFxBtn:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QPushButton#masterFxBtn:checked {
+    background-color: {{colors.accent}};
+    color: {{colors.text_on_accent}};
+}
+
+QPushButton#masterFxBtn:disabled {
+    color: {{colors.text_muted}};
+}
+
+QScrollArea#masterFxScroll {
+    background-color: transparent;
+    border: none;
+}
+
+QListWidget#pluginPickerList {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    border: 1px solid {{colors.border}};
+    font-size: {{typography.size_sm}};
+}

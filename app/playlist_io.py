@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import unicodedata
 import uuid
 
@@ -20,6 +21,7 @@ TRACK_ID_ROLE = Qt.ItemDataRole.UserRole + 8
 MIXER_SCENE_ROLE = Qt.ItemDataRole.UserRole + 9
 
 TRACKS_CLIPBOARD_MIME = "application/x-simpleaudioplayer-tracks"
+DEFAULT_PLACEHOLDER_NAME = "New Track"
 
 # Preset mark colors for playlist tracks (stored as #RRGGBB).
 TRACK_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
@@ -85,16 +87,25 @@ def clone_playlist_item(item: QListWidgetItem) -> QListWidgetItem:
     return clone
 
 
+def is_item_placeholder(item: QListWidgetItem | None) -> bool:
+    if item is None:
+        return False
+    return get_item_file_path(item) is None
+
+
 def item_to_snapshot(item: QListWidgetItem | None) -> dict | None:
     if item is None:
         return None
     file_path = get_item_file_path(item)
-    if not file_path:
-        return None
-    snapshot: dict = {
-        "path": os.path.abspath(file_path),
-        "name": item.text().strip() or os.path.basename(file_path),
-    }
+    if file_path:
+        snapshot: dict = {
+            "path": os.path.abspath(file_path),
+            "name": item.text().strip() or os.path.basename(file_path),
+        }
+    else:
+        snapshot = {
+            "name": item.text().strip() or DEFAULT_PLACEHOLDER_NAME,
+        }
     duration_ms = get_item_duration(item)
     if duration_ms is not None:
         snapshot["duration_ms"] = duration_ms
@@ -115,6 +126,9 @@ def item_to_snapshot(item: QListWidgetItem | None) -> dict | None:
     scene_id = get_item_mixer_scene_id(item)
     if scene_id:
         snapshot["mixer_scene_id"] = scene_id
+    track_id = get_item_track_id(item)
+    if track_id:
+        snapshot["id"] = track_id
     return snapshot
 
 
@@ -185,7 +199,9 @@ def is_item_file_missing(item: QListWidgetItem | None) -> bool:
         return bool(value)
 
     path = get_item_file_path(item)
-    return bool(path) and not os.path.isfile(path)
+    if not path:
+        return False
+    return not os.path.isfile(path)
 
 
 def get_item_bpm(item: QListWidgetItem | None) -> float | None:
@@ -382,7 +398,19 @@ def _parse_playlist_entry(
 
     raw_path = entry.get("path") or entry.get("file")
     if not raw_path:
-        return None, None, None, None, None, None, False
+        name = entry.get("name")
+        display_name = str(name).strip() if name is not None else None
+        if display_name == "":
+            display_name = None
+        return (
+            None,
+            display_name or DEFAULT_PLACEHOLDER_NAME,
+            _timeline_from_entry(entry),
+            _bpm_from_entry(entry),
+            _duration_from_entry(entry),
+            _color_from_entry(entry),
+            _stems_from_entry(entry),
+        )
 
     path = str(raw_path).strip() or None
     name = entry.get("name")
@@ -428,7 +456,7 @@ def _parse_playlist_file(
 ) -> tuple[
     list[
         tuple[
-            str,
+            str | None,
             str | None,
             TimelineState | None,
             float | None,
@@ -448,7 +476,7 @@ def _parse_playlist_file(
 
     parsed: list[
         tuple[
-            str,
+            str | None,
             str | None,
             TimelineState | None,
             float | None,
@@ -464,7 +492,9 @@ def _parse_playlist_file(
             _parse_playlist_entry(entry)
         )
         if not file_path:
-            skipped += 1
+            parsed.append(
+                (None, display_name, timeline, bpm, duration_ms, False, color, has_stems)
+            )
             continue
         resolved_path, exists = _resolve_file_path(file_path)
         parsed.append(
@@ -500,15 +530,40 @@ def _playlist_item_to_entry(
     timeline_states: dict[str, TimelineState] | None,
 ) -> dict | None:
     file_path = get_item_file_path(item)
+    track_id = ensure_item_track_id(item)
     if not file_path:
-        return None
+        entry: dict = {
+            "name": item.text().strip() or DEFAULT_PLACEHOLDER_NAME,
+        }
+        if track_id:
+            entry["id"] = track_id
+        state = _timeline_for_item(item, track_id or "", timeline_states)
+        if state is not None:
+            entry.update(_timeline_to_entry(state))
+        duration_ms = get_item_duration(item)
+        if duration_ms is not None:
+            entry["duration_ms"] = duration_ms
+        bpm = get_item_bpm(item)
+        if bpm is not None:
+            entry["bpm"] = _bpm_to_entry(bpm)
+        color = get_item_color(item)
+        if color is not None:
+            entry["color"] = color
+        gain_db = get_item_gain_db(item)
+        if gain_db is not None:
+            entry["gain_db"] = gain_db
+        if item_has_stems(item):
+            entry["stems"] = True
+        scene_id = get_item_mixer_scene_id(item)
+        if scene_id:
+            entry["mixer_scene_id"] = scene_id
+        return entry
 
     abs_path = os.path.abspath(file_path)
-    entry: dict = {
+    entry = {
         "path": abs_path,
         "name": item.text().strip() or os.path.basename(file_path),
     }
-    track_id = ensure_item_track_id(item)
     if track_id:
         entry["id"] = track_id
     state = _timeline_for_item(item, abs_path, timeline_states)
@@ -540,6 +595,8 @@ def playlist_to_entries(
 ) -> list[dict]:
     entries = []
     for i in range(playlist_widget.count()):
+        if i % 16 == 0:
+            time.sleep(0)
         item = playlist_widget.item(i)
         if item is None:
             continue
@@ -588,6 +645,56 @@ def _lufs_from_entry(entry: dict | None) -> float | None:
         return float(entry["lufs"])
     except (TypeError, ValueError):
         return None
+
+
+def _add_placeholder_entry(
+    playlist_widget,
+    display_name: str | None,
+    timeline: TimelineState | None,
+    timeline_states: dict[str, TimelineState] | None,
+    *,
+    bpm: float | None = None,
+    duration_ms: int | None = None,
+    color: str | None = None,
+    has_stems: bool = False,
+    track_id: str | None = None,
+    gain_db: float | None = None,
+    lufs: float | None = None,
+    mixer_scene_id: str | None = None,
+) -> None:
+    item: QListWidgetItem | None = None
+    if hasattr(playlist_widget, "add_placeholder_item"):
+        item = playlist_widget.add_placeholder_item(display_name=display_name)
+    else:
+        item = QListWidgetItem(display_name or DEFAULT_PLACEHOLDER_NAME)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        playlist_widget.addItem(item)
+
+    if item is None:
+        return
+    if track_id:
+        set_item_track_id(item, track_id)
+    else:
+        ensure_item_track_id(item)
+    if duration_ms is not None:
+        set_item_duration(item, duration_ms)
+    if bpm is not None:
+        set_item_bpm(item, bpm)
+    if color is not None:
+        set_item_color(item, color)
+    if gain_db is not None:
+        set_item_gain_db(item, gain_db)
+    if lufs is not None:
+        set_item_lufs(item, lufs)
+    if mixer_scene_id:
+        set_item_mixer_scene_id(item, mixer_scene_id)
+    if has_stems:
+        set_item_has_stems(item, True)
+
+    if timeline_states is not None and timeline is not None:
+        key = get_item_track_id(item)
+        if key:
+            timeline_states[key] = timeline
 
 
 def _add_playlist_entry(
@@ -676,6 +783,19 @@ def load_playlist_from_file(
         color,
         has_stems,
     ) in parsed:
+        if not file_path:
+            _add_placeholder_entry(
+                playlist_widget,
+                display_name,
+                timeline,
+                timeline_states,
+                bpm=bpm,
+                duration_ms=duration_ms,
+                color=color,
+                has_stems=has_stems,
+            )
+            added += 1
+            continue
         _add_playlist_entry(
             playlist_widget,
             file_path,
@@ -716,7 +836,21 @@ def load_playlist_from_entries(
             _parse_playlist_entry(entry)
         )
         if not file_path:
-            skipped += 1
+            _add_placeholder_entry(
+                playlist_widget,
+                display_name,
+                timeline,
+                timeline_states,
+                bpm=bpm,
+                duration_ms=duration_ms,
+                color=color,
+                has_stems=has_stems,
+                track_id=str(entry.get("id") or "").strip() or None,
+                gain_db=_gain_from_entry(entry),
+                lufs=_lufs_from_entry(entry),
+                mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
+            )
+            added += 1
             continue
         exists = entry.get("_exists")
         if exists is None:

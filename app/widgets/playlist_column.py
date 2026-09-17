@@ -144,6 +144,11 @@ class PlaylistColumnPanel(QFrame):
             lambda: self._with_current(window.add_to_playlist_widget),
         )
         add_tool(
+            "file",
+            "Add empty track",
+            lambda: self._with_current(window.add_placeholder_to_playlist_widget),
+        )
+        add_tool(
             "remove",
             "Remove selected track",
             lambda: self._with_current(window.remove_from_playlist_widget),

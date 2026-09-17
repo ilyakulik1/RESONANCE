@@ -56,3 +56,4 @@ analysis_cache/
 !.env.example
 *.pem
 credentials.json
+:memory:.ses

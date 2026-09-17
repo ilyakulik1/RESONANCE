@@ -208,6 +208,8 @@ class MainGLWidget(MixerCanvasWidget):
         self.update()
 
     def start_crossfade(self, duration_ms: int, outgoing: QPixmap | None = None) -> None:
+        if self._fade_from is not None and self._fade_t < 1.0:
+            return
         if outgoing is not None and not outgoing.isNull():
             self._fade_from = outgoing
         self._hold_outgoing = False
@@ -218,6 +220,9 @@ class MainGLWidget(MixerCanvasWidget):
             self._fade_from = None
             self._fade_incoming = None
         self.update()
+
+    def is_crossfading(self) -> bool:
+        return self._fade_from is not None and (self._fade_t < 1.0 or self._hold_outgoing)
 
     def tick_transition(self, dt_ms: int) -> bool:
         """Advance crossfade; return True if still animating."""

@@ -1,8 +1,55 @@
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import QPoint, Qt, pyqtSignal
 from PyQt6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QSpinBox, QVBoxLayout, QWidget
 
 from app.ui.icon_loader import icon_size, load_icon
 from app.ui.tokens import get_token_int
+
+
+class StepperButton(QPushButton):
+    """Tiny arrow: whole rect is clickable, never steals focus."""
+
+    def __init__(self, host: QWidget, icon_name: str, parent=None):
+        super().__init__(parent)
+        stepper_btn = get_token_int("sizes.stepper_btn", 12)
+        stepper_icon = get_token_int("sizes.stepper_icon", 8)
+        self.setObjectName("stepperBtn")
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAutoDefault(False)
+        self.setDefault(False)
+        self.setFlat(True)
+        self.setAutoRepeat(False)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        mac_small = getattr(Qt.WidgetAttribute, "WA_MacSmallSize", None)
+        if mac_small is not None:
+            self.setAttribute(mac_small, True)
+        self.setFixedSize(stepper_btn, stepper_btn)
+        self.setIcon(load_icon(host, icon_name, stepper_icon))
+        self.setIconSize(icon_size(stepper_icon))
+
+    def hitButton(self, pos: QPoint) -> bool:  # noqa: N802
+        return True
+
+
+def arrow_stack_height() -> int:
+    stepper_btn = get_token_int("sizes.stepper_btn", 12)
+    arrow_spacing = get_token_int("spacing.xs", 2)
+    return stepper_btn * 2 + arrow_spacing
+
+
+def _arrow_column(host: QWidget, on_up, on_down) -> tuple[QVBoxLayout, StepperButton, StepperButton]:
+    arrow_spacing = get_token_int("spacing.xs", 2)
+    arrows = QVBoxLayout()
+    arrows.setContentsMargins(0, 0, 0, 0)
+    arrows.setSpacing(arrow_spacing)
+    btn_up = StepperButton(host, "up")
+    btn_down = StepperButton(host, "down")
+    # pressed: tiny buttons lose `clicked` if the mouse moves 1px or focus
+    # jumps back to the playlist before release.
+    btn_up.pressed.connect(on_up)
+    btn_down.pressed.connect(on_down)
+    arrows.addWidget(btn_up)
+    arrows.addWidget(btn_down)
+    return arrows, btn_up, btn_down
 
 
 class ValueStepper(QWidget):
@@ -24,15 +71,18 @@ class ValueStepper(QWidget):
         parent=None,
     ):
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._editable = editable
         self._step = max(1, step)
-        stepper_btn = get_token_int("sizes.stepper_btn", 12)
-        stepper_icon = get_token_int("sizes.stepper_icon", 8)
-        arrow_spacing = get_token_int("spacing.xs", 2)
-        arrow_stack_height = stepper_btn * 2 + arrow_spacing
+        arrows, btn_up, btn_down = _arrow_column(
+            host,
+            lambda: self._adjust(1),
+            lambda: self._adjust(-1),
+        )
+        stack_h = arrow_stack_height()
         if box_size is None:
-            box_size = get_token_int("sizes.stepper_value", arrow_stack_height)
-        box_size = max(box_size, arrow_stack_height)
+            box_size = get_token_int("sizes.stepper_value", stack_h)
+        box_size = max(box_size, stack_h)
         label_width = value_width if value_width is not None else box_size
         self._spin = QSpinBox()
         self._spin.setRange(minimum, maximum)
@@ -46,33 +96,8 @@ class ValueStepper(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        arrows = QVBoxLayout()
-        arrows.setContentsMargins(0, 0, 0, 0)
-        arrows.setSpacing(arrow_spacing)
-
-        btn_up = QPushButton()
-        btn_up.setObjectName("stepperBtn")
-        btn_up.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_up.setAutoDefault(False)
-        btn_up.setDefault(False)
-        btn_up.setFixedSize(stepper_btn, stepper_btn)
-        btn_up.setIcon(load_icon(host, "up", stepper_icon))
-        btn_up.setIconSize(icon_size(stepper_icon))
-
-        btn_down = QPushButton()
-        btn_down.setObjectName("stepperBtn")
-        btn_down.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        btn_down.setAutoDefault(False)
-        btn_down.setDefault(False)
-        btn_down.setFixedSize(stepper_btn, stepper_btn)
-        btn_down.setIcon(load_icon(host, "down", stepper_icon))
-        btn_down.setIconSize(icon_size(stepper_icon))
-
-        btn_up.clicked.connect(lambda: self._adjust(1))
-        btn_down.clicked.connect(lambda: self._adjust(-1))
-        arrows.addWidget(btn_up)
-        arrows.addWidget(btn_down)
-
+        self._btn_up = btn_up
+        self._btn_down = btn_down
         layout.addLayout(arrows)
 
         if editable:
@@ -80,14 +105,14 @@ class ValueStepper(QWidget):
             self._spin.setObjectName("stepperSpin")
             self._spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
             self._spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._spin.setFixedSize(label_width, arrow_stack_height)
+            self._spin.setFixedSize(label_width, stack_h)
             layout.addWidget(self._spin)
         else:
             self._spin.hide()
             self._value_label = QLabel(str(value))
             self._value_label.setObjectName("stepperValue")
             self._value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            self._value_label.setFixedSize(label_width, arrow_stack_height)
+            self._value_label.setFixedSize(label_width, stack_h)
             layout.addWidget(self._value_label)
 
         self._spin.valueChanged.connect(self._sync_from_spin)
@@ -108,3 +133,9 @@ class ValueStepper(QWidget):
 
     def spin_box(self) -> QSpinBox:
         return self._spin
+
+    def up_button(self) -> QPushButton:
+        return self._btn_up
+
+    def down_button(self) -> QPushButton:
+        return self._btn_down

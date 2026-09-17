@@ -77,7 +77,7 @@ class EqProcessor:
         memory (zi) is preserved — smoother live dragging.
         """
         if state is None:
-            state = EqState()
+            return
         with self._lock:
             self._bypass = bool(state.bypass)
             bands = list(state.enabled_bands()) if not state.bypass else []

@@ -80,7 +80,7 @@ QPushButton#accentButtonSpace:pressed {
 }
 
 QPushButton#segmentButton {
-    min-width: 28px;
+    min-width: 0px;
     min-height: {{sizes.button_min_height}};
     border-radius: {{radius.lg}};
     padding: {{spacing.xs}} {{spacing.sm}};
@@ -92,13 +92,25 @@ QPushButton#segmentButton[segmentActive="true"] {
     background-color: {{colors.accent_red}};
 }
 
+QPushButton#segmentButton[midiLearn="true"],
+QPushButton#stepperBtn[midiLearn="true"],
+QPushButton#accentButtonSpace[midiLearn="true"] {
+    border: 1px solid {{colors.accent_red}};
+}
+
 QPushButton#stepperBtn {
-    min-width: {{sizes.stepper_btn}};
-    min-height: {{sizes.stepper_btn}};
+    min-width: 0px;
+    min-height: 0px;
     max-width: {{sizes.stepper_btn}};
     max-height: {{sizes.stepper_btn}};
-    padding: 0;
+    padding: 0px;
+    margin: 0px;
+    border: none;
     border-radius: {{radius.md}};
+}
+
+QPushButton#stepperBtn:pressed {
+    background-color: {{colors.bg_control_pressed}};
 }
 
 QLabel#stepperValue {

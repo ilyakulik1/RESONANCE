@@ -26,6 +26,7 @@ from app.ui.widgets.float_value_stepper import FloatValueStepper
 from app.ui.widgets.section_header import SectionHeader
 from app.ui.widgets.segment_button import SegmentButtonGroup
 from app.ui.widgets.volume_knob import VolumeKnob
+
 from app.widgets.parametric_eq_view import ParametricEqView
 from app.widgets.stem_fader import StemFader
 

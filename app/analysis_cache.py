@@ -279,14 +279,27 @@ def export_analysis_to_dir(file_path: str, dest_dir: Path | str) -> bool:
 
 
 def copy_cache_file_for_path(file_path: str, dest_dir: Path | str) -> bool:
-    """Copy the on-disk NPZ for file_path into dest_dir if present."""
-    src = _cache_path(file_path)
-    if src is None or not src.is_file():
-        return export_analysis_to_dir(file_path, dest_dir)
+    """Copy the on-disk NPZ for file_path into dest_dir if present.
+
+    Skip rewrite when the file already lives in ``dest_dir``. Copying a cache
+    onto itself raises ``SameFileError`` and the old fallback recompressed
+    every NPZ on Save — a GIL stall that underruns air.
+    """
     dest = Path(dest_dir)
     dest.mkdir(parents=True, exist_ok=True)
-    try:
-        shutil.copy2(src, dest / src.name)
-        return True
-    except OSError:
-        return export_analysis_to_dir(file_path, dest_dir)
+    src = _cache_path(file_path)
+    if src is not None and src.is_file():
+        target = dest / src.name
+        try:
+            if target.exists() and os.path.samefile(src, target):
+                return True
+        except OSError:
+            pass
+        try:
+            shutil.copy2(src, target)
+            return True
+        except shutil.SameFileError:
+            return True
+        except OSError:
+            pass
+    return export_analysis_to_dir(file_path, dest)

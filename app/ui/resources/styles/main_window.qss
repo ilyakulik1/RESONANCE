@@ -1,7 +1,20 @@
 /* Main window layout widgets */
 
+QSplitter#audioEqSplitter::handle {
+    background-color: {{colors.bg_control}};
+}
+
+QSplitter#audioEqSplitter::handle:horizontal {
+    width: 5px;
+}
+
+QWidget#audioLeftStack {
+    min-width: 0;
+}
+
 QFrame#controlPanelSection {
     background-color: {{colors.bg_primary}};
+    min-width: 0;
 }
 
 QFrame#trackInfoCard {
@@ -197,11 +210,13 @@ QLabel#columnsValue {
 }
 
 QPushButton#columnsBtn {
-    min-width: {{sizes.stepper_btn}};
-    min-height: {{sizes.stepper_btn}};
+    min-width: 0px;
+    min-height: 0px;
     max-width: {{sizes.stepper_btn}};
     max-height: {{sizes.stepper_btn}};
-    padding: 0;
+    padding: 0px;
+    margin: 0px;
+    border: none;
     border-radius: {{radius.md}};
 }
 

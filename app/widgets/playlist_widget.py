@@ -13,6 +13,7 @@ from PyQt6.QtGui import (
     QFont,
     QFocusEvent,
     QKeySequence,
+    QMouseEvent,
     QPainter,
     QPen,
     QColor,
@@ -30,10 +31,12 @@ from PyQt6.QtWidgets import (
 
 from app.audio_utils import is_audio_file
 from app.playlist_io import (
+    DEFAULT_PLACEHOLDER_NAME,
     clone_playlist_item,
     ensure_item_track_id,
     get_item_file_path,
     get_item_duration,
+    is_item_placeholder,
     set_item_duration,
     set_item_file_missing,
     set_item_file_path,
@@ -93,6 +96,7 @@ class PlaylistWidget(QListWidget):
     itemDuplicated = pyqtSignal(object, object)  # src item, dst item
     copyRequested = pyqtSignal()
     pasteRequested = pyqtSignal()
+    trackContextMenuRequested = pyqtSignal(QPoint)
     focused = pyqtSignal(int)
     selectionNavigated = pyqtSignal(object)
     tracksChanged = pyqtSignal()
@@ -125,6 +129,11 @@ class PlaylistWidget(QListWidget):
         self._drop_overlay = _DropLineOverlay(self)
         self.viewport().installEventFilter(self)
         self._reclaim_focus = False
+        self._right_press_pos: QPoint | None = None
+        self._context_menu_armed = False
+        self._context_menu_guard = False
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        self.viewport().setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
 
     def set_reclaim_focus(self, enabled: bool) -> None:
         """When True, immediately take keyboard focus back if something steals it."""
@@ -143,6 +152,13 @@ class PlaylistWidget(QListWidget):
     def _maybe_reclaim_focus(self) -> None:
         if not self._reclaim_focus:
             return
+        # Don't yank focus while a stepper/button is still being clicked —
+        # Qt cancels the click if the button loses focus before release.
+        if QApplication.mouseButtons() != Qt.MouseButton.NoButton:
+            from PyQt6.QtCore import QTimer
+
+            QTimer.singleShot(50, self._maybe_reclaim_focus)
+            return
         focused = QApplication.focusWidget()
         if focused == self:
             return
@@ -151,6 +167,8 @@ class PlaylistWidget(QListWidget):
         # Leave focus on real text/menu editors; everything else is stolen back.
         from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QLineEdit, QMenu
 
+        if QApplication.activePopupWidget() is not None:
+            return
         if isinstance(focused, (QLineEdit, QComboBox, QMenu, QAbstractSpinBox)):
             return
         if focused is not None and focused.window() != self.window():
@@ -161,10 +179,60 @@ class PlaylistWidget(QListWidget):
         return self.viewport().mapFromGlobal(QCursor.pos())
 
     def eventFilter(self, obj, event):
-        if obj is self.viewport() and event.type() == QEvent.Type.Resize:
-            if self._drop_indicator_y_px is not None:
-                self._drop_overlay.show_at(self._drop_indicator_y_px)
+        if obj is self.viewport():
+            etype = event.type()
+            if etype == QEvent.Type.Resize:
+                if self._drop_indicator_y_px is not None:
+                    self._drop_overlay.show_at(self._drop_indicator_y_px)
+            elif etype == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+                if event.button() == Qt.MouseButton.RightButton:
+                    pos = event.position().toPoint()
+                    self._select_item_at(pos)
+                    self._right_press_pos = pos
+                    self._context_menu_armed = True
+                    event.accept()
+                    return True
+            elif etype == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+                if event.button() == Qt.MouseButton.RightButton:
+                    if self._context_menu_armed:
+                        pos = event.position().toPoint()
+                        self._emit_track_context_menu(pos)
+                    self._context_menu_armed = False
+                    self._right_press_pos = None
+                    event.accept()
+                    return True
+            elif etype == QEvent.Type.ContextMenu:
+                pos = event.pos() if hasattr(event, "pos") else self._right_press_pos
+                if pos is not None:
+                    self._emit_track_context_menu(pos)
+                self._context_menu_armed = False
+                event.accept()
+                return True
         return super().eventFilter(obj, event)
+
+    def _select_item_at(self, viewport_pos: QPoint):
+        item = self.itemAt(viewport_pos)
+        if item is None:
+            return None
+        if item not in self.selectedItems():
+            self.clearSelection()
+            item.setSelected(True)
+            self.setCurrentItem(item)
+        return item
+
+    def _emit_track_context_menu(self, viewport_pos: QPoint) -> None:
+        if self._context_menu_guard:
+            return
+        item = self._select_item_at(viewport_pos)
+        if item is None:
+            item = self.currentItem()
+        if item is None:
+            return
+        self._context_menu_guard = True
+        try:
+            self.trackContextMenuRequested.emit(self.viewport().mapToGlobal(viewport_pos))
+        finally:
+            self._context_menu_guard = False
 
     def set_playlist_registry(self, playlists: list["PlaylistWidget"]) -> None:
         self._playlists = playlists
@@ -302,6 +370,40 @@ class PlaylistWidget(QListWidget):
         if self.duration_prober is not None:
             self.duration_prober.probe_item(item, file_path)
         self.viewport().update()
+
+    def add_placeholder_item(
+        self,
+        display_name: str | None = None,
+        *,
+        row: int | None = None,
+    ) -> QListWidgetItem:
+        name = (display_name or DEFAULT_PLACEHOLDER_NAME).strip() or DEFAULT_PLACEHOLDER_NAME
+        item = QListWidgetItem(name)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        item.setFont(self.font())
+        ensure_item_track_id(item)
+        if row is None:
+            self.addItem(item)
+        else:
+            insert_at = max(0, min(row, self.count()))
+            self.insertItem(insert_at, item)
+        return item
+
+    def assign_file_to_item(self, item: QListWidgetItem, file_path: str) -> bool:
+        """Attach an audio file to a placeholder row (e.g. drag-and-drop)."""
+        if item is None or not file_path or not is_audio_file(file_path):
+            return False
+        name = item.text().strip()
+        if not name or name == DEFAULT_PLACEHOLDER_NAME:
+            item.setText(os.path.basename(file_path))
+        self._remember_item_path(item, file_path)
+        self._apply_item_duration(item, file_path)
+        self._request_duration_probe(item, file_path)
+        self.viewport().update()
+        abs_path = os.path.abspath(file_path)
+        self.fileImported.emit(item, abs_path)
+        self.tracksChanged.emit()
+        return True
 
     def add_item_with_path(
         self,
@@ -448,6 +550,21 @@ class PlaylistWidget(QListWidget):
         self._clear_drop_indicator()
 
         if event.mimeData().hasUrls():
+            vp_pos = self._cursor_viewport_pos()
+            target_item = self.itemAt(vp_pos)
+            if target_item is not None and is_item_placeholder(target_item):
+                assigned = False
+                for url in event.mimeData().urls():
+                    file_path = url.toLocalFile()
+                    if is_audio_file(file_path):
+                        if self.assign_file_to_item(target_item, file_path):
+                            assigned = True
+                        break
+                if assigned:
+                    event.acceptProposedAction()
+                    self.tracksChanged.emit()
+                    return
+
             insert_row = target_row
             for url in event.mimeData().urls():
                 file_path = url.toLocalFile()

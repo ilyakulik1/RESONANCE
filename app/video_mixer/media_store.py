@@ -8,6 +8,10 @@ from PyQt6.QtGui import QImage, QPixmap
 from app.video_mixer.decoder import VideoDecoder
 from app.video_mixer.model import Layer, MixerModel
 
+# One still per sync tick — a busy scene can have a dozen PNGs; decoding them
+# all on Take stalls the GUI thread / GIL longer than the ~120 ms air buffer.
+_IMAGE_LOADS_PER_SYNC = 1
+
 
 def load_image_rgba(path: str | Path) -> np.ndarray | None:
     """Load image as contiguous RGBA uint8 (handles QImage row padding)."""
@@ -62,7 +66,8 @@ class LayerMedia:
                 self.width = pix.width()
                 self.height = pix.height()
                 self.generation = 1
-                self.frame = load_image_rgba(layer.path)
+                # Software compositor draws the pixmap. A second RGBA numpy
+                # copy of a 4K still is tens of MB under the GIL and underruns air.
             else:
                 self.frame = load_image_rgba(layer.path)
                 if self.frame is not None:
@@ -289,6 +294,7 @@ class MediaStore:
 
     def _hot_layer_ids(self) -> set[str]:
         ids: set[str] = set()
+        selected = self.model.selected_layer_id
         for scene in (
             self.model.main_scene(),
             self.model.preview_scene(),
@@ -300,11 +306,21 @@ class MediaStore:
             for layer in scene.layers:
                 if layer.file_missing:
                     continue
+                # Hidden stills wait until shown/selected. Scene 5 has ~12 PNGs;
+                # loading them all on Take underruns playlist audio.
+                if (
+                    layer.kind == "image"
+                    and not layer.visible
+                    and layer.id != selected
+                ):
+                    continue
                 ids.add(layer.id)
         return ids
 
     def sync(self) -> None:
         live_ids = self._hot_layer_ids()
+        pending: list[Layer] = []
+        seen: set[str] = set()
         for scene in self.model.scenes:
             for layer in scene.layers:
                 if layer.file_missing:
@@ -312,21 +328,36 @@ class MediaStore:
                     if existing is not None:
                         existing.release()
                     continue
-                if layer.id not in live_ids:
+                if layer.id not in live_ids or layer.id in seen:
                     continue
+                seen.add(layer.id)
                 existing = self._media.get(layer.id)
                 if existing is None or existing.path != layer.path or existing.kind != layer.kind:
                     if existing is not None:
                         existing.release()
-                    self._media[layer.id] = LayerMedia(layer)
+                        del self._media[layer.id]
+                    pending.append(layer)
                 else:
                     existing.sync_from_layer(layer)
+
+        pending.sort(key=lambda layer: (not layer.visible, layer.kind != "video"))
+        image_loads = 0
+        for layer in pending:
+            if layer.kind == "image":
+                if image_loads >= _IMAGE_LOADS_PER_SYNC:
+                    continue
+                image_loads += 1
+            self._media[layer.id] = LayerMedia(layer)
 
         stale = [lid for lid in self._media if lid not in live_ids]
         for lid in stale:
             self._media[lid].release()
             del self._media[lid]
         self._apply_suspend()
+
+    def has_unloaded_hot_media(self) -> bool:
+        live_ids = self._hot_layer_ids()
+        return any(lid not in self._media for lid in live_ids)
 
     def tick(self, dt_ms: int = 33) -> bool:
         changed = False

@@ -5,13 +5,12 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PyQt6.QtCore import QFileInfo, QMimeData, QPoint, Qt, QUrl, pyqtSignal
+from PyQt6.QtCore import QMimeData, QPoint, Qt, QUrl, pyqtSignal
 from PyQt6.QtGui import QDrag, QFocusEvent, QFont, QKeyEvent, QKeySequence, QMouseEvent, QShortcut
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QApplication,
     QComboBox,
-    QFileDialog,
     QFileIconProvider,
     QFrame,
     QGridLayout,
@@ -29,6 +28,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.audio_utils import is_audio_file
+from app.ui.file_dialog import pick_existing_directory
 from app.ui.icon_loader import icon_size, load_icon
 from app.ui.tokens import get_token, get_token_int
 from app.ui.widgets.section_header import SectionHeader
@@ -55,6 +55,8 @@ class FileBrowserList(QListWidget):
         self._root_limit: str | None = None
         self._drag_start_pos: QPoint | None = None
         self._icon_provider = QFileIconProvider()
+        self._folder_icon = load_icon(self, "folder", 13)
+        self._file_icon = self._icon_provider.icon(QFileIconProvider.IconType.File)
         self._sort_mode = SORT_NAME
         self._filter_text = ""
         self.setObjectName("fileBrowserList")
@@ -148,28 +150,29 @@ class FileBrowserList(QListWidget):
         if not path or not os.path.isdir(path):
             return
 
-        try:
-            names = os.listdir(path)
-        except OSError:
-            return
-
         dirs: list[tuple[str, str, float]] = []
         files: list[tuple[str, str, float]] = []
         needle = self._filter_text
-        for name in names:
-            if name.startswith("."):
-                continue
-            if needle and needle not in name.lower():
-                continue
-            full = os.path.join(path, name)
-            try:
-                mtime = os.path.getmtime(full)
-            except OSError:
-                mtime = 0.0
-            if os.path.isdir(full):
-                dirs.append((name, full, mtime))
-            elif os.path.isfile(full):
-                files.append((name, full, mtime))
+        try:
+            with os.scandir(path) as entries:
+                for entry in entries:
+                    name = entry.name
+                    if name.startswith("."):
+                        continue
+                    if needle and needle not in name.lower():
+                        continue
+                    try:
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    full = entry.path
+                    if is_dir:
+                        dirs.append((name, full, mtime))
+                    else:
+                        files.append((name, full, mtime))
+        except OSError:
+            return
 
         dirs.sort(key=self._entry_sort_key)
         files.sort(key=self._entry_sort_key)
@@ -183,10 +186,7 @@ class FileBrowserList(QListWidget):
         item = QListWidgetItem(name)
         item.setData(ENTRY_PATH_ROLE, full_path)
         item.setData(ENTRY_IS_DIR_ROLE, is_dir)
-        if is_dir:
-            item.setIcon(load_icon(self, "folder", 13))
-        else:
-            item.setIcon(self._icon_provider.icon(QFileInfo(full_path)))
+        item.setIcon(self._folder_icon if is_dir else self._file_icon)
         item.setToolTip(full_path)
         self.addItem(item)
 
@@ -405,13 +405,17 @@ class FileBrowserTabPage(QWidget):
     def current_path(self) -> str:
         return self.list.current_path()
 
-    def set_root_limit(self, path: str | None) -> None:
+    def set_root_limit(self, path: str | None, *, navigate_if_outside: bool = True) -> None:
         self._root_limit = os.path.abspath(path) if path else None
         self.list.set_root_limit(self._root_limit)
         locked = self._root_limit is not None
         self.btn_open.setEnabled(not locked)
         self.btn_open.setVisible(not locked)
-        if locked and not self._is_within_limit(self.current_path()):
+        if (
+            navigate_if_outside
+            and locked
+            and not self._is_within_limit(self.current_path())
+        ):
             self.list.navigate_to(self._root_limit)
 
     def navigate_to(self, path: str) -> None:
@@ -438,7 +442,7 @@ class FileBrowserTabPage(QWidget):
 
     def _choose_folder(self) -> None:
         start = self.current_path() or str(Path.home())
-        chosen = QFileDialog.getExistingDirectory(self, "Open Folder", start)
+        chosen = pick_existing_directory(self, "Open Folder", start)
         if chosen:
             self.list.navigate_to(chosen)
 
@@ -617,7 +621,7 @@ class FileBrowserPanel(QWidget):
         self.btn_browser_autoplay = make_btn(QPushButton("AUTO"))
         self.btn_browser_autoplay.setObjectName("previewAutoplayButton")
         self.btn_browser_autoplay.setCheckable(True)
-        self.btn_browser_autoplay.setChecked(True)
+        self.btn_browser_autoplay.setChecked(False)
         self.btn_browser_autoplay.setToolTip("Auto-play when selecting a file in the browser")
         self.btn_browser_autoplay.setFixedSize(btn_w, btn_h)
 
@@ -695,12 +699,16 @@ class FileBrowserPanel(QWidget):
             style.polish(frame)
             frame.update()
 
-    def set_project_root(self, path: str, title: str | None = None) -> None:
+    def set_project_root(
+        self, path: str, title: str | None = None, *, reload: bool = True
+    ) -> None:
         self._project_root = os.path.abspath(path)
-        self._project_page.set_root_limit(self._project_root)
-        self._project_page.navigate_to(self._project_root)
+        self._project_page.set_root_limit(
+            self._project_root, navigate_if_outside=reload
+        )
         self.tabs.setTabText(0, title or "Project")
-        self._project_page.refresh()
+        if reload:
+            self._project_page.navigate_to(self._project_root)
 
     def add_user_tab(
         self,

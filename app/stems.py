@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -241,7 +242,7 @@ class StemChannelState:
     def to_dict(self) -> dict:
         data: dict = {"gain_db": round(float(self.gain_db), 3)}
         if isinstance(self.eq, dict) and (self.eq.get("bands") or self.eq.get("bypass")):
-            data["eq"] = self.eq
+            data["eq"] = copy.deepcopy(self.eq)
         return data
 
     @classmethod

@@ -241,6 +241,7 @@ def load_icon(
         "folder": QStyle.StandardPixmap.SP_DirIcon,
         "eject": QStyle.StandardPixmap.SP_DialogCloseButton,
         "add": QStyle.StandardPixmap.SP_FileDialogNewFolder,
+        "file": QStyle.StandardPixmap.SP_FileIcon,
         "remove": QStyle.StandardPixmap.SP_TrashIcon,
         "import": QStyle.StandardPixmap.SP_DialogOpenButton,
         "export": QStyle.StandardPixmap.SP_DialogSaveButton,

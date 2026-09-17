@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtWidgets import QDoubleSpinBox, QHBoxLayout, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QDoubleSpinBox, QHBoxLayout, QWidget
 
-from app.ui.icon_loader import icon_size, load_icon
-from app.ui.tokens import get_token_int
+from app.ui.widgets.value_stepper import _arrow_column, arrow_stack_height
 
 
 class FloatValueStepper(QWidget):
@@ -25,11 +24,9 @@ class FloatValueStepper(QWidget):
         parent=None,
     ):
         super().__init__(parent)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self._step = float(step)
-        stepper_btn = get_token_int("sizes.stepper_btn", 12)
-        stepper_icon = get_token_int("sizes.stepper_icon", 8)
-        arrow_spacing = get_token_int("spacing.xs", 2)
-        arrow_stack_height = stepper_btn * 2 + arrow_spacing
+        stack_h = arrow_stack_height()
         label_width = value_width if value_width is not None else 56
 
         self._spin = QDoubleSpinBox()
@@ -40,33 +37,19 @@ class FloatValueStepper(QWidget):
         self._spin.setObjectName("stepperSpin")
         self._spin.setButtonSymbols(QDoubleSpinBox.ButtonSymbols.NoButtons)
         self._spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._spin.setFixedSize(label_width, arrow_stack_height)
+        self._spin.setFixedSize(label_width, stack_h)
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        arrows = QVBoxLayout()
-        arrows.setContentsMargins(0, 0, 0, 0)
-        arrows.setSpacing(arrow_spacing)
-
-        btn_up = QPushButton()
-        btn_up.setObjectName("stepperBtn")
-        btn_up.setFixedSize(stepper_btn, stepper_btn)
-        btn_up.setIcon(load_icon(host, "up", stepper_icon))
-        btn_up.setIconSize(icon_size(stepper_icon))
-
-        btn_down = QPushButton()
-        btn_down.setObjectName("stepperBtn")
-        btn_down.setFixedSize(stepper_btn, stepper_btn)
-        btn_down.setIcon(load_icon(host, "down", stepper_icon))
-        btn_down.setIconSize(icon_size(stepper_icon))
-
-        btn_up.clicked.connect(lambda: self._adjust(1))
-        btn_down.clicked.connect(lambda: self._adjust(-1))
-        arrows.addWidget(btn_up)
-        arrows.addWidget(btn_down)
-
+        arrows, btn_up, btn_down = _arrow_column(
+            host,
+            lambda: self._adjust(1),
+            lambda: self._adjust(-1),
+        )
+        self._btn_up = btn_up
+        self._btn_down = btn_down
         layout.addLayout(arrows)
         layout.addWidget(self._spin)
         self._spin.valueChanged.connect(self._on_spin)

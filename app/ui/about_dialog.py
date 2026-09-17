@@ -52,7 +52,7 @@ Media server for live / broadcast use.
         (
             "Third-party",
             "PyQt6 (GPL-3.0), mutagen (GPL-2.0+), pydub / moderngl (MIT), "
-            "numpy / scipy / PyAV (BSD), librosa (ISC). Qt is used under LGPL.",
+            "numpy / scipy / PyAV (BSD), librosa (ISC), pedalboard (GPL/MIT). Qt is used under LGPL.",
         ),
     ]
 

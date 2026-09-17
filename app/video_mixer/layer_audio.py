@@ -252,7 +252,6 @@ class LayerAudioStore:
                             audible = True
                     continue
                 wanted.add(prog_layer.id)
-                audible = True
                 player = self._players.get(prog_layer.id)
                 if player is None or player.path != prog_layer.path:
                     if player is not None:
@@ -273,6 +272,8 @@ class LayerAudioStore:
                     muted=prog_layer.muted,
                     visible=prog_layer.visible,
                 )
+                if player.is_output_active:
+                    audible = True
 
         program_ids = {
             layer.id for layer in program.layers if not layer.file_missing

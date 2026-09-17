@@ -12,9 +12,9 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QHBoxLayout,
     QLabel,
-    QLayout,
     QPushButton,
     QSizePolicy,
+    QSplitter,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 from app.constants import MAX_PLAYLISTS, FADE_PRESETS_MS, FADE_PRESET_SHORTCUTS, fade_preset_label
 from app.ui.icon_loader import icon_size, load_icon
 from app.ui.tokens import get_token_int
+from app.ui.widgets.flow_layout import FlowFrame, FlowLayout
 from app.ui.widgets.section_header import SectionHeader
 from app.ui.widgets.segment_button import SegmentButtonGroup
 from app.ui.widgets.square_checkbox import SquareCheckBox
@@ -89,7 +90,6 @@ class MainWindowUi:
         root.setContentsMargins(11, 12, 11, 12)
         root.setSpacing(6)
 
-        from PyQt6.QtWidgets import QSplitter
         from app.widgets.file_browser import FileBrowserPanel
 
         audio = QWidget()
@@ -125,26 +125,38 @@ class MainWindowUi:
 
         window.timeline_section = self._build_timeline(window)
 
-        # Left stack: Control → ON AIR → PREVIEW; EQ to the right
+        # Left stack: Control → ON AIR → PREVIEW. Drag the splitter to size VOLUME / EQ.
         left_stack = QWidget()
         left_stack.setObjectName("audioLeftStack")
+        left_stack.setMinimumWidth(96)
+        left_stack.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
         left_stack_layout = QVBoxLayout(left_stack)
         left_stack_layout.setContentsMargins(0, 0, 0, 0)
         left_stack_layout.setSpacing(4)
+        left_stack_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         left_stack_layout.addWidget(window.control_panel_section, 0)
-        left_stack_layout.addWidget(window.timeline_section, 0)
+        left_stack_layout.addWidget(window.timeline_section, 1)
 
-        main_row = QWidget()
-        main_row.setObjectName("audioMainRow")
-        main_row_layout = QHBoxLayout(main_row)
-        main_row_layout.setContentsMargins(0, 0, 0, 0)
-        main_row_layout.setSpacing(6)
-        main_row_layout.addWidget(left_stack, 3)
-        main_row_layout.addWidget(window.file_properties_panel, 2)
-        window.audio_top_row = main_row
+        window.file_properties_panel.setMinimumWidth(260)
+        window.file_properties_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+
+        eq_splitter = QSplitter(Qt.Orientation.Horizontal)
+        eq_splitter.setObjectName("audioEqSplitter")
+        eq_splitter.setChildrenCollapsible(False)
+        eq_splitter.addWidget(left_stack)
+        eq_splitter.addWidget(window.file_properties_panel)
+        eq_splitter.setStretchFactor(0, 1)
+        eq_splitter.setStretchFactor(1, 3)
+        eq_splitter.setSizes([360, 720])
+        window.eq_row_splitter = eq_splitter
+        window.audio_top_row = eq_splitter
         window.audio_left_stack = left_stack
 
-        audio_layout.addWidget(main_row)
+        audio_layout.addWidget(eq_splitter)
         audio_layout.addWidget(window.playlist_section, 1)
 
         project_root = getattr(window, "_pending_project_root", None)
@@ -206,9 +218,38 @@ class MainWindowUi:
         window.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         window.set_playlist_columns(2)
 
+    @staticmethod
+    def _hfw_policy(
+        horizontal: QSizePolicy.Policy,
+        vertical: QSizePolicy.Policy,
+    ) -> QSizePolicy:
+        policy = QSizePolicy(horizontal, vertical)
+        policy.setHeightForWidth(True)
+        return policy
+
+    @staticmethod
+    def _labeled_control(label_text: str, widget: QWidget) -> QWidget:
+        col = QWidget()
+        col.setSizePolicy(
+            MainWindowUi._hfw_policy(
+                QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred
+            )
+        )
+        layout = QVBoxLayout(col)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(2)
+        lbl = QLabel(label_text)
+        lbl.setObjectName("sectionLabel")
+        lbl.setWordWrap(True)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
+        lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        layout.addWidget(lbl)
+        layout.addWidget(widget)
+        return col
+
     def _build_control_panel(self, window: AudioPlayer) -> QWidget:
-        """Две линии: подписи сверху, виджеты снизу; время справа."""
-        section = QFrame()
+        """Подписи сверху, виджеты снизу; при сужении блоки переносятся."""
+        section = FlowFrame()
         section.setObjectName("controlPanelSection")
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 2)
@@ -222,28 +263,15 @@ class MainWindowUi:
         window.btn_pause = None
         window.btn_stop = None
 
-        grid = QGridLayout()
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(2)
-        col = 0
+        flow = FlowLayout()
+        flow.setHorizontalSpacing(12)
+        flow.setVerticalSpacing(6)
 
         def add_labeled(label_text: str, widget: QWidget) -> None:
-            nonlocal col
-            lbl = QLabel(label_text)
-            lbl.setObjectName("sectionLabel")
-            lbl.setAlignment(Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
-            grid.addWidget(lbl, 0, col, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignBottom)
-            grid.addWidget(
-                widget, 1, col, Qt.AlignmentFlag.AlignHCenter | Qt.AlignmentFlag.AlignVCenter
-            )
-            col += 1
+            flow.addWidget(self._labeled_control(label_text, widget))
 
         window.playback_mode_group = SegmentButtonGroup(
             [("loop", "LOOP"), ("next", "NEXT"), ("stop", "STOP")],
-        )
-        window.playback_mode_group.setSizePolicy(
-            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
         )
         window.playback_mode_group.set_value("next")
         window.playback_mode_group.valueChanged.connect(window.on_playback_mode_changed)
@@ -258,9 +286,6 @@ class MainWindowUi:
                 ("crossfade", "XFADE"),
                 ("high_cut", "HCUT"),
             ],
-        )
-        window.fade_mode_group.setSizePolicy(
-            QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed
         )
         window.fade_mode_group.set_value("sequential")
         window.fade_mode_group.setToolTip(
@@ -297,13 +322,16 @@ class MainWindowUi:
         fade_ms_layout.addWidget(fade_ms_unit)
 
         fade_col = QWidget()
+        fade_col.setSizePolicy(
+            self._hfw_policy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        )
         fade_col_layout = QVBoxLayout(fade_col)
         fade_col_layout.setContentsMargins(0, 0, 0, 0)
         fade_col_layout.setSpacing(2)
         fade_col_layout.addWidget(fade_ms_wrap)
-        preset_row = QHBoxLayout()
-        preset_row.setContentsMargins(0, 0, 0, 0)
-        preset_row.setSpacing(2)
+        preset_row = FlowLayout()
+        preset_row.setHorizontalSpacing(2)
+        preset_row.setVerticalSpacing(2)
         window._air_fade_preset_group = QButtonGroup(window)
         window._air_fade_preset_group.setExclusive(True)
         window._air_fade_preset_buttons: dict[int, QPushButton] = {}
@@ -388,15 +416,17 @@ class MainWindowUi:
         window.bpm_label = window.bpm_value_label
         add_labeled("BPM", window.bpm_value_label)
 
-        grid.setColumnStretch(col, 1)
         spacer = QWidget()
+        spacer.setObjectName("controlPanelFlex")
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        grid.addWidget(spacer, 0, col, 2, 1)
-        col += 1
+        spacer.setMinimumSize(0, 0)
+        flow.addWidget(spacer)
 
         # Справа: ON AIR + Elapsed/Remaining, под ними крупные цифры
         time_wrap = QWidget()
-        time_wrap.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        time_wrap.setSizePolicy(
+            self._hfw_policy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        )
         time_layout = QVBoxLayout(time_wrap)
         time_layout.setContentsMargins(0, 0, 0, 0)
         time_layout.setSpacing(2)
@@ -419,17 +449,16 @@ class MainWindowUi:
         )
         window.btn_space.clicked.connect(window.handle_space)
 
-        time_header = QHBoxLayout()
-        time_header.setContentsMargins(0, 0, 0, 0)
-        time_header.setSpacing(8)
-        time_header.addWidget(window.btn_space, 0, Qt.AlignmentFlag.AlignVCenter)
-        time_header.addWidget(window.time_mode_group, 0, Qt.AlignmentFlag.AlignVCenter)
+        time_header = FlowLayout()
+        time_header.setHorizontalSpacing(8)
+        time_header.setVerticalSpacing(2)
+        time_header.addWidget(window.btn_space)
+        time_header.addWidget(window.time_mode_group)
         time_layout.addLayout(time_header, 0)
 
-        time_values = QHBoxLayout()
-        time_values.setSpacing(8)
-        time_values.setContentsMargins(0, 0, 0, 0)
-        time_values.addStretch(1)
+        time_values = FlowLayout()
+        time_values.setHorizontalSpacing(8)
+        time_values.setVerticalSpacing(0)
         window.time_large_label = QLabel("--:--")
         window.time_large_label.setObjectName("timeLarge")
         window.time_large_label.setAlignment(
@@ -447,7 +476,7 @@ class MainWindowUi:
         time_values.addWidget(window.time_duration_label)
         time_layout.addLayout(time_values)
 
-        grid.addWidget(time_wrap, 0, col, 2, 1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        flow.addWidget(time_wrap)
 
         window.time_current_label = window.time_large_label
         window.time_total_label = window.time_duration_label
@@ -456,7 +485,7 @@ class MainWindowUi:
         window.radio_time_elapsed = None
         window.radio_time_remaining = None
 
-        layout.addLayout(grid)
+        layout.addLayout(flow)
         return section
 
     @staticmethod
@@ -475,6 +504,7 @@ class MainWindowUi:
         """Стек: ON AIR сверху, PREVIEW снизу (без заголовка TIMELINE)."""
         section = QFrame()
         section.setObjectName("timelineSection")
+        section.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 8)
         layout.setSpacing(6)
@@ -508,6 +538,13 @@ class MainWindowUi:
         window.air_output_combo = QComboBox()
         window.air_output_combo.setObjectName("airOutputCombo")
         window.air_output_combo.setToolTip("Audio output device for on-air playback")
+        window.air_output_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        window.air_output_combo.setMinimumContentsLength(8)
+        window.air_output_combo.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed
+        )
         air_device_row.addWidget(air_device_label)
         air_device_row.addWidget(window.air_output_combo, 1)
         air_layout.addLayout(air_device_row)
@@ -530,7 +567,7 @@ class MainWindowUi:
             pause_slot=window.pause,
             stop_slot=window.stop,
         ))
-        layout.addWidget(air_col)
+        layout.addWidget(air_col, 1)
 
         # --- Preview ---
         preview_col = QFrame()
@@ -578,7 +615,7 @@ class MainWindowUi:
             stop_slot=window.preview_stop,
             autoplay_slot=window.on_preview_autoplay_toggled,
         ))
-        layout.addWidget(preview_col)
+        layout.addWidget(preview_col, 1)
 
         return section
 
@@ -616,6 +653,8 @@ class MainWindowUi:
         wave_row.setSpacing(6)
         wave_height = get_token_int("sizes.preview_waveform_height", 72)
         waveform = AudioWaveform(bar_area_height=wave_height)
+        waveform.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        waveform.setMinimumWidth(80)
         if preview:
             waveform.setObjectName("previewWaveform")
         setattr(window, waveform_attr, waveform)
@@ -680,7 +719,7 @@ class MainWindowUi:
                     "AUTO", "Auto-play preview when selecting a track", checkable=True
                 )
                 btn_autoplay.setObjectName("previewAutoplayButton")
-                btn_autoplay.setChecked(True)
+                btn_autoplay.setChecked(False)
                 btn_autoplay.toggled.connect(autoplay_slot)
                 window.btn_preview_autoplay = btn_autoplay
                 wave_tools.addWidget(btn_autoplay, row_i, 1)
@@ -720,8 +759,11 @@ class MainWindowUi:
             window.btn_air_eject = btn_eject
         wave_tools.addWidget(btn_eject, row_i, 1)
 
+        wave_tools_wrap = QWidget()
+        wave_tools_wrap.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Maximum)
+        wave_tools_wrap.setLayout(wave_tools)
         wave_row.addWidget(waveform, 1)
-        wave_row.addLayout(wave_tools)
+        wave_row.addWidget(wave_tools_wrap, 0, Qt.AlignmentFlag.AlignTop)
         block.addLayout(wave_row)
 
         # Сохраняем для player.py, но не показываем

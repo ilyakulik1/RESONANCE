@@ -12,6 +12,7 @@ from app.playlist_io import (
     DURATION_ROLE,
     STEMS_ROLE,
     is_item_file_missing,
+    is_item_placeholder,
 )
 from app.time_utils import format_time_ms
 from app.ui.tokens import get_token
@@ -255,7 +256,10 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
         if layout.name_rect.width() > 0:
             painter.setFont(option.font)
-            if is_item_file_missing(item):
+            placeholder = is_item_placeholder(item)
+            if placeholder:
+                painter.setPen(self._color("text_muted", "#808080"))
+            elif is_item_file_missing(item):
                 painter.setPen(self._color("accent_red", "#e45656"))
             elif selected:
                 painter.setPen(self._color("text_on_accent", "#ffffff"))
