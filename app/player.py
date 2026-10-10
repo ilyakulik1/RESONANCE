@@ -22,6 +22,7 @@ from PyQt6.QtWidgets import (
     QProgressBar, QLabel, QMenu,
 )
 
+from app.air_mix_bus import AirMixBus, MixBusChannel
 from app.audio_devices import (
     NO_OUTPUT_DEVICE_ID,
     combo_selected_device_id,
@@ -34,9 +35,16 @@ from app.audio_devices import (
 from app.audio_utils import is_audio_file
 from app.bpm_detector import BpmDetector
 from app.config import get_config_path
-from app.constants import APP_NAME, MAX_PLAYLISTS, FADE_PRESETS_MS, FADE_PRESET_SHORTCUTS, fade_preset_label
-from app.eq_dsp import EqProcessor
-from app.eq_state import EqBand, EqState
+from app.constants import (
+    APP_NAME,
+    FADE_PRESETS_MS,
+    FADE_PRESET_SHORTCUTS,
+    MAIN_CHANNEL_ID,
+    MAX_AUX_CHANNELS,
+    MAX_PLAYLISTS,
+    fade_preset_label,
+)
+from app.eq_state import EqState
 from app.midi import (
     FADE_MODE_TAKE_TARGETS,
     MidiHub,
@@ -46,9 +54,12 @@ from app.midi import (
     TARGET_FADE_SEQ,
     TARGET_FADE_XFADE,
     TARGET_MASTER_VOLUME,
+    TARGET_MIXER_FADER_MASTER,
     TARGET_ON_AIR,
     TARGET_STOP,
+    is_mixer_fader_target,
     midi_available,
+    mixer_fader_target,
 )
 from app.pcm_air_player import PcmAirPlayer
 
@@ -63,6 +74,7 @@ from app.playlist_io import (
     TRACK_COLOR_PRESETS,
     TRACKS_CLIPBOARD_MIME,
     ensure_item_track_id,
+    get_item_audio_channel_id,
     get_item_bpm,
     get_item_color,
     get_item_duration,
@@ -76,6 +88,7 @@ from app.playlist_io import (
     item_to_snapshot,
     is_item_placeholder,
     load_playlist_from_entries,
+    set_item_audio_channel_id,
     set_item_bpm,
     set_item_color,
     set_item_duration,
@@ -84,7 +97,7 @@ from app.playlist_io import (
     set_item_lufs,
     set_item_mixer_scene_id,
 )
-from app.loudness import TARGET_LUFS, clamp_gain_db, clamp_target_lufs, gain_db_to_target
+from app.loudness import clamp_gain_db, clamp_track_gain_db, volume_to_gain_db
 from app.project import (
     ProjectColumnState,
     ProjectManager,
@@ -111,6 +124,7 @@ from app.widgets.audio_waveform import AudioWaveform, TimelineState
 
 
 from app.widgets.master_eq_window import MasterEqWindow
+from app.widgets.playlist_item_delegate import PlaylistItemDelegate
 from app.widgets.playlist_widget import PlaylistWidget
 from app.widgets.stem_fader import clamp_stem_gain_db
 from app.remote.controller import DEFAULT_REMOTE_PORT, RemoteControl
@@ -153,12 +167,35 @@ class AudioPlayer(QMainWindow):
         self._outputs = [p.audioOutput() for p in self._players]
         self._active_player_idx = 0
         self._outputs[1].setVolume(0.0)
-        self._master_eq = EqProcessor(channels=2, sample_rate=44100.0)
-        self._master_eq_state: dict = {}
-        self._master_eq_window: MasterEqWindow | None = None
-        for idx, air_player in enumerate(self._players):
-            air_player.set_master_eq(self._master_eq, self._master_eq_state)
 
+        self._mix_bus = AirMixBus(self)
+        self._master_eq = self._mix_bus.master_eq
+        self._master_eq_state: dict = {}
+        self._master_eq_presets: dict[str, dict] = {}
+        self._master_eq_preset_name: str | None = None
+        self._master_eq_window: MasterEqWindow | None = None
+        self._mixer_channels: list[dict] = [
+            {
+                "id": MAIN_CHANNEL_ID,
+                "name": "Main",
+                "is_main": True,
+                "fader_db": 0.0,
+                "mute": False,
+            }
+        ]
+        self._aux_players: dict[str, PcmAirPlayer] = {}
+        self._aux_channel_meta: dict[str, dict] = {}
+        self._mixer_channel_counter = 1
+        for air_player in self._players:
+            air_player.set_external_mix(True)
+        self._mix_bus.sampleRateChanged.connect(self._on_mix_bus_sample_rate)
+        self._mix_bus.peaksUpdated.connect(
+            self._on_mixer_peaks, Qt.ConnectionType.QueuedConnection
+        )
+        self._rebuild_mix_bus_channels()
+        # Master gain stays 1.0 on the bus — program level uses deck volumes
+        # (same as pre-mixer) so timeline/crossfade math stays unchanged.
+        self._mix_bus.set_master_gain(1.0)
         self.config_path = get_config_path("config.json")
         self.project = ProjectManager(_peek_saved_project_root())
         self.project.save_signals.failed.connect(self._on_project_save_failed)
@@ -177,7 +214,6 @@ class AudioPlayer(QMainWindow):
         self._track_gain_db: dict[str, float] = {}
         self._track_lufs: dict[str, float] = {}
         self._track_stem_state: dict[str, TrackStemState] = {}
-        self._target_lufs = TARGET_LUFS
         self._eq_bound_path: str | None = None
         self._eq_bound_item = None
         self._displayed_track_key: str | None = None
@@ -368,6 +404,698 @@ class AudioPlayer(QMainWindow):
         self._outputs[idx].setVolume(volume)
         self._outputs[idx].setMuted(self._air_no_output)
 
+    def _mixer_config_dict(self) -> dict:
+        return {
+            "channels": [
+                {
+                    "id": c["id"],
+                    "name": c["name"],
+                    "is_main": bool(c.get("is_main")),
+                    "fader_db": float(c.get("fader_db", 0.0)),
+                    "mute": bool(c.get("mute", False)),
+                }
+                for c in self._mixer_channels
+            ],
+            "channel_counter": int(self._mixer_channel_counter),
+            "limiter": self._mix_bus.limiter.to_dict(),
+        }
+
+    def _load_mixer_config(self, data: dict) -> None:
+        # Tear down existing aux
+        for cid, player in list(self._aux_players.items()):
+            try:
+                player.stop()
+            except Exception:
+                pass
+            player.deleteLater()
+        self._aux_players.clear()
+        self._aux_channel_meta.clear()
+
+        channels_raw = data.get("channels")
+        loaded: list[dict] = []
+        if isinstance(channels_raw, list):
+            for entry in channels_raw:
+                if not isinstance(entry, dict):
+                    continue
+                cid = str(entry.get("id") or "").strip()
+                if not cid:
+                    continue
+                is_main = bool(entry.get("is_main")) or cid == MAIN_CHANNEL_ID
+                if is_main:
+                    loaded.append(
+                        {
+                            "id": MAIN_CHANNEL_ID,
+                            "name": str(entry.get("name") or "Main"),
+                            "is_main": True,
+                            "fader_db": float(entry.get("fader_db", 0.0)),
+                            "mute": bool(entry.get("mute", False)),
+                        }
+                    )
+                    continue
+                if len([c for c in loaded if not c.get("is_main")]) >= MAX_AUX_CHANNELS:
+                    continue
+                player = PcmAirPlayer(self)
+                player.set_external_mix(True)
+                player.set_mix_sample_rate(self._mix_bus.sample_rate())
+                player.audioOutput().setVolume(1.0)
+                self._aux_players[cid] = player
+                loaded.append(
+                    {
+                        "id": cid,
+                        "name": str(entry.get("name") or cid),
+                        "is_main": False,
+                        "fader_db": float(entry.get("fader_db", 0.0)),
+                        "mute": bool(entry.get("mute", False)),
+                    }
+                )
+        if not any(c.get("is_main") for c in loaded):
+            loaded.insert(
+                0,
+                {
+                    "id": MAIN_CHANNEL_ID,
+                    "name": "Main",
+                    "is_main": True,
+                    "fader_db": 0.0,
+                    "mute": False,
+                },
+            )
+        self._mixer_channels = loaded
+        try:
+            self._mixer_channel_counter = max(
+                1, int(data.get("channel_counter", self._mixer_channel_counter))
+            )
+        except (TypeError, ValueError):
+            pass
+        lim = data.get("limiter")
+        if isinstance(lim, dict):
+            self._mix_bus.limiter.load_dict(lim)
+        self._rebuild_mix_bus_channels()
+        self._refresh_mixer_panel()
+
+    def _on_mix_bus_sample_rate(self, rate: int) -> None:
+        rate = int(rate)
+        for player in self._players:
+            player.set_mix_sample_rate(rate)
+        for player in self._aux_players.values():
+            player.set_mix_sample_rate(rate)
+
+    def _on_mixer_peaks(self, peaks: dict) -> None:
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is not None:
+            panel.set_peaks(peaks)
+
+    def _rebuild_mix_bus_channels(self) -> None:
+        channels: list[MixBusChannel] = []
+        for info in self._mixer_channels:
+            cid = str(info["id"])
+            if info.get("is_main"):
+                sources = [
+                    (
+                        self._players[0].read_float_interleaved,
+                        self._outputs[0].effective_volume,
+                    ),
+                    (
+                        self._players[1].read_float_interleaved,
+                        self._outputs[1].effective_volume,
+                    ),
+                ]
+            else:
+                player = self._aux_players.get(cid)
+                if player is None:
+                    continue
+                out = player.audioOutput()
+                sources = [(player.read_float_interleaved, out.effective_volume)]
+            channels.append(
+                MixBusChannel(
+                    channel_id=cid,
+                    name=str(info.get("name") or cid),
+                    is_main=bool(info.get("is_main")),
+                    mute=bool(info.get("mute", False)),
+                    fader_db=float(info.get("fader_db", 0.0)),
+                    sources=sources,
+                )
+            )
+        self._mix_bus.set_channels(channels)
+
+    def _mixer_channel_infos_for_ui(self) -> list[dict]:
+        return [dict(info) for info in self._mixer_channels]
+
+    def _known_mixer_channel_ids(self) -> set[str]:
+        return {str(c["id"]) for c in self._mixer_channels}
+
+    def _resolve_target_channel_id(self, item) -> str:
+        cid = get_item_audio_channel_id(item) if item is not None else None
+        if not cid or cid == MAIN_CHANNEL_ID:
+            return MAIN_CHANNEL_ID
+        if cid in self._known_mixer_channel_ids():
+            return cid
+        return MAIN_CHANNEL_ID
+
+    def add_mixer_channel(self) -> str | None:
+        aux_count = sum(1 for c in self._mixer_channels if not c.get("is_main"))
+        if aux_count >= MAX_AUX_CHANNELS:
+            return None
+        self._mixer_channel_counter += 1
+        cid = f"ch{self._mixer_channel_counter}"
+        while cid in self._known_mixer_channel_ids():
+            self._mixer_channel_counter += 1
+            cid = f"ch{self._mixer_channel_counter}"
+        name = f"Ch {self._mixer_channel_counter}"
+        player = PcmAirPlayer(self)
+        player.set_external_mix(True)
+        player.set_mix_sample_rate(self._mix_bus.sample_rate())
+        player.audioOutput().setVolume(1.0)
+        self._aux_players[cid] = player
+        self._mixer_channels.append(
+            {
+                "id": cid,
+                "name": name,
+                "is_main": False,
+                "fader_db": 0.0,
+                "mute": False,
+            }
+        )
+        self._rebuild_mix_bus_channels()
+        self._mix_bus.ensure_running()
+        self._refresh_mixer_panel()
+        self.save_config()
+        return cid
+
+    def remove_mixer_channel(self, channel_id: str) -> None:
+        cid = str(channel_id or "").strip()
+        if not cid or cid == MAIN_CHANNEL_ID:
+            return
+        info = next((c for c in self._mixer_channels if c["id"] == cid), None)
+        if info is None or info.get("is_main"):
+            return
+        player = self._aux_players.pop(cid, None)
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+            player.deleteLater()
+        self._aux_channel_meta.pop(cid, None)
+        self._mixer_channels = [c for c in self._mixer_channels if c["id"] != cid]
+        self._rebuild_mix_bus_channels()
+        self._refresh_mixer_panel()
+        # Reassign tracks that pointed at removed channel → Main
+        self._reassign_playlist_channels(cid, MAIN_CHANNEL_ID)
+        self.save_config()
+
+    def _reassign_playlist_channels(self, old_id: str, new_id: str) -> None:
+        for col in range(1, MAX_PLAYLISTS + 1):
+            playlist = self.get_playlist(col)
+            if playlist is None:
+                continue
+            for i in range(playlist.count()):
+                item = playlist.item(i)
+                if get_item_audio_channel_id(item) == old_id:
+                    set_item_audio_channel_id(
+                        item, None if new_id == MAIN_CHANNEL_ID else new_id
+                    )
+
+    def _set_mixer_channel_fader(self, channel_id: str, fader_db: float) -> None:
+        for info in self._mixer_channels:
+            if info["id"] == channel_id:
+                info["fader_db"] = float(fader_db)
+                break
+        self._mix_bus.update_channel_fader(channel_id, float(fader_db))
+        if not hasattr(self, "_mixer_fader_save_timer"):
+            self._mixer_fader_save_timer = QTimer(self)
+            self._mixer_fader_save_timer.setSingleShot(True)
+            self._mixer_fader_save_timer.timeout.connect(self.save_config)
+        self._mixer_fader_save_timer.start(400)
+
+    def _set_mixer_channel_mute(self, channel_id: str, muted: bool) -> None:
+        for info in self._mixer_channels:
+            if info["id"] == channel_id:
+                info["mute"] = bool(muted)
+                self._mix_bus.update_channel_fader(
+                    channel_id, float(info.get("fader_db", 0.0)), mute=bool(muted)
+                )
+                break
+        self.save_config()
+
+    def _refresh_mixer_panel(self) -> None:
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is None:
+            return
+        panel.rebuild_channels(self._mixer_channel_infos_for_ui())
+        panel.master_strip.set_master_volume(self._playback_volume)
+        panel.master_strip.set_limiter(
+            bypass=self._mix_bus.limiter.is_bypass(),
+            threshold=self._mix_bus.limiter.threshold,
+        )
+        self._sync_mixer_midi_labels()
+
+    def _stop_all_aux_channels(self) -> None:
+        for player in self._aux_players.values():
+            try:
+                player.stop()
+            except Exception:
+                pass
+        self._aux_channel_meta.clear()
+        self._refresh_aux_playlist_overlays(relayout=True)
+
+    def _resolve_gain_db_for_item(self, item, file_path: str | None) -> float:
+        """Best-effort track gain: instance key → item role → path → 0 dB."""
+        key = self._settings_key(item=item, file_path=file_path)
+        if key and key in self._track_gain_db:
+            return clamp_gain_db(float(self._track_gain_db[key]))
+
+        if item is not None:
+            item_gain = get_item_gain_db(item)
+            if item_gain is not None:
+                return clamp_gain_db(float(item_gain))
+
+        abs_path = os.path.abspath(file_path) if file_path else None
+        if abs_path and abs_path in self._track_gain_db:
+            return clamp_gain_db(float(self._track_gain_db[abs_path]))
+        return 0.0
+
+    def _apply_item_dsp_to_player(self, player: PcmAirPlayer, item, file_path: str) -> None:
+        if item is not None:
+            self._adopt_item_settings(item)
+        key = self._settings_key(item=item, file_path=file_path)
+        eq_dict = self._track_eq_state.get(key) if key else None
+        if isinstance(eq_dict, dict) and eq_dict.get("bands"):
+            player.set_eq_state(EqState.from_dict(eq_dict))
+        else:
+            player.set_eq_state(EqState())
+        gain = self._resolve_gain_db_for_item(item, file_path)
+        if key:
+            self._track_gain_db[key] = gain
+            if item is not None:
+                set_item_gain_db(item, gain)
+        player.set_track_gain_db(gain)
+        stem_state = self._track_stem_state.get(key) if key else None
+        if stem_state is None or not stem_state.files_ok():
+            player.clear_stem_mix()
+            return
+        player.set_stem_mix(
+            vocals_path=stem_state.vocals_path,
+            instrumental_path=stem_state.instrumental_path,
+            vocals_eq=EqState.from_dict(stem_state.vocals.eq),
+            instrumental_eq=EqState.from_dict(stem_state.instrumental.eq),
+            vocals_gain_db=stem_state.vocals.gain_db,
+            instrumental_gain_db=stem_state.instrumental.gain_db,
+        )
+
+    def _aux_playback_overlay_for_item(self, item) -> dict | None:
+        if item is None:
+            return None
+        from PyQt6.QtMultimedia import QMediaPlayer as _QMP
+
+        for cid, meta in self._aux_channel_meta.items():
+            if meta.get("item") is not item:
+                continue
+            player = self._aux_players.get(cid)
+            if player is None:
+                return None
+            if player.playbackState() != _QMP.PlaybackState.PlayingState:
+                return None
+            try:
+                if player.mediaStatus() == _QMP.MediaStatus.EndOfMedia:
+                    return None
+            except Exception:
+                pass
+            path = meta.get("path") or get_item_file_path(item)
+            info = next((c for c in self._mixer_channels if c["id"] == cid), None)
+            duration = int(player.duration() or 0)
+            if duration <= 0:
+                duration = int(get_item_duration(item) or 0)
+            position = int(player.position())
+            timeline = meta.get("timeline")
+            if isinstance(timeline, TimelineState):
+                range_start = int(timeline.range_start_ms or 0)
+                range_end = int(timeline.range_end_ms or 0)
+                if range_end > range_start:
+                    # Progress within the trimmed region (like preview take).
+                    position = max(0, position - range_start)
+                    duration = range_end - range_start
+            if duration > 0 and position >= max(0, duration - 40):
+                return None
+            return {
+                "channel_id": cid,
+                "channel_name": str((info or {}).get("name") or cid),
+                "path": path,
+                "position_ms": position,
+                "duration_ms": duration,
+            }
+        return None
+
+    def _refresh_aux_playlist_overlays(self, *, relayout: bool = False) -> None:
+        playlists = getattr(self, "playlists", []) or []
+        if not playlists:
+            return
+        touched: set[int] = set()
+        for meta in self._aux_channel_meta.values():
+            num = meta.get("playlist")
+            if isinstance(num, int):
+                touched.add(num)
+            item = meta.get("item")
+            if item is not None:
+                widget = item.listWidget()
+                if isinstance(widget, PlaylistWidget):
+                    touched.add(widget.playlist_num)
+        targets = (
+            [p for p in playlists if p.playlist_num in touched]
+            if touched and not relayout
+            else list(playlists)
+        )
+        if not touched and not relayout:
+            return
+        for playlist in targets:
+            if relayout:
+                model = playlist.model()
+                if model is not None and playlist.count() > 0:
+                    top = model.index(0, 0)
+                    bottom = model.index(playlist.count() - 1, 0)
+                    model.dataChanged.emit(top, bottom)
+                playlist.doItemsLayout()
+            playlist.viewport().update()
+
+    def _wire_playlist_aux_overlays(self) -> None:
+        for playlist in getattr(self, "playlists", []) or []:
+            delegate = playlist.itemDelegate()
+            if isinstance(delegate, PlaylistItemDelegate):
+                delegate.set_aux_playback_provider(self._aux_playback_overlay_for_item)
+                delegate.set_gain_volume_handler(self._on_playlist_item_gain_volume)
+
+    def _set_aux_players_volume(self, volume: float) -> None:
+        vol = max(0.0, min(1.0, float(volume)))
+        for cid, player in self._aux_players.items():
+            if cid in self._aux_channel_meta:
+                self._apply_aux_timeline_volume(cid, base_volume=vol)
+                continue
+            out = player.audioOutput()
+            out.setVolume(vol)
+            out.setMuted(bool(self._air_no_output))
+
+    def _resolve_timeline_for_play(self, item, file_path: str) -> TimelineState:
+        """Trim/fade markers for an item (preview/air edits), else full file."""
+        duration = 0
+        if item is not None:
+            duration = int(get_item_duration(item) or 0)
+        key = self._timeline_lookup_key(file_path, item)
+        state = self._track_timeline_state.get(key) if key else None
+        if state is None:
+            return self._default_timeline_state(duration)
+        range_end_ms = int(state.range_end_ms or 0)
+        if range_end_ms <= 0 and duration > 0:
+            range_end_ms = duration
+        return TimelineState(
+            range_start_ms=int(state.range_start_ms or 0),
+            range_end_ms=range_end_ms,
+            fade_in_ms=int(state.fade_in_ms or 0),
+            fade_out_ms=int(state.fade_out_ms or 0),
+        )
+
+    def _aux_volume_for_position(
+        self, position: int, timeline: TimelineState, base_volume: float
+    ) -> float:
+        if not self._timeline_fades_enabled():
+            return base_volume
+        start = int(timeline.range_start_ms or 0)
+        end = int(timeline.range_end_ms or 0)
+        fade_in = int(timeline.fade_in_ms or 0)
+        fade_out = int(timeline.fade_out_ms or 0)
+        if fade_in > 0 and position < start + fade_in:
+            progress = (position - start) / fade_in
+            return base_volume * max(0.0, min(1.0, progress))
+        if fade_out > 0 and end > 0 and position > end - fade_out:
+            progress = (end - position) / fade_out
+            return base_volume * max(0.0, min(1.0, progress))
+        return base_volume
+
+    def _apply_aux_timeline_volume(
+        self, channel_id: str, *, base_volume: float | None = None
+    ) -> None:
+        player = self._aux_players.get(channel_id)
+        meta = self._aux_channel_meta.get(channel_id)
+        if player is None or meta is None:
+            return
+        base = (
+            self._playback_volume if base_volume is None else float(base_volume)
+        )
+        timeline = meta.get("timeline")
+        if isinstance(timeline, TimelineState):
+            vol = self._aux_volume_for_position(
+                int(player.position()), timeline, base
+            )
+        else:
+            vol = base
+        out = player.audioOutput()
+        out.setVolume(max(0.0, min(1.0, vol)))
+        out.setMuted(bool(self._air_no_output))
+
+    def _tick_aux_timelines(self) -> None:
+        """Enforce range end + fade envelopes on aux (sample) channels."""
+        if not self._aux_channel_meta:
+            return
+        finished: list[str] = []
+        for cid, meta in list(self._aux_channel_meta.items()):
+            player = self._aux_players.get(cid)
+            if player is None:
+                finished.append(cid)
+                continue
+            if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+                finished.append(cid)
+                continue
+            try:
+                if player.mediaStatus() == QMediaPlayer.MediaStatus.EndOfMedia:
+                    finished.append(cid)
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                pass
+            position = int(player.position())
+            player_dur = int(player.duration() or 0)
+            timeline = meta.get("timeline")
+            range_end = 0
+            if isinstance(timeline, TimelineState):
+                range_end = int(timeline.range_end_ms or 0)
+                self._apply_aux_timeline_volume(cid)
+            effective_end = range_end if range_end > 0 else player_dur
+            # MP3 container duration can exceed decoded PCM — allow a small slack.
+            if effective_end > 0 and position >= max(0, effective_end - 40):
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+                finished.append(cid)
+                continue
+            # Decoded audio ended but probe duration is longer: position stalls.
+            if meta.get("_stall_pos") == position:
+                meta["_stall_ticks"] = int(meta.get("_stall_ticks") or 0) + 1
+            else:
+                meta["_stall_pos"] = position
+                meta["_stall_ticks"] = 0
+            if (
+                int(meta.get("_stall_ticks") or 0) >= 20
+                and position > 0
+                and (effective_end <= 0 or position >= max(0, int(effective_end * 0.85)))
+            ):
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+                finished.append(cid)
+                continue
+        for cid in finished:
+            self._clear_aux_channel_overlay(cid)
+
+    def _clear_aux_channel_overlay(self, channel_id: str) -> None:
+        """Drop aux play meta and collapse the playlist mini-wave row."""
+        cid = str(channel_id or "").strip()
+        if not cid:
+            return
+        if cid not in self._aux_channel_meta:
+            return
+        self._aux_channel_meta.pop(cid, None)
+        self._refresh_aux_playlist_overlays(relayout=True)
+
+    def _stop_aux_playback_for_item(self, item) -> bool:
+        """Stop any aux one-shot for this playlist item and hide its mini-wave."""
+        if item is None:
+            return False
+        stopped = False
+        for cid, meta in list(self._aux_channel_meta.items()):
+            if meta.get("item") is not item:
+                continue
+            player = self._aux_players.get(cid)
+            if player is not None:
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+            self._clear_aux_channel_overlay(cid)
+            stopped = True
+        return stopped
+
+    def _retarget_playback_after_channel_change(self, item) -> None:
+        """After Audio channel reassignment, drop live wave for that item."""
+        if item is None:
+            return
+        self._stop_aux_playback_for_item(item)
+        # Item was on the Main air deck — eject so ON AIR wave does not linger.
+        if item is self.current_playing_item:
+            self._clear_air_deck()
+
+    def _sweep_finished_aux_overlays(self) -> None:
+        """Hide mini-waves for aux channels that are no longer playing."""
+        if not self._aux_channel_meta:
+            return
+        finished: list[str] = []
+        for cid, meta in list(self._aux_channel_meta.items()):
+            player = self._aux_players.get(cid)
+            if player is None:
+                finished.append(cid)
+                continue
+            state = player.playbackState()
+            if state != QMediaPlayer.PlaybackState.PlayingState:
+                finished.append(cid)
+                continue
+            try:
+                status = player.mediaStatus()
+            except Exception:
+                status = None
+            if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                finished.append(cid)
+                continue
+            timeline = meta.get("timeline")
+            duration = int(player.duration() or 0)
+            if isinstance(timeline, TimelineState) and int(timeline.range_end_ms or 0) > 0:
+                duration = int(timeline.range_end_ms)
+            elif duration <= 0:
+                item = meta.get("item")
+                if item is not None:
+                    duration = int(get_item_duration(item) or 0)
+            position = int(player.position())
+            if duration > 0 and position >= max(0, duration - 40):
+                finished.append(cid)
+        if not finished:
+            return
+        for cid in finished:
+            player = self._aux_players.get(cid)
+            if (
+                player is not None
+                and player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            ):
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+            self._clear_aux_channel_overlay(cid)
+
+    def _play_file_on_aux(
+        self,
+        channel_id: str,
+        file_path: str,
+        *,
+        item=None,
+        playlist_num: int | None = None,
+        start_ms: int | None = None,
+    ) -> bool:
+        if not file_path or not os.path.isfile(file_path):
+            return False
+        player = self._aux_players.get(channel_id)
+        if player is None:
+            return False
+        self._mix_bus.ensure_running()
+        try:
+            player.playbackStateChanged.disconnect()
+        except TypeError:
+            pass
+        try:
+            player.mediaStatusChanged.disconnect()
+        except TypeError:
+            pass
+        try:
+            player.stop()
+        except Exception:
+            pass
+
+        # Persist latest preview/air markers for this instance before take.
+        if item is not None:
+            preview_item = getattr(self, "_preview_item", None)
+            if preview_item is item and getattr(self, "_preview_file_path", None):
+                self._save_timeline_for_path(
+                    self._preview_displayed_track_path or self._preview_file_path,
+                    self.preview_waveform,
+                )
+            elif (
+                self.current_playing_item is item
+                and getattr(self, "_current_file_path", None)
+            ):
+                self._save_timeline_for_path(self._current_file_path, self.waveform)
+
+        timeline = self._resolve_timeline_for_play(item, file_path)
+        range_start = int(timeline.range_start_ms or 0)
+        range_end = int(timeline.range_end_ms or 0)
+        if start_ms is None:
+            play_start = range_start
+        else:
+            play_start = int(start_ms)
+            if range_end > 0:
+                play_start = max(range_start, min(play_start, max(range_start, range_end - 1)))
+            else:
+                play_start = max(range_start, play_start)
+
+        self._apply_item_dsp_to_player(player, item, file_path)
+        player.setSource(QUrl.fromLocalFile(file_path))
+        player.audioOutput().setMuted(bool(self._air_no_output))
+        if play_start > 0:
+            player.setPosition(play_start)
+        player.play()
+        self._aux_channel_meta[channel_id] = {
+            "path": os.path.abspath(file_path),
+            "item": item,
+            "playlist": playlist_num,
+            "timeline": timeline,
+        }
+        self._apply_aux_timeline_volume(channel_id)
+
+        def _on_aux_state(state, *, cid=channel_id):
+            if state == QMediaPlayer.PlaybackState.StoppedState:
+                self._clear_aux_channel_overlay(cid)
+
+        def _on_aux_media_status(status, *, cid=channel_id):
+            if status == QMediaPlayer.MediaStatus.EndOfMedia:
+                player = self._aux_players.get(cid)
+                if (
+                    player is not None
+                    and player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+                ):
+                    try:
+                        player.stop()
+                    except Exception:
+                        pass
+                self._clear_aux_channel_overlay(cid)
+
+        player.playbackStateChanged.connect(_on_aux_state)
+        player.mediaStatusChanged.connect(_on_aux_media_status)
+        # Fill missing trim end from probed duration so range-end tick can finish.
+        timeline = self._aux_channel_meta[channel_id].get("timeline")
+        probed = int(player.duration() or 0)
+        if (
+            isinstance(timeline, TimelineState)
+            and int(timeline.range_end_ms or 0) <= 0
+            and probed > 0
+        ):
+            self._aux_channel_meta[channel_id]["timeline"] = TimelineState(
+                range_start_ms=int(timeline.range_start_ms or 0),
+                range_end_ms=probed,
+                fade_in_ms=int(timeline.fade_in_ms or 0),
+                fade_out_ms=int(timeline.fade_out_ms or 0),
+            )
+        self._refresh_aux_playlist_overlays(relayout=True)
+        return True
+
     def _apply_preview_output_volume(self, volume: float) -> None:
         volume = max(0.0, min(1.0, volume))
         self._preview_output.setVolume(volume)
@@ -451,14 +1179,22 @@ class AudioPlayer(QMainWindow):
         if self._air_no_output:
             for output in self._outputs:
                 output.setMuted(True)
+            for player in self._aux_players.values():
+                player.audioOutput().setMuted(True)
+            self._mix_bus.set_muted(True)
             mixer = getattr(self, "video_mixer", None)
             if mixer is not None:
                 mixer.apply_output_device()
             return
         device = find_audio_output(device_id)
+        self._mix_bus.set_device(device)
+        self._mix_bus.set_muted(False)
+        self._on_mix_bus_sample_rate(self._mix_bus.sample_rate())
+        self._mix_bus.ensure_running()
         for output in self._outputs:
-            output.setDevice(device)
             output.setMuted(False)
+        for player in self._aux_players.values():
+            player.audioOutput().setMuted(False)
         if hasattr(self, "volume_fader"):
             self._reapply_output_volume()
         else:
@@ -516,8 +1252,15 @@ class AudioPlayer(QMainWindow):
 
     def _apply_incoming_volume(self, volume: float) -> None:
         idx = self._crossfade_incoming_idx
-        if idx is not None:
-            self._apply_player_volume(idx, volume)
+        if idx is None:
+            return
+        # Transition fader ramps 0 → master; multiply by track envelope so
+        # waveform fadein/fadeout still shape the incoming deck during XFADE.
+        if self._timeline_fades_enabled() and self._playback_volume > 1e-9:
+            pos = self._players[idx].position()
+            envelope = self._volume_for_position(pos)
+            volume = (volume / self._playback_volume) * envelope
+        self._apply_player_volume(idx, volume)
 
     def _apply_output_volume(self, volume: float) -> None:
         volume = max(0.0, min(1.0, volume))
@@ -714,6 +1457,63 @@ class AudioPlayer(QMainWindow):
 
     def setup_ui(self):
         MainWindowUi().setup_ui(self)
+        self._setup_audio_mixer_panel()
+
+    def _setup_audio_mixer_panel(self) -> None:
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is None:
+            return
+        panel.addChannelRequested.connect(self.add_mixer_channel)
+        panel.removeChannelRequested.connect(self.remove_mixer_channel)
+        panel.channelFaderChanged.connect(self._set_mixer_channel_fader)
+        panel.channelMuteChanged.connect(self._set_mixer_channel_mute)
+        panel.masterVolumeChanged.connect(self._on_mixer_master_volume)
+        panel.limiterBypassChanged.connect(self._on_limiter_bypass)
+        panel.limiterThresholdChanged.connect(self._on_limiter_threshold)
+        panel.masterEqRequested.connect(self.toggle_master_eq_window)
+        panel.channelMidiLearnRequested.connect(self._midi_learn_mixer_fader)
+        panel.channelMidiClearRequested.connect(self._midi_clear_mixer_fader)
+        panel.channelMidiLearnCancelRequested.connect(
+            lambda _cid: self._midi.cancel_learn() if hasattr(self, "_midi") else None
+        )
+        panel.masterMidiLearnRequested.connect(self._midi_learn_master)
+        panel.masterMidiClearRequested.connect(self._midi_clear_master)
+        panel.masterMidiLearnCancelRequested.connect(
+            lambda: self._midi.cancel_learn() if hasattr(self, "_midi") else None
+        )
+        self._refresh_mixer_panel()
+
+    def _on_mixer_master_volume(self, volume: float) -> None:
+        self._on_master_volume_changed(volume)
+
+    def _on_limiter_bypass(self, bypass: bool) -> None:
+        self._mix_bus.limiter.set_bypass(bool(bypass))
+        self.save_config()
+
+    def _on_limiter_threshold(self, threshold: float) -> None:
+        self._mix_bus.limiter.set_threshold(float(threshold))
+        if not hasattr(self, "_limiter_save_timer"):
+            self._limiter_save_timer = QTimer(self)
+            self._limiter_save_timer.setSingleShot(True)
+            self._limiter_save_timer.timeout.connect(self.save_config)
+        self._limiter_save_timer.start(400)
+
+    def _sync_mixer_midi_labels(self) -> None:
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is None or not hasattr(self, "_midi"):
+            return
+        for info in self._mixer_channels:
+            cid = str(info["id"])
+            binding = self._midi.binding_for(mixer_fader_target(cid))
+            panel.set_channel_midi_label(
+                cid, None if binding is None else binding.label()
+            )
+        master_binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
+        if master_binding is None:
+            master_binding = self._midi.binding_for(TARGET_MIXER_FADER_MASTER)
+        panel.master_strip.set_midi_binding_label(
+            None if master_binding is None else master_binding.label()
+        )
 
     def _reset_bpm_label(self) -> None:
         self.bpm_label.setText("—")
@@ -823,6 +1623,11 @@ class AudioPlayer(QMainWindow):
         if self._master_eq_window is None:
             self._master_eq_window = MasterEqWindow(self)
             self._master_eq_window.eqChanged.connect(self._on_master_eq_changed)
+            self._master_eq_window.presetsChanged.connect(self._on_master_eq_presets_changed)
+            self._master_eq_window.set_presets(
+                self._master_eq_presets,
+                current=self._master_eq_preset_name,
+            )
             # Load saved state if available
             if self._master_eq_state:
                 from app.eq_state import EqState as _EqState
@@ -844,19 +1649,23 @@ class AudioPlayer(QMainWindow):
             return
         state = self._master_eq_window.state()
         self._master_eq_state = state.to_dict()
-        # Push EQ to the shared processor
         self._master_eq.set_state(state)
-        # Update state in all players so they restore it on sample rate change
-        for player in self._players:
-            player._master_eq_state = state
-            if player._master_eq is not None:
-                player._master_eq.set_state(state)
-        # Debounced save
+        self._mix_bus.set_master_eq_state(state)
+        # Selecting a named preset keeps the name; free edits stay on that preset
+        # until the user picks “Custom” or saves under another name.
+        self._master_eq_preset_name = self._master_eq_window.current_preset_name()
         if not hasattr(self, "_master_eq_save_timer"):
             self._master_eq_save_timer = QTimer(self)
             self._master_eq_save_timer.setSingleShot(True)
             self._master_eq_save_timer.timeout.connect(self.save_config)
         self._master_eq_save_timer.start(400)
+
+    def _on_master_eq_presets_changed(self) -> None:
+        if self._master_eq_window is None:
+            return
+        self._master_eq_presets = self._master_eq_window.presets()
+        self._master_eq_preset_name = self._master_eq_window.current_preset_name()
+        self.save_config()
 
     def _update_file_properties(self, file_path: str | None = None) -> None:
         """Bind air EQ/gain to the current on-air track."""
@@ -1355,35 +2164,34 @@ class AudioPlayer(QMainWindow):
         return None
 
     def _save_gain_for_bound_path(self) -> None:
-        if not hasattr(self, "file_properties_panel") or self._gain_loading:
+        if self._gain_loading:
             return
         key = self._eq_bound_path
         if not key:
             return
-        gain = clamp_gain_db(self.file_properties_panel.gain_db())
+        gain = clamp_gain_db(float(self._track_gain_db.get(key, 0.0)))
         self._track_gain_db[key] = gain
         item = getattr(self, "_eq_bound_item", None)
         if item is not None:
             set_item_gain_db(item, gain)
 
     def _bind_gain_to_path(self, file_path: str | None) -> None:
-        if not hasattr(self, "file_properties_panel"):
-            return
         key = self._eq_path_key(file_path) if file_path else None
-        gain = float(self._track_gain_db.get(key, 0.0)) if key else 0.0
-        abs_path = os.path.abspath(file_path) if file_path else None
-        lufs = self._track_lufs.get(abs_path) if abs_path else None
-        self._gain_loading = True
-        try:
-            self.file_properties_panel.set_gain_db(gain, lufs=lufs)
-        finally:
-            self._gain_loading = False
+        if key and key not in self._track_gain_db:
+            self._track_gain_db[key] = 0.0
         self._apply_live_gain_to_air()
 
+    def _bound_gain_db(self) -> float:
+        key = self._eq_bound_path
+        if key and key in self._track_gain_db:
+            return clamp_gain_db(float(self._track_gain_db[key]))
+        item = getattr(self, "_eq_bound_item", None)
+        if item is not None:
+            return self._resolve_gain_db_for_item(item, self._bound_file_path())
+        return 0.0
+
     def _apply_live_gain_to_air(self) -> None:
-        if not hasattr(self, "file_properties_panel"):
-            return
-        gain = clamp_gain_db(self.file_properties_panel.gain_db())
+        gain = self._bound_gain_db()
         bound_path = self._bound_file_path()
         bound_item = getattr(self, "_eq_bound_item", None)
         if (
@@ -1415,6 +2223,18 @@ class AudioPlayer(QMainWindow):
             elif idx == self._active_player_idx:
                 player.set_track_gain_db(gain)
                 applied = True
+        for cid, meta in self._aux_channel_meta.items():
+            aux_player = self._aux_players.get(cid)
+            if aux_player is None:
+                continue
+            if bound_item is not None and meta.get("item") is bound_item:
+                aux_player.set_track_gain_db(gain)
+                applied = True
+                continue
+            meta_path = meta.get("path")
+            if bound_path and meta_path and os.path.abspath(str(meta_path)) == bound_path:
+                aux_player.set_track_gain_db(gain)
+                applied = True
         if applied:
             return
         if (
@@ -1429,20 +2249,57 @@ class AudioPlayer(QMainWindow):
         except Exception:
             pass
 
-    def _on_gain_changed(self, gain_db: float) -> None:
-        if self._gain_loading or self._eq_loading:
+    def _apply_gain_to_item_players(self, item, gain_db: float) -> None:
+        gain = clamp_gain_db(gain_db)
+        path = get_item_file_path(item)
+        abs_path = os.path.abspath(path) if path else None
+        for player in self._players:
+            try:
+                src = player.source().toLocalFile()
+            except Exception:
+                continue
+            if not src:
+                continue
+            if abs_path and os.path.abspath(src) == abs_path:
+                if item is self.current_playing_item or item is getattr(
+                    self, "_eq_bound_item", None
+                ):
+                    player.set_track_gain_db(gain)
+        for cid, meta in self._aux_channel_meta.items():
+            aux_player = self._aux_players.get(cid)
+            if aux_player is None:
+                continue
+            if meta.get("item") is item:
+                aux_player.set_track_gain_db(gain)
+
+    def _on_playlist_item_gain_volume(self, item, volume: float) -> None:
+        if item is None or self._gain_loading:
             return
-        key = self._eq_bound_path
+        gain = clamp_track_gain_db(volume_to_gain_db(volume))
+        key = self._adopt_item_settings(item)
         if key:
-            gain = clamp_gain_db(gain_db)
             self._track_gain_db[key] = gain
-            self._sync_gain_to_item(getattr(self, "_eq_bound_item", None), gain)
-        self._apply_live_gain_to_air()
+        set_item_gain_db(item, gain)
+        widget = item.listWidget()
+        if widget is not None:
+            widget.viewport().update()
+        self._apply_gain_to_item_players(item, gain)
+        if hasattr(self, "preview_properties_panel") and item is getattr(
+            self, "_preview_item", None
+        ):
+            path = get_item_file_path(item)
+            lufs = self._track_lufs.get(os.path.abspath(path)) if path else None
+            self.preview_properties_panel.set_loudness(lufs, gain)
+        self._save_playlist_for_item(item)
         if not hasattr(self, "_gain_save_timer"):
             self._gain_save_timer = QTimer(self)
             self._gain_save_timer.setSingleShot(True)
             self._gain_save_timer.timeout.connect(self._persist_gain_changes)
         self._gain_save_timer.start(400)
+
+    def _on_gain_changed(self, gain_db: float) -> None:
+        # Legacy hook — gain is edited on playlist knobs now.
+        del gain_db
 
 
 
@@ -1468,6 +2325,10 @@ class AudioPlayer(QMainWindow):
         mixer = getattr(self, "video_mixer", None)
         if mixer is not None:
             mixer.set_master_volume(volume)
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is not None:
+            panel.master_strip.set_master_volume(volume)
+        self._set_aux_players_volume(volume)
         if not hasattr(self, "_master_volume_save_timer"):
             self._master_volume_save_timer = QTimer(self)
             self._master_volume_save_timer.setSingleShot(True)
@@ -1494,34 +2355,13 @@ class AudioPlayer(QMainWindow):
         item=None,
         force_gain: bool = False,
     ) -> None:
-        """Store measured LUFS and auto-set gain toward the current target."""
+        """Store measured LUFS only — gain stays manual (force_gain ignored)."""
+        del force_gain  # kept for analyzer callback signature
         path_key = os.path.abspath(file_path)
         self._track_lufs[path_key] = float(lufs)
         if item is not None:
             set_item_lufs(item, float(lufs))
-        suggested = gain_db_to_target(float(lufs), target_lufs=self._target_lufs_value())
         instance_key = self._adopt_item_settings(item) if item is not None else path_key
-        if force_gain or instance_key not in self._track_gain_db:
-            self._track_gain_db[instance_key] = suggested
-            if item is not None:
-                set_item_gain_db(item, suggested)
-            if self._eq_bound_path == instance_key and hasattr(self, "file_properties_panel"):
-                self._gain_loading = True
-                try:
-                    self.file_properties_panel.set_gain_db(suggested, lufs=float(lufs))
-                finally:
-                    self._gain_loading = False
-                self._apply_live_gain_to_air()
-            elif item is self.current_playing_item:
-                for player in self._players:
-                    try:
-                        src = player.source().toLocalFile()
-                    except Exception:
-                        continue
-                    if src and os.path.abspath(src) == path_key:
-                        player.set_track_gain_db(suggested)
-        elif self._eq_bound_path == instance_key and hasattr(self, "file_properties_panel"):
-            self.file_properties_panel.set_lufs(float(lufs))
         preview = getattr(self, "_preview_file_path", None)
         if preview and os.path.abspath(preview) == path_key and hasattr(
             self, "preview_properties_panel"
@@ -1533,65 +2373,6 @@ class AudioPlayer(QMainWindow):
             else:
                 preview_gain = self._track_gain_db.get(instance_key, 0.0)
             self.preview_properties_panel.set_loudness(float(lufs), preview_gain)
-
-    def _target_lufs_value(self) -> float:
-        if hasattr(self, "file_properties_panel") and self.file_properties_panel is not None:
-            return clamp_target_lufs(self.file_properties_panel.target_lufs())
-        return clamp_target_lufs(self._target_lufs)
-
-    def _on_target_lufs_changed(self, target_lufs: float) -> None:
-        self._target_lufs = clamp_target_lufs(target_lufs)
-        self._reapply_gains_to_target()
-        if not hasattr(self, "_target_lufs_save_timer"):
-            self._target_lufs_save_timer = QTimer(self)
-            self._target_lufs_save_timer.setSingleShot(True)
-            self._target_lufs_save_timer.timeout.connect(self.save_config)
-        self._target_lufs_save_timer.start(400)
-
-    def _reapply_gains_to_target(self) -> None:
-        """Recalculate per-track gain for every playlist instance with measured LUFS."""
-        target = self._target_lufs_value()
-        playing_key = (
-            get_item_track_id(self.current_playing_item)
-            if self.current_playing_item is not None
-            else None
-        )
-        for playlist in getattr(self, "playlists", []) or []:
-            for row in range(playlist.count()):
-                item = playlist.item(row)
-                path = get_item_file_path(item)
-                if not path:
-                    continue
-                lufs = self._track_lufs.get(os.path.abspath(path))
-                if lufs is None:
-                    continue
-                suggested = gain_db_to_target(float(lufs), target_lufs=target)
-                instance_key = self._adopt_item_settings(item)
-                if not instance_key:
-                    continue
-                self._track_gain_db[instance_key] = suggested
-                self._sync_gain_to_item(item, suggested)
-                if instance_key == playing_key:
-                    for player in self._players:
-                        try:
-                            src = player.source().toLocalFile()
-                        except Exception:
-                            continue
-                        if src and os.path.abspath(src) == os.path.abspath(path):
-                            player.set_track_gain_db(suggested)
-        bound = self._eq_bound_path
-        if bound and hasattr(self, "file_properties_panel"):
-            gain = float(self._track_gain_db.get(bound, 0.0))
-            bound_path = self._bound_file_path()
-            lufs = self._track_lufs.get(bound_path) if bound_path else None
-            self._gain_loading = True
-            try:
-                self.file_properties_panel.set_gain_db(gain, lufs=lufs)
-            finally:
-                self._gain_loading = False
-            self._apply_live_gain_to_air()
-        if hasattr(self, "preview_properties_panel"):
-            self._update_preview_properties()
 
     def _on_eq_changed(self) -> None:
         if self._eq_loading or self._stem_eq_loading:
@@ -1942,6 +2723,7 @@ class AudioPlayer(QMainWindow):
             playlist.trackContextMenuRequested.connect(
                 self._on_playlist_track_context_menu
             )
+        self._wire_playlist_aux_overlays()
 
     def _on_playlist_file_imported(self, item, file_path: str) -> None:
         """Auto-queue BPM + waveform analysis when a track is added to a playlist."""
@@ -2662,7 +3444,8 @@ class AudioPlayer(QMainWindow):
             incoming.set_track_gain_db(self._gain_db_for_path(file_path))
             self._apply_stems_to_player(incoming, file_path)
 
-        self._outgoing_fader.sync_volume(self._playback_volume)
+        # Fade from the level already on air (may be mid track-fade).
+        self._outgoing_fader.sync_volume(self._output_volume)
         self._outgoing_fader.fade_to(
             0.0,
             fade_ms,
@@ -2689,7 +3472,15 @@ class AudioPlayer(QMainWindow):
         self._crossfade_incoming_idx = None
         self._crossfade_incoming_ready_to_play = False
         self._pending_playback_player_idx = None
-        self._set_output_volume(self._playback_volume)
+        # Hand volume back to track envelope (fadein/fadeout markers).
+        if (
+            self._timeline_fades_enabled()
+            and self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState
+            and (self._fade_in_ms() > 0 or self._fade_out_ms() > 0)
+        ):
+            self._apply_timeline_volume(self.player.position())
+        else:
+            self._set_output_volume(self._playback_volume)
 
     def _prepare_incoming_crossfade_media(self, duration: int) -> None:
         if not self._current_file_path:
@@ -2797,7 +3588,10 @@ class AudioPlayer(QMainWindow):
         self.btn_fade_mode.setIcon(load_icon(self, icon_name, icon_px))
         self.btn_fade_mode.setIconSize(icon_size(icon_px))
         tips = {
-            "crossfade": "Crossfade: outgoing fade out and incoming fade in overlap",
+            "crossfade": (
+                "Crossfade: panel FADE overlaps decks; "
+                "track fadein/fadeout still apply on the waveform"
+            ),
             "high_cut": "High cut: resonant filter closes with fadeout, then next track starts clean",
             "sequential": "Sequential: fade out completes before the next track fades in",
         }
@@ -2810,7 +3604,9 @@ class AudioPlayer(QMainWindow):
         return self._fade_mode == "high_cut"
 
     def _timeline_fades_enabled(self) -> bool:
-        return self._fade_mode == "sequential"
+        # Track fadein/fadeout (waveform + preview) apply in SEQ and XFADE.
+        # HCUT keeps the next take clean (no track envelope).
+        return self._fade_mode != "high_cut"
 
     def reset_waveform_zoom(self) -> None:
         self.waveform.reset_view()
@@ -3173,10 +3969,6 @@ class AudioPlayer(QMainWindow):
         self._midi.learnChanged.connect(self._on_midi_learn_changed)
         self._midi.bindingChanged.connect(self._on_midi_binding_changed)
         self._midi.buttonTriggered.connect(self._on_midi_button_triggered)
-        knob = self.file_properties_panel.master_knob
-        knob.midiLearnRequested.connect(self._midi_learn_master)
-        knob.midiLearnCancelRequested.connect(self._midi.cancel_learn)
-        knob.midiClearRequested.connect(self._midi_clear_master)
         self._midi_button_meta = {
             TARGET_ON_AIR: (
                 self.btn_space,
@@ -3334,6 +4126,8 @@ class AudioPlayer(QMainWindow):
     def _midi_clear_master(self) -> None:
         if hasattr(self, "_midi"):
             self._midi.clear_binding(TARGET_MASTER_VOLUME)
+            self._midi.clear_binding(TARGET_MIXER_FADER_MASTER)
+            self._sync_mixer_midi_labels()
 
     def _midi_clear_button(self, target: str) -> None:
         if hasattr(self, "_midi"):
@@ -3395,16 +4189,21 @@ class AudioPlayer(QMainWindow):
             self._midi.refresh()
 
     def _on_midi_learn_changed(self, target: str) -> None:
-        knob = self.file_properties_panel.master_knob
-        knob.set_learning(target == TARGET_MASTER_VOLUME)
         self._refresh_all_midi_button_ui()
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is not None:
+            panel.master_strip.set_learning(
+                target in (TARGET_MASTER_VOLUME, TARGET_MIXER_FADER_MASTER)
+            )
+            for info in self._mixer_channels:
+                cid = str(info["id"])
+                panel.set_channel_learning(cid, target == mixer_fader_target(cid))
 
     def _on_midi_binding_changed(self, target: str) -> None:
-        if target == TARGET_MASTER_VOLUME:
-            binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
-            self.file_properties_panel.master_knob.set_midi_binding_label(
-                None if binding is None else binding.label()
-            )
+        if target in (TARGET_MASTER_VOLUME, TARGET_MIXER_FADER_MASTER):
+            self._sync_mixer_midi_labels()
+        elif is_mixer_fader_target(target):
+            self._sync_mixer_midi_labels()
         if target in getattr(self, "_midi_button_meta", {}):
             _, base_tip = self._midi_button_meta[target]
             self._refresh_midi_button_ui(target, base_tip)
@@ -3425,17 +4224,65 @@ class AudioPlayer(QMainWindow):
     def _on_midi_cc(self, channel: int, cc: int, value: int) -> None:
         if not hasattr(self, "_midi"):
             return
-        binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
-        if (
-            binding is None
-            or binding.kind != "cc"
-            or binding.number != cc
-            or binding.channel != channel
-        ):
+        vol = max(0.0, min(1.0, int(value) / 127.0))
+
+        # Master volume (legacy + mixer master alias)
+        for target in (TARGET_MASTER_VOLUME, TARGET_MIXER_FADER_MASTER):
+            binding = self._midi.binding_for(target)
+            if (
+                binding is not None
+                and binding.kind == "cc"
+                and binding.number == cc
+                and binding.channel == channel
+            ):
+                self._on_master_volume_changed(vol)
+                panel = getattr(self, "audio_mixer_panel", None)
+                if panel is not None:
+                    panel.master_strip.set_master_volume(vol)
+                return
+
+        # Channel faders: map 0..127 → −∞…+10 dB (same range as StemFader)
+        from app.widgets.stem_fader import STEM_FADER_DB_FLOOR, STEM_FADER_DB_MAX, STEM_FADER_DB_MUTE
+
+        for info in self._mixer_channels:
+            cid = str(info["id"])
+            target = mixer_fader_target(cid)
+            binding = self._midi.binding_for(target)
+            if (
+                binding is None
+                or binding.kind != "cc"
+                or binding.number != cc
+                or binding.channel != channel
+            ):
+                continue
+            if int(value) <= 0:
+                db = STEM_FADER_DB_MUTE
+            else:
+                ratio = int(value) / 127.0
+                db = STEM_FADER_DB_FLOOR + ratio * (STEM_FADER_DB_MAX - STEM_FADER_DB_FLOOR)
+            self._set_mixer_channel_fader(cid, db)
+            panel = getattr(self, "audio_mixer_panel", None)
+            if panel is not None:
+                panel.set_channel_fader_db(cid, db)
             return
-        volume = max(0.0, min(1.0, int(value) / 127.0))
-        self.file_properties_panel.set_master_volume(volume)
-        self._on_master_volume_changed(volume)
+
+    def _midi_learn_mixer_fader(self, channel_id: str) -> None:
+        if not self._ensure_midi_available():
+            return
+        if not hasattr(self, "_midi"):
+            return
+        target = mixer_fader_target(str(channel_id))
+        self._midi.start_learn(target)
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is not None:
+            panel.set_channel_learning(str(channel_id), True)
+
+    def _midi_clear_mixer_fader(self, channel_id: str) -> None:
+        if not hasattr(self, "_midi"):
+            return
+        self._midi.clear_binding(mixer_fader_target(str(channel_id)))
+        self._sync_mixer_midi_labels()
+        self.save_config()
 
     def _setup_remote_menu(self) -> None:
         menu = self.menuBar().addMenu("Remote")
@@ -3665,6 +4512,24 @@ class AudioPlayer(QMainWindow):
                 act.setChecked(current_scene == scene.id)
                 scene_actions.append((act, scene.id))
 
+        channel_actions: list[tuple[object, str | None]] = []
+        channel_menu = menu.addMenu("Audio channel")
+        current_channels = {get_item_audio_channel_id(target) for target in targets}
+        # None / missing means Main
+        normalized = {
+            (cid if cid else MAIN_CHANNEL_ID) for cid in current_channels
+        }
+        current_channel = next(iter(normalized)) if len(normalized) == 1 else object()
+        for info in self._mixer_channels:
+            cid = str(info["id"])
+            label = str(info.get("name") or cid)
+            act = channel_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(current_channel == cid)
+            # Store None for Main so playlist omits the field (migration default)
+            store_id = None if cid == MAIN_CHANNEL_ID else cid
+            channel_actions.append((act, store_id))
+
         reclaim = playlist._reclaim_focus
         playlist.set_reclaim_focus(False)
         self._playlist_context_menu_open = True
@@ -3700,6 +4565,15 @@ class AudioPlayer(QMainWindow):
                     set_item_mixer_scene_id(target, scene_id)
                 playlist.viewport().update()
                 self.save_project()
+                return
+        for act, channel_id in channel_actions:
+            if chosen is act:
+                for target in targets:
+                    set_item_audio_channel_id(target, channel_id)
+                    self._retarget_playback_after_channel_change(target)
+                playlist.viewport().update()
+                self.save_project()
+                self.save_config()
                 return
 
     def _retarget_path_references(self, old_path: str, new_path: str) -> None:
@@ -4367,8 +5241,14 @@ class AudioPlayer(QMainWindow):
                     )
                 except (TypeError, ValueError):
                     pass
-            if hasattr(self, "file_properties_panel"):
-                self.file_properties_panel.set_master_volume(self._playback_volume)
+            if hasattr(self, "audio_mixer_panel"):
+                self.audio_mixer_panel.master_strip.set_master_volume(
+                    self._playback_volume
+                )
+
+            raw_mixer = config.get("audio_mixer")
+            if isinstance(raw_mixer, dict):
+                self._load_mixer_config(raw_mixer)
 
             last_plugin_dir = config.get("last_plugin_dir")
             if isinstance(last_plugin_dir, str) and os.path.isdir(last_plugin_dir):
@@ -4379,7 +5259,29 @@ class AudioPlayer(QMainWindow):
             if isinstance(raw_master_eq, dict) and raw_master_eq.get("bands"):
                 from app.eq_state import EqState as _EqState
                 self._master_eq_state = raw_master_eq
-                self._master_eq.set_state(_EqState.from_dict(raw_master_eq))
+                state = _EqState.from_dict(raw_master_eq)
+                self._master_eq.set_state(state)
+                self._mix_bus.set_master_eq_state(state)
+
+            raw_presets = config.get("master_eq_presets")
+            if isinstance(raw_presets, dict):
+                cleaned: dict[str, dict] = {}
+                for raw_name, raw_state in raw_presets.items():
+                    name = str(raw_name or "").strip()
+                    if not name or not isinstance(raw_state, dict):
+                        continue
+                    cleaned[name] = dict(raw_state)
+                self._master_eq_presets = cleaned
+            preset_name = config.get("master_eq_preset")
+            if isinstance(preset_name, str) and preset_name.strip():
+                self._master_eq_preset_name = preset_name.strip()
+            else:
+                self._master_eq_preset_name = None
+            if self._master_eq_window is not None:
+                self._master_eq_window.set_presets(
+                    self._master_eq_presets,
+                    current=self._master_eq_preset_name,
+                )
 
             if hasattr(self, "_remote"):
                 if "remote_enabled" in config:
@@ -4394,10 +5296,7 @@ class AudioPlayer(QMainWindow):
 
             if "midi_bindings" in config and hasattr(self, "_midi"):
                 self._midi.set_bindings(config.get("midi_bindings"))
-                binding = self._midi.binding_for(TARGET_MASTER_VOLUME)
-                self.file_properties_panel.master_knob.set_midi_binding_label(
-                    None if binding is None else binding.label()
-                )
+                self._sync_mixer_midi_labels()
                 self._refresh_all_midi_button_ui()
 
             if "waveform_res_enabled" in config:
@@ -4458,12 +5357,6 @@ class AudioPlayer(QMainWindow):
             self._properties_collapsed = bool(config.get("properties_collapsed", False))
             self._apply_properties_collapsed_state(self._properties_collapsed)
             if hasattr(self, "file_properties_panel"):
-                if "target_lufs" in config:
-                    try:
-                        self._target_lufs = clamp_target_lufs(float(config["target_lufs"]))
-                    except (TypeError, ValueError):
-                        self._target_lufs = TARGET_LUFS
-                    self.file_properties_panel.set_target_lufs(self._target_lufs)
                 track_eq = config.get("track_eq")
                 if isinstance(track_eq, dict):
                     for key, value in track_eq.items():
@@ -4525,6 +5418,9 @@ class AudioPlayer(QMainWindow):
             "fade_mode": self._fade_mode,
             "master_volume": self._playback_volume,
             "master_eq": self._master_eq_state if self._master_eq_state else {},
+            "master_eq_presets": dict(self._master_eq_presets),
+            "master_eq_preset": self._master_eq_preset_name or "",
+            "audio_mixer": self._mixer_config_dict(),
             "last_plugin_dir": self._last_plugin_dir,
             "midi_bindings": (
                 self._midi.bindings_to_dict() if hasattr(self, "_midi") else {}
@@ -4536,7 +5432,6 @@ class AudioPlayer(QMainWindow):
                 self._remote.port if hasattr(self, "_remote") else DEFAULT_REMOTE_PORT
             ),
             "high_cut_q": self._high_cut_q(),
-            "target_lufs": self._target_lufs_value(),
             "waveform_res_enabled": self._waveform_res_enabled,
             "preview_autoplay": self._preview_autoplay,
             "browser_autoplay": self._browser_autoplay,
@@ -5364,6 +6259,16 @@ class AudioPlayer(QMainWindow):
 
         air_start_ms = self._preview_range_start_ms()
         self._stop_preview_for_air()
+
+        channel_id = self._resolve_target_channel_id(self._preview_item)
+        if channel_id != MAIN_CHANNEL_ID:
+            return self._play_file_on_aux(
+                channel_id,
+                self._preview_file_path,
+                item=self._preview_item,
+                playlist_num=self._preview_playlist_num,
+                start_ms=air_start_ms,
+            )
 
         self.current_playing_playlist = self._preview_playlist_num
         self.current_playing_item = self._preview_item
@@ -6310,6 +7215,26 @@ class AudioPlayer(QMainWindow):
     ) -> bool:
         if not file_path or not os.path.isfile(file_path):
             return False
+
+        channel_id = self._resolve_target_channel_id(self.current_playing_item)
+        if channel_id != MAIN_CHANNEL_ID:
+            item = self.current_playing_item
+            playlist_num = self.current_playing_playlist
+            # Aux samples use playlist mini-wave, not the ON AIR deck.
+            if (
+                self._current_file_path
+                or self._displayed_track_path
+                or bool(getattr(self.waveform, "waveform_data", None))
+            ):
+                self._clear_air_deck()
+            return self._play_file_on_aux(
+                channel_id,
+                file_path,
+                item=item,
+                playlist_num=playlist_num,
+                start_ms=start_ms,
+            )
+
         if self._queue_play_after_stop_fade(
             file_path,
             space_triggered=space_triggered,
@@ -6320,6 +7245,7 @@ class AudioPlayer(QMainWindow):
         ):
             return True
 
+        self._mix_bus.ensure_running()
         self._video_duck_fade_active = False
         self._pending_space_restart = None
         abs_path = os.path.abspath(file_path)
@@ -6823,6 +7749,7 @@ class AudioPlayer(QMainWindow):
             self._suppress_range_end = False
             self._pending_transition_fade_ms = 0
             self.player.stop()
+            self._stop_all_aux_channels()
             self._set_output_volume(self._playback_volume)
             self._fade_out_started = False
             self._clear_air_spectrum()
@@ -7160,6 +8087,11 @@ class AudioPlayer(QMainWindow):
                 self.waveform.set_position(position)
             self._check_fade_out_and_range(position)
             self.update_time_display()
+        if self._aux_channel_meta and not self._is_window_resizing:
+            self._tick_aux_timelines()
+            self._sweep_finished_aux_overlays()
+            if self._aux_channel_meta:
+                self._refresh_aux_playlist_overlays(relayout=False)
 
     def _on_player_playback_state_changed(self, player_idx: int, state) -> None:
         if player_idx != self._active_player_idx:

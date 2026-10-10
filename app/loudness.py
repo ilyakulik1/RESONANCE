@@ -12,8 +12,11 @@ from scipy.signal import sosfilt
 TARGET_LUFS = -14.0
 TARGET_LUFS_MIN = -30.0
 TARGET_LUFS_MAX = -6.0
-GAIN_DB_MIN = -24.0
-GAIN_DB_MAX = 24.0
+GAIN_DB_MIN = -36.0
+GAIN_DB_MAX = 36.0
+# Playlist track knob: −24 … +12 dB (0 dB = unity at 2/3 of the dial).
+TRACK_GAIN_DB_MIN = -24.0
+TRACK_GAIN_DB_MAX = 12.0
 
 # Analysis decode settings (reuse BPM sample rate; longer window for loudness).
 LOUDNESS_SAMPLE_RATE = 22050
@@ -35,6 +38,29 @@ def clamp_target_lufs(lufs: float) -> float:
 
 def clamp_gain_db(gain_db: float) -> float:
     return float(max(GAIN_DB_MIN, min(GAIN_DB_MAX, float(gain_db))))
+
+
+def clamp_track_gain_db(gain_db: float) -> float:
+    return float(max(TRACK_GAIN_DB_MIN, min(TRACK_GAIN_DB_MAX, float(gain_db))))
+
+
+def volume_to_gain_db(volume: float) -> float:
+    """Map playlist knob 0…1 → track gain dB (−24 … +12)."""
+    t = max(0.0, min(1.0, float(volume)))
+    return clamp_track_gain_db(
+        TRACK_GAIN_DB_MIN + t * (TRACK_GAIN_DB_MAX - TRACK_GAIN_DB_MIN)
+    )
+
+
+def gain_db_to_volume(gain_db: float) -> float:
+    """Map track gain dB → playlist knob 0…1 (−24→0, 0 dB→⅔, +12→1)."""
+    span = TRACK_GAIN_DB_MAX - TRACK_GAIN_DB_MIN
+    if span <= 0:
+        return 0.0
+    return max(
+        0.0,
+        min(1.0, (clamp_track_gain_db(gain_db) - TRACK_GAIN_DB_MIN) / span),
+    )
 
 
 def gain_db_to_target(lufs: float, *, target_lufs: float = TARGET_LUFS) -> float:

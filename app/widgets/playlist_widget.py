@@ -119,7 +119,7 @@ class PlaylistWidget(QListWidget):
         self.setFont(QFont(get_token("typography.font_family_ui", "Arial"), 10))
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setWordWrap(False)
-        self.setUniformItemSizes(True)
+        self.setUniformItemSizes(False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked
@@ -180,6 +180,11 @@ class PlaylistWidget(QListWidget):
 
     def eventFilter(self, obj, event):
         if obj is self.viewport():
+            delegate = self.itemDelegate()
+            if isinstance(delegate, PlaylistItemDelegate):
+                if delegate.handle_viewport_event(self, event):
+                    event.accept()
+                    return True
             etype = event.type()
             if etype == QEvent.Type.Resize:
                 if self._drop_indicator_y_px is not None:

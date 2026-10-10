@@ -8,6 +8,31 @@ QSplitter#audioEqSplitter::handle:horizontal {
     width: 5px;
 }
 
+QTabWidget#audioPropsTabs::pane {
+    border: none;
+    background-color: transparent;
+    top: -1px;
+}
+
+QTabWidget#audioPropsTabs QTabBar::tab {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_muted}};
+    padding: 4px 12px;
+    margin-right: 2px;
+    border: none;
+    min-width: 88px;
+}
+
+QTabWidget#audioPropsTabs QTabBar::tab:selected {
+    background-color: {{colors.bg_card}};
+    color: {{colors.text_primary}};
+    font-weight: bold;
+}
+
+QTabWidget#audioPropsTabs QTabBar::tab:hover:!selected {
+    color: {{colors.text_primary}};
+}
+
 QWidget#audioLeftStack {
     min-width: 0;
 }

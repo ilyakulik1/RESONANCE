@@ -116,9 +116,9 @@ class RemoteBridge(QObject):
 
     def _set_volume(self, params: dict) -> None:
         volume = max(0.0, min(1.0, float(params.get("volume", 0))))
-        panel = getattr(self._player, "file_properties_panel", None)
+        panel = getattr(self._player, "audio_mixer_panel", None)
         if panel is not None:
-            panel.set_master_volume(volume)
+            panel.master_strip.set_master_volume(volume)
         self._player._on_master_volume_changed(volume)
 
     def _set_playback_mode(self, mode: str) -> None:

@@ -19,6 +19,7 @@ LUFS_ROLE = Qt.ItemDataRole.UserRole + 6
 STEMS_ROLE = Qt.ItemDataRole.UserRole + 7
 TRACK_ID_ROLE = Qt.ItemDataRole.UserRole + 8
 MIXER_SCENE_ROLE = Qt.ItemDataRole.UserRole + 9
+AUDIO_CHANNEL_ROLE = Qt.ItemDataRole.UserRole + 10
 
 TRACKS_CLIPBOARD_MIME = "application/x-simpleaudioplayer-tracks"
 DEFAULT_PLACEHOLDER_NAME = "New Track"
@@ -126,6 +127,9 @@ def item_to_snapshot(item: QListWidgetItem | None) -> dict | None:
     scene_id = get_item_mixer_scene_id(item)
     if scene_id:
         snapshot["mixer_scene_id"] = scene_id
+    audio_channel_id = get_item_audio_channel_id(item)
+    if audio_channel_id:
+        snapshot["audio_channel_id"] = audio_channel_id
     track_id = get_item_track_id(item)
     if track_id:
         snapshot["id"] = track_id
@@ -273,6 +277,19 @@ def get_item_mixer_scene_id(item: QListWidgetItem | None) -> str | None:
     if item is None:
         return None
     value = item.data(MIXER_SCENE_ROLE)
+    text = str(value).strip() if value is not None else ""
+    return text or None
+
+
+def set_item_audio_channel_id(item: QListWidgetItem, channel_id: str | None) -> None:
+    text = str(channel_id or "").strip()
+    item.setData(AUDIO_CHANNEL_ROLE, text if text else None)
+
+
+def get_item_audio_channel_id(item: QListWidgetItem | None) -> str | None:
+    if item is None:
+        return None
+    value = item.data(AUDIO_CHANNEL_ROLE)
     text = str(value).strip() if value is not None else ""
     return text or None
 
@@ -557,6 +574,9 @@ def _playlist_item_to_entry(
         scene_id = get_item_mixer_scene_id(item)
         if scene_id:
             entry["mixer_scene_id"] = scene_id
+        audio_channel_id = get_item_audio_channel_id(item)
+        if audio_channel_id:
+            entry["audio_channel_id"] = audio_channel_id
         return entry
 
     abs_path = os.path.abspath(file_path)
@@ -586,6 +606,9 @@ def _playlist_item_to_entry(
     scene_id = get_item_mixer_scene_id(item)
     if scene_id:
         entry["mixer_scene_id"] = scene_id
+    audio_channel_id = get_item_audio_channel_id(item)
+    if audio_channel_id:
+        entry["audio_channel_id"] = audio_channel_id
     return entry
 
 
@@ -661,6 +684,7 @@ def _add_placeholder_entry(
     gain_db: float | None = None,
     lufs: float | None = None,
     mixer_scene_id: str | None = None,
+    audio_channel_id: str | None = None,
 ) -> None:
     item: QListWidgetItem | None = None
     if hasattr(playlist_widget, "add_placeholder_item"):
@@ -688,6 +712,8 @@ def _add_placeholder_entry(
         set_item_lufs(item, lufs)
     if mixer_scene_id:
         set_item_mixer_scene_id(item, mixer_scene_id)
+    if audio_channel_id:
+        set_item_audio_channel_id(item, audio_channel_id)
     if has_stems:
         set_item_has_stems(item, True)
 
@@ -713,6 +739,7 @@ def _add_playlist_entry(
     gain_db: float | None = None,
     lufs: float | None = None,
     mixer_scene_id: str | None = None,
+    audio_channel_id: str | None = None,
 ) -> None:
     if file_exists is None:
         file_exists = os.path.isfile(file_path)
@@ -749,6 +776,8 @@ def _add_playlist_entry(
             set_item_lufs(item, lufs)
         if mixer_scene_id:
             set_item_mixer_scene_id(item, mixer_scene_id)
+        if audio_channel_id:
+            set_item_audio_channel_id(item, audio_channel_id)
         if has_stems:
             set_item_has_stems(item, True)
 
@@ -849,6 +878,7 @@ def load_playlist_from_entries(
                 gain_db=_gain_from_entry(entry),
                 lufs=_lufs_from_entry(entry),
                 mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
+                audio_channel_id=str(entry.get("audio_channel_id") or "").strip() or None,
             )
             added += 1
             continue
@@ -873,6 +903,7 @@ def load_playlist_from_entries(
             gain_db=_gain_from_entry(entry),
             lufs=_lufs_from_entry(entry),
             mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
+            audio_channel_id=str(entry.get("audio_channel_id") or "").strip() or None,
         )
         added += 1
         if not exists:

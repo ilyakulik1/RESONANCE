@@ -198,6 +198,8 @@ class PcmAirPlayer(QObject):
     durationChanged = pyqtSignal(int)
     playbackStateChanged = pyqtSignal(object)
     mediaStatusChanged = pyqtSignal(object)
+    # Cross-thread EOF → main (QTimer.singleShot from the mix I/O thread is unreliable).
+    decodeFinished = pyqtSignal(int)
 
     PlaybackState = QMediaPlayer.PlaybackState
     MediaStatus = QMediaPlayer.MediaStatus
@@ -245,6 +247,8 @@ class PcmAirPlayer(QObject):
         self._master_fx_copy = 0
         self._master_eq = None
         self._master_eq_state: EqState | None = None
+        # When True, this player feeds AirMixBus (no private QAudioSink).
+        self._external_mix = False
 
         self._sample_rate = 44100
         self._sink: QAudioSink | None = None
@@ -253,6 +257,7 @@ class PcmAirPlayer(QObject):
 
         self._chunk_queue: queue.Queue[np.ndarray | None] = queue.Queue(maxsize=_QUEUE_MAX_CHUNKS)
         self._float_pending = np.zeros(0, dtype=np.float32)
+        self._float_out_pending = np.zeros(0, dtype=np.float32)
         self._byte_pending = bytearray()
         self._frames_played = 0
         self._frames_decoded = 0
@@ -276,6 +281,7 @@ class PcmAirPlayer(QObject):
         self._pos_timer = QTimer(self)
         self._pos_timer.setInterval(50)
         self._pos_timer.timeout.connect(self._emit_position)
+        self.decodeFinished.connect(self._on_decode_finished)
         self._last_restart_at = 0.0
         self._seek_coalesce_timer = QTimer(self)
         self._seek_coalesce_timer.setSingleShot(True)
@@ -396,31 +402,37 @@ class PcmAirPlayer(QObject):
                 return
         if self._playback_state == QMediaPlayer.PlaybackState.PlayingState:
             return
-        if self._playback_state == QMediaPlayer.PlaybackState.PausedState and self._sink is not None:
-            try:
-                self._sink.resume()
-            except Exception:
-                self._restart_pipeline(start_ms=self._position_ms, autoplay=True)
+        if self._playback_state == QMediaPlayer.PlaybackState.PausedState:
+            if self._external_mix:
+                self._set_playback_state(QMediaPlayer.PlaybackState.PlayingState)
+                self._pos_timer.start()
                 return
-            self._set_playback_state(QMediaPlayer.PlaybackState.PlayingState)
-            self._pos_timer.start()
-            return
+            if self._sink is not None:
+                try:
+                    self._sink.resume()
+                except Exception:
+                    self._restart_pipeline(start_ms=self._position_ms, autoplay=True)
+                    return
+                self._set_playback_state(QMediaPlayer.PlaybackState.PlayingState)
+                self._pos_timer.start()
+                return
         self._restart_pipeline(start_ms=self._position_ms, autoplay=True)
 
     def pause(self) -> None:
         if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
             return
-        if self._sink is not None:
+        if not self._external_mix and self._sink is not None:
             self._sink.suspend()
         self._set_playback_state(QMediaPlayer.PlaybackState.PausedState)
         self._pos_timer.stop()
 
     def stop(self) -> None:
         self.clear_high_cut_sweep()
-        self._stop_pipeline(destroy_sink=True)
+        self._stop_pipeline(destroy_sink=not self._external_mix)
         self._position_ms = 0
         self._frames_played = 0
         self._seek_frame = 0
+        self._float_out_pending = np.zeros(0, dtype=np.float32)
         with self._spectrum_lock:
             self._spectrum_pcm.fill(0.0)
             self._spectrum_db.fill(-90.0)
@@ -434,7 +446,7 @@ class PcmAirPlayer(QObject):
         self._master_fx_copy = int(copy_index)
 
     def set_master_eq(self, eq_processor: EqProcessor, state_dict: dict | None = None) -> None:
-        """Attach the shared EqProcessor for master EQ processing."""
+        """Legacy no-op: master EQ runs on AirMixBus after the sum."""
         self._master_eq = eq_processor
         if state_dict and isinstance(state_dict, dict) and state_dict.get("bands"):
             self._master_eq_state = EqState.from_dict(state_dict)
@@ -442,11 +454,111 @@ class PcmAirPlayer(QObject):
             self._master_eq_state = None
 
     def refresh_master_eq(self) -> None:
-        """Refresh master EQ state from the shared processor."""
-        if self._master_eq is not None and self._master_eq._filters:
-            # Create a state from current filters by reading coefficients
-            # This is a fallback; real state should come from UI
-            pass
+        """Legacy no-op (master EQ lives on the mix bus)."""
+        return
+
+    def set_external_mix(self, enabled: bool) -> None:
+        """Route PCM to AirMixBus instead of a private QAudioSink."""
+        enabled = bool(enabled)
+        if self._external_mix == enabled:
+            return
+        was_playing = self._playback_state == QMediaPlayer.PlaybackState.PlayingState
+        pos = self._position_ms
+        self._external_mix = enabled
+        if enabled and self._sink is not None:
+            try:
+                self._sink.stop()
+            except Exception:
+                pass
+            self._sink.deleteLater()
+            self._sink = None
+        if was_playing and self._path:
+            self._restart_pipeline(start_ms=pos, autoplay=True)
+
+    def set_mix_sample_rate(self, sample_rate: int) -> None:
+        """Align decode rate with the mix bus device format."""
+        rate = int(sample_rate)
+        if rate <= 0 or rate == self._sample_rate:
+            return
+        was_playing = self._playback_state == QMediaPlayer.PlaybackState.PlayingState
+        was_paused = self._playback_state == QMediaPlayer.PlaybackState.PausedState
+        pos = self._position_ms
+        self._sample_rate = rate
+        self._eq.set_sample_rate(float(rate))
+        self._eq.set_state(self._eq_state)
+        for stem_id, proc in self._stem_eq.items():
+            proc.set_sample_rate(float(rate))
+            proc.set_state(self._stem_eq_state.get(stem_id) or EqState())
+        self._high_cut.set_sample_rate(float(rate))
+        if was_playing or was_paused:
+            self._restart_pipeline(start_ms=pos, autoplay=was_playing)
+
+    def read_float_interleaved(self, n_samples: int) -> np.ndarray:
+        """Pull processed float PCM for the mix bus (zeros when idle)."""
+        n_samples = max(0, int(n_samples))
+        n_samples -= n_samples % _TARGET_CHANNELS
+        if n_samples <= 0:
+            return np.zeros(0, dtype=np.float32)
+        if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
+            return np.zeros(n_samples, dtype=np.float32)
+        with self._lock:
+            return self._read_float_locked(n_samples)
+
+    def _read_float_locked(self, n_samples: int) -> np.ndarray:
+        # Produce enough wet float into _float_out_pending.
+        while self._float_out_pending.size < n_samples:
+            before = self._float_out_pending.size
+            self._produce_float(max(n_samples - before, _CHUNK_FRAMES * _TARGET_CHANNELS))
+            if self._float_out_pending.size == before:
+                break
+
+        if self._float_out_pending.size == 0:
+            if (
+                self._decode_eof_generation == self._generation
+                and self._float_pending.size == 0
+                and self._chunk_queue.empty()
+                and (
+                    not self._stem_enabled
+                    or (
+                        self._stem_pending[STEM_VOCALS].size == 0
+                        and self._stem_pending[STEM_INSTRUMENTAL].size == 0
+                        and self._stem_pair_queue.empty()
+                    )
+                )
+            ):
+                gen = self._generation
+                self._schedule_decode_finished(gen)
+            return np.zeros(n_samples, dtype=np.float32)
+
+        take = min(self._float_out_pending.size, n_samples)
+        take -= take % _TARGET_CHANNELS
+        if take <= 0:
+            return np.zeros(n_samples, dtype=np.float32)
+        out = self._float_out_pending[:take]
+        self._float_out_pending = self._float_out_pending[take:]
+
+        if take < n_samples:
+            padded = np.zeros(n_samples, dtype=np.float32)
+            padded[:take] = out
+            out = padded
+
+        if (
+            getattr(self, "_decode_eof_generation", None) == self._generation
+            and self._float_out_pending.size == 0
+            and self._float_pending.size == 0
+            and self._chunk_queue.empty()
+            and (
+                not self._stem_enabled
+                or (
+                    self._stem_pending[STEM_VOCALS].size == 0
+                    and self._stem_pending[STEM_INSTRUMENTAL].size == 0
+                    and self._stem_pair_queue.empty()
+                )
+            )
+        ):
+            gen = self._generation
+            self._schedule_decode_finished(gen)
+        return out.astype(np.float32, copy=False)
 
     def set_eq_state(self, state: EqState | None) -> None:
         """Live coefficient swap — no pipeline restart."""
@@ -574,11 +686,16 @@ class PcmAirPlayer(QObject):
         self._high_cut.set_progress(elapsed / float(duration))
 
     def _on_output_params_changed(self) -> None:
+        if self._external_mix:
+            return
         if self._sink is not None:
             self._sink.setVolume(self._output.effective_volume())
 
     def _on_device_changed(self, device: QAudioDevice) -> None:
         self._device = device
+        if self._external_mix:
+            # Device is owned by AirMixBus; ignore per-player device changes.
+            return
         was_playing = self._playback_state == QMediaPlayer.PlaybackState.PlayingState
         pos = self._position_ms
         if was_playing or self._playback_state == QMediaPlayer.PlaybackState.PausedState:
@@ -628,6 +745,26 @@ class PcmAirPlayer(QObject):
         return fmt
 
     def _ensure_sink(self) -> bool:
+        if self._external_mix:
+            # Mix bus owns the device & sample rate; keep DSP in sync only.
+            rate = max(1, int(self._sample_rate))
+            self._eq.set_sample_rate(float(rate))
+            self._eq.set_state(self._eq_state)
+            for stem_id, proc in self._stem_eq.items():
+                proc.set_sample_rate(float(rate))
+                proc.set_state(self._stem_eq_state.get(stem_id) or EqState())
+            self._high_cut.set_sample_rate(float(rate))
+            if self._master_fx is not None:
+                self._master_fx.set_sample_rate(float(rate))
+            if self._sink is not None:
+                try:
+                    self._sink.stop()
+                except Exception:
+                    pass
+                self._sink.deleteLater()
+                self._sink = None
+            return True
+
         fmt = self._preferred_format()
         rate = int(fmt.sampleRate())
         self._sample_rate = rate
@@ -639,10 +776,6 @@ class PcmAirPlayer(QObject):
         self._high_cut.set_sample_rate(float(self._sample_rate))
         if self._master_fx is not None:
             self._master_fx.set_sample_rate(float(self._sample_rate))
-        if self._master_eq is not None:
-            self._master_eq.set_sample_rate(float(self._sample_rate))
-            if self._master_eq_state is not None:
-                self._master_eq.set_state(self._master_eq_state)
 
         if self._sink is not None and getattr(self, "_sink_rate", None) == rate:
             try:
@@ -689,6 +822,7 @@ class PcmAirPlayer(QObject):
         }
         self._stem_vocals_sign = None
         self._byte_pending.clear()
+        self._float_out_pending = np.zeros(0, dtype=np.float32)
 
     def _stop_pipeline(self, *, destroy_sink: bool = False) -> None:
         """Abort decode without blocking the UI thread.
@@ -881,8 +1015,7 @@ class PcmAirPlayer(QObject):
             proc.reset()
         if self._master_fx is not None:
             self._master_fx.reset_copy(self._master_fx_copy)
-        if self._master_eq is not None:
-            self._master_eq.reset()
+        self._float_out_pending = np.zeros(0, dtype=np.float32)
         self._seek_frame = int(start_ms * self._sample_rate / 1000.0)
         self._frames_played = 0
         self._frames_decoded = 0
@@ -930,6 +1063,15 @@ class PcmAirPlayer(QObject):
             self._wait_prebuffer(gen)
         self._last_restart_at = now
         if gen != self._generation:
+            return
+        if self._external_mix:
+            if autoplay:
+                self._set_playback_state(QMediaPlayer.PlaybackState.PlayingState)
+                self._set_media_status(QMediaPlayer.MediaStatus.BufferedMedia)
+                self._pos_timer.start()
+            else:
+                self._set_playback_state(QMediaPlayer.PlaybackState.PausedState)
+                self._set_media_status(QMediaPlayer.MediaStatus.BufferedMedia)
             return
         if autoplay and self._sink is not None:
             self._sink.start(self._io)
@@ -1207,6 +1349,21 @@ class PcmAirPlayer(QObject):
             return
         if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
             return
+        if self._external_mix:
+            target_samples = int(self._sample_rate * milliseconds / 1000.0) * _TARGET_CHANNELS
+            for _ in range(48):
+                with self._lock:
+                    if self._float_out_pending.size >= target_samples:
+                        return
+                    before = self._float_out_pending.size
+                    self._produce_float(
+                        max(_CHUNK_FRAMES * _TARGET_CHANNELS, target_samples - before)
+                    )
+                    grew = self._float_out_pending.size > before
+                if not grew:
+                    return
+                time.sleep(0)
+            return
         target = int(self._sample_rate * milliseconds / 1000.0) * _TARGET_CHANNELS * 2
         for _ in range(48):
             with self._lock:
@@ -1219,9 +1376,68 @@ class PcmAirPlayer(QObject):
                 return
             time.sleep(0)
 
+    def _produce_float(self, need_samples: int) -> None:
+        """Append track-EQ'd float to _float_out_pending (external mix path)."""
+        if need_samples <= 0:
+            return
+        if self._stem_enabled and self._stem_paths:
+            hit_eof = self._drain_stem_queues()
+            if hit_eof:
+                self._decode_eof_generation = int(self._generation)
+            need_samples = max(0, need_samples)
+            need_samples -= need_samples % _TARGET_CHANNELS
+            if need_samples <= 0:
+                return
+            while (
+                min(
+                    self._stem_pending[STEM_VOCALS].size,
+                    self._stem_pending[STEM_INSTRUMENTAL].size,
+                )
+                < need_samples
+            ):
+                if not self._drain_stem_queues():
+                    break
+            mixed = self._mix_stems(need_samples)
+            if mixed is not None and mixed.size:
+                wet = self._high_cut.process_interleaved(mixed)
+                gain = float(self._track_gain)
+                if gain != 1.0:
+                    wet = wet * np.float32(gain)
+                self._emit_wet_pcm(wet)
+            return
+
+        while self._float_pending.size < need_samples + 4096:
+            try:
+                item = self._chunk_queue.get_nowait()
+            except queue.Empty:
+                break
+            if item is None:
+                self._decode_eof_generation = int(self._generation)
+                break
+            if self._float_pending.size:
+                self._float_pending = np.concatenate([self._float_pending, item])
+            else:
+                self._float_pending = item
+        if need_samples > 0 and self._float_pending.size > 0:
+            take = min(self._float_pending.size, need_samples)
+            take -= take % _TARGET_CHANNELS
+            if take > 0:
+                dry = self._float_pending[:take]
+                self._float_pending = self._float_pending[take:]
+                wet = self._eq.process_interleaved(dry)
+                wet = self._high_cut.process_interleaved(wet)
+                gain = float(self._track_gain)
+                if gain != 1.0:
+                    wet = wet * np.float32(gain)
+                self._emit_wet_pcm(wet)
+
     def _produce_pcm(self, extra_bytes: int) -> None:
         """Append processed Int16 to byte_pending without consuming it."""
         if extra_bytes <= 0:
+            return
+        if self._external_mix:
+            need_samples = ((extra_bytes + 3) // 4) * _TARGET_CHANNELS
+            self._produce_float(need_samples)
             return
         if self._stem_enabled and self._stem_paths:
             hit_eof = self._drain_stem_queues()
@@ -1278,12 +1494,18 @@ class PcmAirPlayer(QObject):
                 self._emit_wet_pcm(wet)
 
     def _emit_wet_pcm(self, wet: np.ndarray) -> None:
-        """Spectrum (pre-FX) → master EQ → Int16."""
+        """Spectrum capture → float out (bus) or Int16 (legacy sink)."""
         frames = int(wet.size) // _TARGET_CHANNELS
         self._capture_spectrum(wet)
-        # Apply master EQ
-        if self._master_eq is not None:
-            wet = self._master_eq.process_interleaved(wet)
+        if self._external_mix:
+            if self._float_out_pending.size:
+                self._float_out_pending = np.concatenate(
+                    [self._float_out_pending, wet.astype(np.float32, copy=False)]
+                )
+            else:
+                self._float_out_pending = wet.astype(np.float32, copy=True)
+            self._frames_played += frames
+            return
         clipped = np.clip(wet, -1.0, 1.0)
         pcm = (clipped * 32767.0).astype(np.int16)
         self._byte_pending.extend(pcm.tobytes())
@@ -1308,7 +1530,7 @@ class PcmAirPlayer(QObject):
                 and self._chunk_queue.empty()
             ):
                 gen = self._generation
-                QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
+                self._schedule_decode_finished(gen)
             return bytes(min(maxlen, 4096))
 
         take_b = min(len(self._byte_pending), maxlen)
@@ -1326,7 +1548,7 @@ class PcmAirPlayer(QObject):
             and self._chunk_queue.empty()
         ):
             gen = self._generation
-            QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
+            self._schedule_decode_finished(gen)
         return data
 
     def _read_audio_bytes_stems(self, maxlen: int) -> bytes:
@@ -1341,7 +1563,7 @@ class PcmAirPlayer(QObject):
         if not self._byte_pending:
             if self._decode_eof_generation == self._generation and stems_empty:
                 gen = self._generation
-                QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
+                self._schedule_decode_finished(gen)
             return bytes(min(maxlen, 4096))
 
         take_b = min(len(self._byte_pending), maxlen)
@@ -1357,8 +1579,42 @@ class PcmAirPlayer(QObject):
             and stems_empty
         ):
             gen = self._generation
-            QTimer.singleShot(0, lambda g=gen: self._on_decode_finished(g))
+            self._schedule_decode_finished(gen)
         return data
+
+    def _schedule_decode_finished(self, generation: int) -> None:
+        """Post EOF handling to the main thread (mix I/O has no Qt event loop)."""
+        self.decodeFinished.emit(int(generation))
+
+    def _buffers_drained_for_eof(self) -> bool:
+        if self._external_mix:
+            return (
+                self._float_out_pending.size == 0
+                and self._float_pending.size == 0
+                and self._chunk_queue.empty()
+                and (
+                    not self._stem_enabled
+                    or (
+                        self._stem_pending[STEM_VOCALS].size == 0
+                        and self._stem_pending[STEM_INSTRUMENTAL].size == 0
+                        and self._stem_pair_queue.empty()
+                    )
+                )
+            )
+        stems_ok = (
+            not self._stem_enabled
+            or (
+                self._stem_pending[STEM_VOCALS].size == 0
+                and self._stem_pending[STEM_INSTRUMENTAL].size == 0
+                and self._stem_pair_queue.empty()
+            )
+        )
+        return (
+            not self._byte_pending
+            and self._float_pending.size == 0
+            and self._chunk_queue.empty()
+            and stems_ok
+        )
 
     def _on_decode_finished(self, generation: int | None = None) -> None:
         # Ignore stale EOF from a previous seek/restart/track (kills NEXT otherwise).
@@ -1366,14 +1622,18 @@ class PcmAirPlayer(QObject):
             return
         if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
             return
-        if self._byte_pending or self._float_pending.size or not self._chunk_queue.empty():
+        if not self._buffers_drained_for_eof():
             return
         if getattr(self, "_decode_eof_generation", None) not in (None, self._generation):
             return
+        self._finish_eof_stop()
+
+    def _finish_eof_stop(self) -> None:
+        """Mark EndOfMedia and Stopped (aux mini-wave clears on these signals)."""
         self._decode_eof_generation = None
         self._set_media_status(QMediaPlayer.MediaStatus.EndOfMedia)
         self._pos_timer.stop()
-        if self._sink is not None:
+        if not self._external_mix and self._sink is not None:
             try:
                 self._sink.stop()
             except Exception:
@@ -1384,7 +1644,11 @@ class PcmAirPlayer(QObject):
         if self._sample_rate <= 0:
             return
         pos = self._position_ms
-        if self._sink is not None and self._playback_state == QMediaPlayer.PlaybackState.PlayingState:
+        if (
+            not self._external_mix
+            and self._sink is not None
+            and self._playback_state == QMediaPlayer.PlaybackState.PlayingState
+        ):
             try:
                 us = int(self._sink.processedUSecs())
                 pos = int(self._seek_frame * 1000 / self._sample_rate) + us // 1000
@@ -1397,3 +1661,17 @@ class PcmAirPlayer(QObject):
         if pos != self._position_ms:
             self._position_ms = pos
             self.positionChanged.emit(pos)
+        if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        # External mix: finish when decode drained (do not wait for probed duration —
+        # MP3 container length is often longer than decoded PCM, which left aux waves stuck).
+        if self._external_mix and self._decode_eof_generation == self._generation:
+            if self._buffers_drained_for_eof():
+                self._on_decode_finished(self._generation)
+            return
+        if (
+            self._duration_ms > 0
+            and self._position_ms >= self._duration_ms
+            and self._buffers_drained_for_eof()
+        ):
+            self._finish_eof_stop()

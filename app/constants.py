@@ -4,6 +4,9 @@ MAX_TABS_PER_COLUMN = 20
 APP_NAME = "RESONANCE"
 DEFAULT_FADE_MS = 1500
 FADE_PRESETS_MS = (0, 200, 400, 800, 2000)
+# Audio mixer: immutable Main + up to this many aux strips
+MAIN_CHANNEL_ID = "main"
+MAX_AUX_CHANNELS = 7
 # Air / music (Control Panel FADE)
 FADE_PRESET_SHORTCUTS: tuple[tuple[str, int], ...] = (
     ("Ctrl+Shift+1", 0),

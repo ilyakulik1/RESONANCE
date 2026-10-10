@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSizePolicy,
     QSplitter,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -30,6 +31,7 @@ from app.ui.widgets.square_checkbox import SquareCheckBox
 from app.ui.widgets.value_stepper import ValueStepper
 from app.ui.widgets.float_value_stepper import FloatValueStepper
 from app.widgets.audio_waveform import AudioWaveform
+from app.widgets.audio_mixer_panel import AudioMixerPanel
 from app.widgets.playlist_widget import PlaylistWidget
 from app.eq_dsp import HIGH_CUT_Q_DEFAULT, HIGH_CUT_Q_MAX, HIGH_CUT_Q_MIN
 
@@ -107,13 +109,6 @@ class MainWindowUi:
 
         window.file_properties_panel = FilePropertiesPanel(window)
         window.file_properties_panel.eqChanged.connect(window._on_eq_changed)
-        window.file_properties_panel.gainChanged.connect(window._on_gain_changed)
-        window.file_properties_panel.masterVolumeChanged.connect(
-            window._on_master_volume_changed
-        )
-        window.file_properties_panel.targetLufsChanged.connect(
-            window._on_target_lufs_changed
-        )
         window.file_properties_panel.stemSelectionChanged.connect(
             window._on_stem_selection_changed
         )
@@ -144,11 +139,30 @@ class MainWindowUi:
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
 
+        window.audio_mixer_panel = AudioMixerPanel(window)
+        window.audio_mixer_panel.setMinimumWidth(260)
+        window.audio_mixer_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        window.audio_mixer_panel.setMinimumHeight(0)
+        window.audio_mixer_panel.setMaximumHeight(16777215)
+
+        props_tabs = QTabWidget()
+        props_tabs.setObjectName("audioPropsTabs")
+        props_tabs.setDocumentMode(True)
+        props_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        props_tabs.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
+        props_tabs.addTab(window.file_properties_panel, "VOLUME / EQ")
+        props_tabs.addTab(window.audio_mixer_panel, "MIXER")
+        window.audio_props_tabs = props_tabs
+
         eq_splitter = QSplitter(Qt.Orientation.Horizontal)
         eq_splitter.setObjectName("audioEqSplitter")
         eq_splitter.setChildrenCollapsible(False)
         eq_splitter.addWidget(left_stack)
-        eq_splitter.addWidget(window.file_properties_panel)
+        eq_splitter.addWidget(props_tabs)
         eq_splitter.setStretchFactor(0, 1)
         eq_splitter.setStretchFactor(1, 3)
         eq_splitter.setSizes([360, 720])
@@ -289,7 +303,8 @@ class MainWindowUi:
         )
         window.fade_mode_group.set_value("sequential")
         window.fade_mode_group.setToolTip(
-            "SEQ: fade out then next · XFADE: overlapping fades · "
+            "SEQ: fade out then next · XFADE: overlapping panel FADE "
+            "(track fadein/fadeout still apply) · "
             "HCUT: resonant high-cut kill with end fadeout, then next starts clean"
         )
         window.fade_mode_group.valueChanged.connect(window.on_fade_mode_changed)

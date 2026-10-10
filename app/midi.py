@@ -21,6 +21,23 @@ TARGET_FADE_XFADE = "fade_xfade"
 TARGET_FADE_HCUT = "fade_hcut"
 TARGET_FADE_PRESET_PREV = "fade_preset_prev"
 TARGET_FADE_PRESET_NEXT = "fade_preset_next"
+TARGET_MIXER_FADER_MASTER = "mixer_fader_master"
+TARGET_MIXER_FADER_PREFIX = "mixer_fader_"
+
+
+def mixer_fader_target(channel_id: str) -> str:
+    return f"{TARGET_MIXER_FADER_PREFIX}{channel_id}"
+
+
+def is_mixer_fader_target(target: str) -> bool:
+    return (
+        target == TARGET_MIXER_FADER_MASTER
+        or target == TARGET_MASTER_VOLUME
+        or (
+            target.startswith(TARGET_MIXER_FADER_PREFIX)
+            and len(target) > len(TARGET_MIXER_FADER_PREFIX)
+        )
+    )
 FADE_MODE_TAKE_TARGETS = {
     TARGET_FADE_SEQ: "sequential",
     TARGET_FADE_XFADE: "crossfade",
@@ -208,7 +225,7 @@ class MidiHub(QObject):
         """Main-thread CC handler."""
         if self._learn_target:
             target = self._learn_target
-            if target in BUTTON_TARGETS or target == TARGET_MASTER_VOLUME:
+            if target in BUTTON_TARGETS or is_mixer_fader_target(target):
                 self._finish_learn(MidiBinding(channel=channel, number=cc, kind="cc"))
             return
 
