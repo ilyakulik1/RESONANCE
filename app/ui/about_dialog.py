@@ -16,6 +16,8 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.ui.tokens import get_token
+
 
 class AboutInfo:
     """Контент окна About — редактируйте здесь."""
@@ -113,7 +115,9 @@ class AboutDialog(QDialog):
             return
         label = QLabel(f"Version {version}")
         label.setObjectName("aboutVersion")
-        label.setStyleSheet("color: #9f9f9f;")
+        label.setStyleSheet(
+            f"color: {get_token('colors.text_muted', '#7d8b9c')};"
+        )
         layout.addWidget(label)
 
     def _add_tagline(self, layout: QVBoxLayout) -> None:
@@ -123,7 +127,9 @@ class AboutDialog(QDialog):
         label = QLabel(tagline)
         label.setObjectName("aboutTagline")
         label.setWordWrap(True)
-        label.setStyleSheet("color: #e0e0e0;")
+        label.setStyleSheet(
+            f"color: {get_token('colors.text_secondary', '#c5d0dc')};"
+        )
         layout.addWidget(label)
 
     def _add_description(self, layout: QVBoxLayout) -> None:

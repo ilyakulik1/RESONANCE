@@ -326,7 +326,7 @@ class PlaylistWidget(QListWidget):
             painter.setPen(Qt.PenStyle.NoPen)
             painter.setBrush(QColor(get_token("colors.accent", "#3897fd")))
             painter.drawRoundedRect(badge, 8, 8)
-            painter.setPen(QColor("#ffffff"))
+            painter.setPen(QColor(get_token("colors.text_on_accent", "#0c1218")))
             painter.drawText(badge, int(Qt.AlignmentFlag.AlignCenter), str(len(rows)))
         painter.end()
         return pixmap, rect

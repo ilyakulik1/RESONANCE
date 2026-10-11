@@ -1,14 +1,14 @@
 /* Section title bars — CONTROL PANEL, TIMELINE, PLAYLIST N */
 
 QFrame#sectionHeader {
-    background-color: {{colors.bg_control}};
+    background-color: transparent;
     border-radius: {{radius.md}};
 }
 
 QLabel#sectionHeaderTitle {
-    color: {{colors.text_primary}};
+    color: {{colors.text_muted}};
     font-size: {{typography.size_sm}};
-    font-weight: bold;
+    font-weight: normal;
 }
 
 QLineEdit#sectionHeaderEditor {

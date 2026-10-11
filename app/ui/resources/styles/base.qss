@@ -62,17 +62,18 @@ QPushButton:pressed {
 }
 
 QPushButton#accentButton {
-    background-color: {{colors.accent_red}};
+    background-color: {{colors.accent}};
+    color: {{colors.text_on_accent}};
     min-width: 0;
     min-height: {{sizes.button_min_height}};
 }
 
 QPushButton#accentButton:hover {
-    background-color: #f06666;
+    background-color: {{colors.accent_hover}};
 }
 
 QPushButton#accentButtonSpace:hover {
-    background-color: #f06666;
+    background-color: {{colors.accent_hover}};
 }
 
 QPushButton#accentButtonSpace:pressed {
@@ -89,7 +90,8 @@ QPushButton#segmentButton {
 }
 
 QPushButton#segmentButton[segmentActive="true"] {
-    background-color: {{colors.accent_red}};
+    background-color: {{colors.accent}};
+    color: {{colors.text_on_accent}};
 }
 
 QPushButton#segmentButton[midiLearn="true"],

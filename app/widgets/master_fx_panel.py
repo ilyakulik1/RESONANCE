@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.ui.tokens import get_token
 from app.vst_host import MAX_SLOTS, PluginSlot, pedalboard_available, scan_installed_plugins
 
 
@@ -57,7 +58,9 @@ class _SlotRow(QWidget):
         self.name.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         if slot.error:
             self.name.setText(f"{self.name.text()} — {slot.error}")
-            self.name.setStyleSheet("color: #e45656;")
+            self.name.setStyleSheet(
+                f"color: {get_token('colors.accent_red', '#c45c5c')};"
+            )
         self.name.setToolTip(slot.error or slot.path)
 
         self.btn_edit = QPushButton("EDIT")

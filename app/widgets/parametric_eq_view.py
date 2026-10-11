@@ -39,6 +39,7 @@ from app.eq_state import (
     EqBand,
     EqState,
 )
+from app.ui.tokens import get_token
 
 
 class _EqCanvas(QWidget):
@@ -89,15 +90,24 @@ class _EqCanvas(QWidget):
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setObjectName("eqCanvas")
 
-        self._bg = QColor("#0a0a0a")
-        self._grid = QColor(255, 255, 255, 28)
-        self._grid_zero = QColor(255, 255, 255, 55)
-        self._spectrum = QColor(56, 151, 253, 70)
-        self._curve = QColor("#3897fd")
-        self._curve_bypass = QColor(159, 159, 159, 120)
-        self._node = QColor("#3897fd")
-        self._node_sel = QColor("#ffffff")
-        self._label = QColor("#9f9f9f")
+        accent = QColor(get_token("colors.accent", "#2ad4ea"))
+        muted = QColor(get_token("colors.text_muted", "#7d8b9c"))
+        self._bg = QColor(get_token("colors.waveform_bg", "#070b10"))
+        self._grid = QColor(accent)
+        self._grid.setAlpha(22)
+        self._grid_zero = QColor(accent)
+        self._grid_zero.setAlpha(40)
+        self._minor_grid = QColor(accent)
+        self._minor_grid.setAlpha(10)
+        self._spectrum = QColor(accent)
+        self._spectrum.setAlpha(36)
+        self._curve = QColor(accent)
+        self._curve_bypass = QColor(muted)
+        self._curve_bypass.setAlpha(120)
+        self._node = QColor(accent)
+        self._node_sel = QColor(get_token("colors.text_primary", "#e7eef6"))
+        self._node_outline = QColor(get_token("colors.bg_window", "#0c1218"))
+        self._label = muted
 
     def set_state(self, state: EqState) -> None:
         self._state = state
@@ -167,8 +177,7 @@ class _EqCanvas(QWidget):
         rect = self._plot_rect()
 
         # Grid — frequency (minor + major)
-        minor_grid = QColor(255, 255, 255, 14)
-        painter.setPen(QPen(minor_grid, 1))
+        painter.setPen(QPen(self._minor_grid, 1))
         for f in self._FREQ_MINOR:
             x = self._freq_to_x(f, rect)
             painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
@@ -178,7 +187,7 @@ class _EqCanvas(QWidget):
             painter.drawLine(QPointF(x, rect.top()), QPointF(x, rect.bottom()))
 
         # Grid — dB (EQ gain): every 3 dB, emphasize 0 and ±6/±12/±18
-        painter.setPen(QPen(minor_grid, 1))
+        painter.setPen(QPen(self._minor_grid, 1))
         for db in self._DB_MINOR:
             y = self._db_to_y(db, rect)
             painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
@@ -249,9 +258,20 @@ class _EqCanvas(QWidget):
                 curve.moveTo(x, y)
             else:
                 curve.lineTo(x, y)
-        painter.setPen(
-            QPen(self._curve_bypass if self._state.bypass else self._curve, 2.0)
-        )
+        stroke = self._curve_bypass if self._state.bypass else self._curve
+        if not self._state.bypass:
+            for width, alpha in ((14.0, 22), (7.0, 48)):
+                glow = QColor(stroke)
+                glow.setAlpha(alpha)
+                pen = QPen(glow, width)
+                pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+                painter.setPen(pen)
+                painter.drawPath(curve)
+        core = QPen(stroke, 1.6)
+        core.setCapStyle(Qt.PenCapStyle.RoundCap)
+        core.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(core)
         painter.drawPath(curve)
 
         # Nodes
@@ -259,8 +279,13 @@ class _EqCanvas(QWidget):
             p = self._band_point(band, rect)
             selected = band.id == self._state.selected_id
             r = 6.0 if selected else 5.0
+            halo = QColor(self._node)
+            halo.setAlpha(32)
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(halo)
+            painter.drawEllipse(p, r + 5.0, r + 5.0)
             painter.setBrush(self._node_sel if selected else self._node)
-            painter.setPen(QPen(QColor("#000000"), 1))
+            painter.setPen(QPen(self._node_outline, 1))
             painter.drawEllipse(p, r, r)
             if selected:
                 # Q handles (horizontal wings)

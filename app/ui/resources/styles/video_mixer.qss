@@ -12,7 +12,7 @@ QLabel#screenCaption {
 }
 
 QLabel#programClock {
-    color: {{colors.accent_red}};
+    color: {{colors.accent}};
     font-size: {{typography.size_sm}};
     font-weight: 700;
     font-family: "Menlo", "Monaco", "Consolas", monospace;
@@ -81,7 +81,7 @@ QFrame#sceneSlot {
 }
 
 QFrame#sceneSlot[active="true"] {
-    border: 2px solid {{colors.accent_red}};
+    border: 2px solid {{colors.accent}};
 }
 
 QFrame#sceneSlot[preview="true"] {

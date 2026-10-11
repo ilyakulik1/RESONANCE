@@ -59,7 +59,7 @@ QDial#volumeKnobDial {
 }
 
 QWidget#eqCanvas {
-    background-color: #0a0a0a;
+    background-color: {{colors.waveform_bg}};
     border: 1px solid {{colors.border}};
 }
 
@@ -85,7 +85,7 @@ QPushButton#eqDeleteBtn {
 }
 
 QPushButton#eqBypassBtn:checked {
-    background-color: {{colors.accent_red}};
+    background-color: {{colors.accent}};
     color: {{colors.text_on_accent}};
 }
 

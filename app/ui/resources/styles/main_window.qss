@@ -15,7 +15,7 @@ QTabWidget#audioPropsTabs::pane {
 }
 
 QTabWidget#audioPropsTabs QTabBar::tab {
-    background-color: {{colors.bg_control}};
+    background-color: transparent;
     color: {{colors.text_muted}};
     padding: 4px 12px;
     margin-right: 2px;
@@ -24,8 +24,8 @@ QTabWidget#audioPropsTabs QTabBar::tab {
 }
 
 QTabWidget#audioPropsTabs QTabBar::tab:selected {
-    background-color: {{colors.bg_card}};
-    color: {{colors.text_primary}};
+    background-color: transparent;
+    color: {{colors.accent}};
     font-weight: bold;
 }
 
@@ -85,7 +85,7 @@ QPushButton#accentButtonSpace {
 }
 
 QPushButton#accentButtonSpace {
-    background-color: {{colors.accent_red}};
+    background-color: {{colors.accent}};
     color: {{colors.text_on_accent}};
     font-weight: bold;
     min-width: 0;

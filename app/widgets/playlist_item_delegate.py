@@ -227,6 +227,22 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             wave_rect=wave_rect,
         )
 
+    def _shift(self, color: QColor, delta: int) -> QColor:
+        return QColor(
+            max(0, min(255, color.red() + delta)),
+            max(0, min(255, color.green() + delta)),
+            max(0, min(255, color.blue() + delta)),
+        )
+
+    def _color_wash(self, mark: QColor) -> QColor:
+        """Dense dark wash so a track color reads as a solid row."""
+        dark = self._color("bg_window", "#141c28")
+        return QColor(
+            (dark.red() * 3 + mark.red() * 2) // 5,
+            (dark.green() * 3 + mark.green() * 2) // 5,
+            (dark.blue() * 3 + mark.blue() * 2) // 5,
+        )
+
     def _row_background(
         self,
         row: int,
@@ -236,40 +252,26 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         mark: QColor | None = None,
         aux_playing: bool = False,
     ) -> QColor:
-        if selected:
-            return self._color("accent_blue", "#3897fd")
-        if aux_playing:
-            base = QColor(get_token("colors.accent", "#3897fd"))
-            base.setAlpha(48)
-            # Blend onto surface
-            surface = self._color("bg_surface", "#262626")
-            return QColor(
-                (surface.red() * 2 + base.red()) // 3,
-                (surface.green() * 2 + base.green()) // 3,
-                (surface.blue() * 2 + base.blue()) // 3,
-            )
-        if hovered:
-            base = self._color("bg_item_hover", "#333333")
+        if mark is not None and mark.isValid():
+            base = self._color_wash(mark)
+            if hovered:
+                base = self._shift(base, 12)
+        elif hovered:
+            base = self._color("bg_item_hover", "#243044")
         elif row % 2 == 0:
-            base = self._color("bg_surface", "#262626")
+            base = self._color("bg_surface", "#1a2330")
         else:
-            base = self._color("playlist_row_alt", "#2c2c2c")
-        if mark is None or not mark.isValid():
-            return base
-        tinted = QColor(base)
-        tinted.setRed(min(255, (tinted.red() * 2 + mark.red()) // 3))
-        tinted.setGreen(min(255, (tinted.green() * 2 + mark.green()) // 3))
-        tinted.setBlue(min(255, (tinted.blue() * 2 + mark.blue()) // 3))
-        return tinted
-
-    def _badge_colors(self, *, selected: bool) -> tuple[QColor, QColor]:
+            base = self._color("playlist_row_alt", "#161e28")
+        if aux_playing:
+            accent = self._color("accent", "#2ad4ea")
+            base = QColor(
+                (base.red() * 3 + accent.red()) // 4,
+                (base.green() * 3 + accent.green()) // 4,
+                (base.blue() * 3 + accent.blue()) // 4,
+            )
         if selected:
-            bg = QColor(255, 255, 255, 38)
-            fg = self._color("text_on_accent", "#ffffff")
-            return bg, fg
-        bg = self._color("bg_control", "#404040")
-        fg = self._color("text_secondary", "#e0e0e0")
-        return bg, fg
+            base = self._shift(base, 14)
+        return base
 
     def _draw_badge(
         self,
@@ -317,10 +319,9 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         bar_w = max(1.0, rect.width() / float(n))
         played_x = rect.left() + int(rect.width() * max(0.0, min(1.0, progress)))
 
-        played = QColor(get_token("colors.accent", "#3897fd"))
-        if selected:
-            played = QColor(255, 255, 255)
-        rest = QColor(255, 255, 255, 90 if selected else 70)
+        played = QColor(get_token("colors.accent", "#2ad4ea"))
+        rest = QColor(played)
+        rest.setAlpha(90 if selected else 70)
         for i, peak in enumerate(peaks):
             h = max(1, int(abs(float(peak)) * amp))
             x = int(rect.left() + i * bar_w)
@@ -329,7 +330,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             painter.fillRect(x, mid_y - h, w, h * 2, color)
 
         # Playhead
-        painter.setPen(QPen(played if not selected else QColor("#ffffff"), 1))
+        painter.setPen(QPen(played, 1))
         painter.drawLine(played_x, rect.top() + 1, played_x, rect.bottom() - 1)
 
         # Channel chip
@@ -376,9 +377,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         angle_deg = start_deg - 270.0 * v
         span = 270.0 * v
 
-        accent = QColor(get_token("colors.accent", "#3897fd"))
-        if selected:
-            accent = QColor("#ffffff")
+        accent = QColor(get_token("colors.accent", "#2ad4ea"))
         pen = QPen(accent, 2.2)
         pen.setCapStyle(Qt.PenCapStyle.RoundCap)
         painter.setPen(pen)
@@ -403,7 +402,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         y1 = cy - inner * math.sin(angle_rad)
         x2 = cx + outer * math.cos(angle_rad)
         y2 = cy - outer * math.sin(angle_rad)
-        painter.setPen(QPen(accent if not selected else QColor("#ffffff"), 2))
+        painter.setPen(QPen(accent, 2))
         painter.drawLine(int(x1), int(y1), int(x2), int(y2))
         painter.restore()
 
@@ -540,8 +539,13 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         if mark is not None and mark.isValid():
             strip = QRect(option.rect.left(), option.rect.top(), 3, option.rect.height())
             painter.fillRect(strip, mark)
+        if selected:
+            painter.setPen(QPen(self._color("accent", "#2ad4ea"), 1))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.drawRect(option.rect.adjusted(0, 0, -1, -1))
 
-        badge_bg, badge_fg = self._badge_colors(selected=selected)
+        clear = QColor(0, 0, 0, 0)
+        plain_fg = self._color("text_secondary", "#c5d0dc")
         index_text = str(row + 1)
         duration_text = format_time_ms(_duration_from_index(index))
         bpm_value = _bpm_from_index(index)
@@ -552,33 +556,30 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             painter,
             layout.index_rect,
             index_text,
-            bg=badge_bg,
-            fg=badge_fg,
+            bg=clear,
+            fg=plain_fg,
         )
         if layout.stems_rect is not None:
-            accent_bg = QColor(get_token("colors.accent", "#3897fd"))
-            if selected:
-                accent_bg = QColor(255, 255, 255, 55)
             self._draw_badge(
                 painter,
                 layout.stems_rect,
                 "stems",
-                bg=accent_bg,
-                fg=badge_fg,
+                bg=self._color("accent", "#2ad4ea"),
+                fg=self._color("text_on_accent", "#0c1218"),
             )
         self._draw_badge(
             painter,
             layout.time_rect,
             duration_text,
-            bg=badge_bg,
-            fg=badge_fg,
+            bg=clear,
+            fg=plain_fg,
         )
         self._draw_badge(
             painter,
             layout.bpm_rect,
             bpm_text,
-            bg=badge_bg,
-            fg=badge_fg,
+            bg=clear,
+            fg=self._color("accent", "#2ad4ea"),
         )
         self._draw_gain_knob(
             painter,
@@ -591,13 +592,11 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             painter.setFont(option.font)
             placeholder = is_item_placeholder(item)
             if placeholder:
-                painter.setPen(self._color("text_muted", "#808080"))
+                painter.setPen(self._color("text_muted", "#7d8b9c"))
             elif is_item_file_missing(item):
-                painter.setPen(self._color("accent_red", "#e45656"))
-            elif selected:
-                painter.setPen(self._color("text_on_accent", "#ffffff"))
+                painter.setPen(self._color("accent_red", "#c45c5c"))
             else:
-                painter.setPen(self._color("text_primary", "#ffffff"))
+                painter.setPen(self._color("text_primary", "#e7eef6"))
 
             name = index.data(Qt.ItemDataRole.DisplayRole) or ""
             # Keep name in the top band only (above the mini wave).

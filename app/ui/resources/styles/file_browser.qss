@@ -140,7 +140,7 @@ QTabWidget#fileBrowserTabs QTabBar::tab {
 
 QTabWidget#fileBrowserTabs QTabBar::tab:selected {
     background-color: {{colors.bg_surface}};
-    color: {{colors.text_primary}};
+    color: {{colors.accent}};
 }
 
 QTabWidget#fileBrowserTabs QTabBar::tab:hover:!selected {

@@ -59,7 +59,7 @@ QTabWidget#playlistColumnTabs QTabBar::tab {
 
 QTabWidget#playlistColumnTabs QTabBar::tab:selected {
     background-color: {{colors.bg_surface}};
-    color: {{colors.text_primary}};
+    color: {{colors.accent}};
 }
 
 QTabWidget#playlistColumnTabs QTabBar::tab:hover:!selected {

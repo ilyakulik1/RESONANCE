@@ -19,6 +19,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from app.ui.tokens import get_token
 from app.ui.widgets.float_value_stepper import FloatValueStepper
 from app.video_mixer.gl_widget import (
     OutputGLWidget,
@@ -218,7 +219,9 @@ class MappingWindow(QWidget):
 
         hint = QLabel("Corners · move inside · wheel scale · W/H steppers · Esc close")
         hint.setObjectName("mixerTimeLabel")
-        hint.setStyleSheet("color: #9f9f9f; font-size: 11px;")
+        hint.setStyleSheet(
+            f"color: {get_token('colors.text_muted', '#7d8b9c')}; font-size: 11px;"
+        )
         toolbar.addWidget(hint)
         root.addLayout(toolbar)
 

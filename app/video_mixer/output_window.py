@@ -6,6 +6,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeyEvent, QCloseEvent
 from PyQt6.QtWidgets import QVBoxLayout, QWidget, QApplication, QLabel
 
+from app.ui.tokens import get_token
 from app.video_mixer.gl_widget import OutputGLWidget
 
 if TYPE_CHECKING:
@@ -33,7 +34,10 @@ class OutputWindow(QWidget):
         self._hint = QLabel("Esc — exit fullscreen", self)
         self._hint.setObjectName("outputHint")
         self._hint.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._hint.setStyleSheet("color: #9f9f9f; background: transparent; font-size: 11px;")
+        self._hint.setStyleSheet(
+            f"color: {get_token('colors.text_muted', '#7d8b9c')}; "
+            "background: transparent; font-size: 11px;"
+        )
         self._hint.hide()
 
     def open_on_screen(self, screen_index: int | None = None) -> None:
