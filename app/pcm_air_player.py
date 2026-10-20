@@ -216,7 +216,6 @@ class PcmAirPlayer(QObject):
 
         self._eq = EqProcessor(channels=_TARGET_CHANNELS, sample_rate=44100.0)
         self._eq_state = EqState()
-        self._track_gain = 1.0
         self._stem_enabled = False
         self._stem_paths: dict[str, str] = {}
         self._stem_eq = {
@@ -565,12 +564,6 @@ class PcmAirPlayer(QObject):
         self._eq_state = state or EqState()
         self._eq.set_state(self._eq_state)
 
-    def set_track_gain_db(self, gain_db: float) -> None:
-        """Per-track linear gain applied in the PCM path (after EQ / stem mix)."""
-        from app.loudness import clamp_gain_db, db_to_linear
-
-        self._track_gain = db_to_linear(clamp_gain_db(gain_db))
-
     def set_stem_mix(
         self,
         *,
@@ -581,7 +574,7 @@ class PcmAirPlayer(QObject):
         vocals_gain_db: float = 0.0,
         instrumental_gain_db: float = 0.0,
     ) -> None:
-        """Enable dual-stem playback. Master track gain stays independent."""
+        """Enable dual-stem playback. Stem faders stay independent of the mixer."""
         from app.loudness import db_to_linear
         from app.stems import is_readable_stem_wav
         from app.widgets.stem_fader import clamp_stem_gain_db
@@ -845,6 +838,15 @@ class PcmAirPlayer(QObject):
                 self._sink.deleteLater()
                 self._sink = None
 
+    def _enqueue_eof(self, dest: queue.Queue, generation: int) -> None:
+        """Block until the end marker is queued, or this decode generation ends."""
+        while generation == self._generation and not self._decode_stop.is_set():
+            try:
+                dest.put(None, timeout=_PUT_TIMEOUT_S)
+                return
+            except queue.Full:
+                continue
+
     def _enqueue_chunk(self, block: np.ndarray, generation: int) -> bool:
         """Non-blocking-ish put that abandons quickly on seek/stop."""
         while True:
@@ -976,12 +978,9 @@ class PcmAirPlayer(QObject):
                     pending_i = np.pad(pending_i, (0, n - pending_i.size))
                 self._enqueue_stem_pair(pending_v.copy(), pending_i.copy(), generation)
 
-            # EOF marker on both queues
-            if generation == self._generation:
-                try:
-                    self._stem_pair_queue.put_nowait(None)
-                except queue.Full:
-                    pass
+            # EOF marker. put_nowait used to drop it when the queue was full,
+            # so NEXT never saw EndOfMedia on some files.
+            self._enqueue_eof(self._stem_pair_queue, generation)
         except Exception:
             pass
         finally:
@@ -1178,11 +1177,7 @@ class PcmAirPlayer(QObject):
                 container.close()
             except Exception:
                 pass
-            if generation == self._generation:
-                try:
-                    self._chunk_queue.put_nowait(None)
-                except queue.Full:
-                    pass
+            self._enqueue_eof(self._chunk_queue, generation)
 
     def _capture_spectrum(self, interleaved: np.ndarray) -> None:
         if not self._spectrum_enabled:
@@ -1400,9 +1395,6 @@ class PcmAirPlayer(QObject):
             mixed = self._mix_stems(need_samples)
             if mixed is not None and mixed.size:
                 wet = self._high_cut.process_interleaved(mixed)
-                gain = float(self._track_gain)
-                if gain != 1.0:
-                    wet = wet * np.float32(gain)
                 self._emit_wet_pcm(wet)
             return
 
@@ -1426,9 +1418,6 @@ class PcmAirPlayer(QObject):
                 self._float_pending = self._float_pending[take:]
                 wet = self._eq.process_interleaved(dry)
                 wet = self._high_cut.process_interleaved(wet)
-                gain = float(self._track_gain)
-                if gain != 1.0:
-                    wet = wet * np.float32(gain)
                 self._emit_wet_pcm(wet)
 
     def _produce_pcm(self, extra_bytes: int) -> None:
@@ -1459,9 +1448,6 @@ class PcmAirPlayer(QObject):
             mixed = self._mix_stems(need_samples)
             if mixed is not None and mixed.size:
                 wet = self._high_cut.process_interleaved(mixed)
-                gain = float(self._track_gain)
-                if gain != 1.0:
-                    wet = wet * np.float32(gain)
                 self._emit_wet_pcm(wet)
             return
 
@@ -1488,9 +1474,6 @@ class PcmAirPlayer(QObject):
                 self._float_pending = self._float_pending[take:]
                 wet = self._eq.process_interleaved(dry)
                 wet = self._high_cut.process_interleaved(wet)
-                gain = float(self._track_gain)
-                if gain != 1.0:
-                    wet = wet * np.float32(gain)
                 self._emit_wet_pcm(wet)
 
     def _emit_wet_pcm(self, wet: np.ndarray) -> None:
@@ -1630,6 +1613,8 @@ class PcmAirPlayer(QObject):
 
     def _finish_eof_stop(self) -> None:
         """Mark EndOfMedia and Stopped (aux mini-wave clears on these signals)."""
+        if self._playback_state != QMediaPlayer.PlaybackState.PlayingState:
+            return
         self._decode_eof_generation = None
         self._set_media_status(QMediaPlayer.MediaStatus.EndOfMedia)
         self._pos_timer.stop()
@@ -1672,6 +1657,17 @@ class PcmAirPlayer(QObject):
         if (
             self._duration_ms > 0
             and self._position_ms >= self._duration_ms
+            and self._buffers_drained_for_eof()
+        ):
+            self._finish_eof_stop()
+            return
+        # Decoder already exited and nothing is left to play. A dropped EOF
+        # marker (or a container duration longer than the decoded PCM) used
+        # to leave NEXT sitting on the finished track.
+        thread = self._decode_thread
+        if (
+            thread is not None
+            and not thread.is_alive()
             and self._buffers_drained_for_eof()
         ):
             self._finish_eof_stop()

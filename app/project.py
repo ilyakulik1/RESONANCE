@@ -221,7 +221,6 @@ class ProjectState:
     playlist_columns: int = 2
     track_timelines: dict[str, dict] = field(default_factory=dict)
     track_eq: dict[str, dict] = field(default_factory=dict)
-    track_gain_db: dict[str, float] = field(default_factory=dict)
     track_lufs: dict[str, float] = field(default_factory=dict)
     track_stems: dict[str, dict] = field(default_factory=dict)
     video_mixer: dict | None = None
@@ -406,11 +405,6 @@ def _payload_from_state(state: ProjectState, root: Path, name: str) -> dict:
         "track_eq": {
             _instance_key_for_storage(path, root): data
             for path, data in state.track_eq.items()
-        },
-        "track_gain_db": {
-            _instance_key_for_storage(path, root): float(value)
-            for path, value in state.track_gain_db.items()
-            if isinstance(value, (int, float))
         },
         "track_lufs": {
             to_project_path(path, root): float(value)
@@ -798,14 +792,6 @@ class ProjectManager:
                     continue
                 track_eq[_instance_key_from_storage(str(key), root)] = value
 
-        track_gain_db: dict[str, float] = {}
-        raw_gain = data.get("track_gain_db")
-        if isinstance(raw_gain, dict):
-            for key, value in raw_gain.items():
-                if not isinstance(value, (int, float)):
-                    continue
-                track_gain_db[_instance_key_from_storage(str(key), root)] = float(value)
-
         track_lufs: dict[str, float] = {}
         raw_lufs = data.get("track_lufs")
         if isinstance(raw_lufs, dict):
@@ -840,7 +826,6 @@ class ProjectManager:
             playlist_columns=columns_count,
             track_timelines=timelines,
             track_eq=track_eq,
-            track_gain_db=track_gain_db,
             track_lufs=track_lufs,
             track_stems=track_stems,
             video_mixer=video_mixer,

@@ -234,7 +234,7 @@ def separate_vocals_instrumental(
 
 @dataclass
 class StemChannelState:
-    """Per-stem EQ + relative gain (independent of master track gain)."""
+    """Per-stem EQ + relative gain, mixed before the bus."""
 
     gain_db: float = 0.0
     eq: dict | None = None

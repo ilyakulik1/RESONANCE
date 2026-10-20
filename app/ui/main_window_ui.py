@@ -120,7 +120,7 @@ class MainWindowUi:
 
         window.timeline_section = self._build_timeline(window)
 
-        # Left stack: Control → ON AIR → PREVIEW. Drag the splitter to size VOLUME / EQ.
+        # Left stack: Control → ON AIR → PREVIEW. Drag the splitter to size EQUALIZER.
         left_stack = QWidget()
         left_stack.setObjectName("audioLeftStack")
         left_stack.setMinimumWidth(96)
@@ -154,7 +154,7 @@ class MainWindowUi:
         props_tabs.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        props_tabs.addTab(window.file_properties_panel, "VOLUME / EQ")
+        props_tabs.addTab(window.file_properties_panel, "EQUALIZER")
         props_tabs.addTab(window.audio_mixer_panel, "MIXER")
         window.audio_props_tabs = props_tabs
 

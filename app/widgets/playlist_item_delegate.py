@@ -1,20 +1,23 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Callable
 
-from PyQt6.QtCore import QEvent, QPointF, Qt, QRect, QSize
-from PyQt6.QtGui import QColor, QFont, QMouseEvent, QPainter, QPen, QWheelEvent
-from PyQt6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionViewItem
+from PyQt6.QtCore import Qt, QRect, QSize
+from PyQt6.QtGui import QColor, QFont, QPainter, QPen
+from PyQt6.QtWidgets import (
+    QAbstractItemView,
+    QLineEdit,
+    QStyledItemDelegate,
+    QStyle,
+    QStyleOptionViewItem,
+)
 
 from app.analysis_cache import load_peaks
-from app.loudness import TRACK_GAIN_DB_MAX, TRACK_GAIN_DB_MIN, gain_db_to_volume, volume_to_gain_db
 from app.playlist_io import (
     BPM_ROLE,
     COLOR_ROLE,
     DURATION_ROLE,
-    GAIN_DB_ROLE,
     STEMS_ROLE,
     get_item_file_path,
     is_item_file_missing,
@@ -25,15 +28,10 @@ from app.ui.tokens import get_token
 
 # Callback: item -> {path, position_ms, duration_ms, channel_name} | None
 AuxPlaybackProvider = Callable[[object], dict | None]
-# Callback: (item, volume 0..1) -> None
-GainVolumeHandler = Callable[[object, float], None]
 
 _MINI_WAVE_H = 18
 _MINI_WAVE_BARS = 96
 _PLAYING_ROW_EXTRA = _MINI_WAVE_H + 6
-_GAIN_KNOB = 26
-_GAIN_DRAG_PX = 100.0  # full −24…+12 span over this many pixels of vertical drag
-_GAIN_WHEEL_DB = 0.5
 
 
 def _duration_from_index(index) -> int | None:
@@ -74,16 +72,6 @@ def _has_stems_from_index(index) -> bool:
     return bool(index.data(STEMS_ROLE))
 
 
-def _volume_from_index(index) -> float:
-    value = index.data(GAIN_DB_ROLE)
-    if value is None:
-        return 1.0
-    try:
-        return gain_db_to_volume(float(value))
-    except (TypeError, ValueError):
-        return 1.0
-
-
 def _format_bpm(bpm: float) -> str:
     if bpm == int(bpm):
         return str(int(bpm))
@@ -96,7 +84,6 @@ class _ColumnLayout:
     name_rect: QRect
     time_rect: QRect
     bpm_rect: QRect
-    gain_rect: QRect
     stems_rect: QRect | None
     wave_rect: QRect | None
 
@@ -104,11 +91,8 @@ class _ColumnLayout:
 class PlaylistItemDelegate(QStyledItemDelegate):
     ROW_PAD_H = 4
     COL_GAP = 6
-    INDEX_BADGE_W = 24
-    TIME_BADGE_W = 46
-    BPM_BADGE_W = 32
+    META_PAD = 6
     STEMS_BADGE_W = 40
-    GAIN_KNOB_W = _GAIN_KNOB
     BADGE_RADIUS = 5
     ROW_V_PAD = 4
 
@@ -117,15 +101,10 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         self._badge_font = QFont(get_token("typography.font_family_ui", "Arial"))
         self._badge_font.setPixelSize(10)
         self._aux_playback_provider: AuxPlaybackProvider | None = None
-        self._gain_handler: GainVolumeHandler | None = None
         self._peaks_cache: dict[str, list[float]] = {}
-        self._gain_drag: dict | None = None
 
     def set_aux_playback_provider(self, provider: AuxPlaybackProvider | None) -> None:
         self._aux_playback_provider = provider
-
-    def set_gain_volume_handler(self, handler: GainVolumeHandler | None) -> None:
-        self._gain_handler = handler
 
     def _aux_info_for_item(self, item) -> dict | None:
         if item is None or self._aux_playback_provider is None:
@@ -151,7 +130,15 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
     def _badge_height(self, option: QStyleOptionViewItem) -> int:
         fm = option.fontMetrics
-        return max(_GAIN_KNOB, fm.height() + 2)
+        return fm.height() + 2
+
+    def _meta_widths(self, fm, *, row_count: int) -> tuple[int, int, int]:
+        """Index, time, and BPM columns sized for the playlist font."""
+        pad = self.META_PAD
+        index_w = fm.horizontalAdvance(str(max(int(row_count), 1))) + pad
+        time_w = fm.horizontalAdvance("0:00:00") + pad
+        bpm_w = fm.horizontalAdvance("000.0") + pad
+        return index_w, time_w, bpm_w
 
     def _layout_columns(
         self,
@@ -160,6 +147,8 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         *,
         has_stems: bool,
         show_wave: bool,
+        fm,
+        row_count: int,
     ) -> _ColumnLayout:
         inner_left = rect.left() + self.ROW_PAD_H
         inner_right = rect.right() - self.ROW_PAD_H
@@ -170,26 +159,20 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             top_band = rect
 
         badge_y = top_band.top() + (top_band.height() - badge_h) // 2
-        knob_y = top_band.top() + (top_band.height() - self.GAIN_KNOB_W) // 2
+        index_w, time_w, bpm_w = self._meta_widths(fm, row_count=row_count)
 
-        index_rect = QRect(inner_left, badge_y, self.INDEX_BADGE_W, badge_h)
+        index_rect = QRect(inner_left, badge_y, index_w, badge_h)
 
-        gain_rect = QRect(
-            inner_right - self.GAIN_KNOB_W,
-            knob_y,
-            self.GAIN_KNOB_W,
-            self.GAIN_KNOB_W,
-        )
         bpm_rect = QRect(
-            gain_rect.left() - self.COL_GAP - self.BPM_BADGE_W,
+            inner_right - bpm_w,
             badge_y,
-            self.BPM_BADGE_W,
+            bpm_w,
             badge_h,
         )
         time_rect = QRect(
-            bpm_rect.left() - self.COL_GAP - self.TIME_BADGE_W,
+            bpm_rect.left() - self.COL_GAP - time_w,
             badge_y,
-            self.TIME_BADGE_W,
+            time_w,
             badge_h,
         )
         stems_rect = None
@@ -222,7 +205,6 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             name_rect=name_rect,
             time_rect=time_rect,
             bpm_rect=bpm_rect,
-            gain_rect=gain_rect,
             stems_rect=stems_rect,
             wave_rect=wave_rect,
         )
@@ -236,7 +218,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
     def _color_wash(self, mark: QColor) -> QColor:
         """Dense dark wash so a track color reads as a solid row."""
-        dark = self._color("bg_window", "#141c28")
+        dark = self._color("bg_window", "#1a1c20")
         return QColor(
             (dark.red() * 3 + mark.red() * 2) // 5,
             (dark.green() * 3 + mark.green() * 2) // 5,
@@ -270,8 +252,142 @@ class PlaylistItemDelegate(QStyledItemDelegate):
                 (base.blue() * 3 + accent.blue()) // 4,
             )
         if selected:
-            base = self._shift(base, 14)
+            base = QColor("#008264")
         return base
+
+    def _item_font(self, option: QStyleOptionViewItem, index) -> QFont:
+        font = index.data(Qt.ItemDataRole.FontRole)
+        if isinstance(font, QFont):
+            return QFont(font)
+        return QFont(option.font)
+
+    def _editor_stylesheet(self, font: QFont, background: QColor) -> str:
+        family = font.family().replace('"', "")
+        if font.pointSize() > 0:
+            size = f"{font.pointSize()}pt"
+        elif font.pixelSize() > 0:
+            size = f"{font.pixelSize()}px"
+        else:
+            size = "13pt"
+        foreground = self._color("text_primary", "#e7eef6")
+        return (
+            "QLineEdit#playlistItemEditor {"
+            f' font-size: {size};'
+            f' font-family: "{family}";'
+            f" background-color: {background.name()};"
+            f" color: {foreground.name()};"
+            " border: none;"
+            " padding: 0;"
+            " margin: 0;"
+            "}"
+        )
+
+    def _editor_background(self, option: QStyleOptionViewItem, index) -> QColor:
+        item = None
+        widget = option.widget if option.widget is not None else self.parent()
+        if widget is not None and hasattr(widget, "item"):
+            item = widget.item(index.row())
+        return self._row_background(
+            index.row(),
+            selected=bool(option.state & QStyle.StateFlag.State_Selected),
+            hovered=bool(option.state & QStyle.StateFlag.State_MouseOver),
+            mark=_color_from_index(index),
+            aux_playing=self._aux_info_for_item(item) is not None,
+        )
+
+    def _is_editing_index(self, widget, index) -> bool:
+        if widget is None or not hasattr(widget, "state"):
+            return False
+        if widget.state() != QAbstractItemView.State.EditingState:
+            return False
+        current = widget.currentIndex()
+        return (
+            current.isValid()
+            and current.row() == index.row()
+            and current.column() == index.column()
+        )
+
+    def _restore_item_font(self, index, font: QFont) -> None:
+        widget = self.parent()
+        if widget is None or not hasattr(widget, "item"):
+            return
+        item = widget.item(index.row())
+        if item is not None:
+            item.setFont(font)
+
+    def _name_editor_rect(self, option: QStyleOptionViewItem, index) -> QRect:
+        badge_h = self._badge_height(option)
+        item = None
+        widget = option.widget if option.widget is not None else self.parent()
+        if widget is not None and hasattr(widget, "item"):
+            item = widget.item(index.row())
+        row_count = widget.count() if widget is not None and hasattr(widget, "count") else 1
+        layout = self._layout_columns(
+            option.rect,
+            badge_h,
+            has_stems=_has_stems_from_index(index),
+            show_wave=self._aux_info_for_item(item) is not None,
+            fm=option.fontMetrics,
+            row_count=row_count,
+        )
+        name_rect = QRect(layout.name_rect)
+        if layout.wave_rect is not None:
+            name_rect.setHeight(max(badge_h, name_rect.height() - _MINI_WAVE_H - 2))
+        return name_rect
+
+    def createEditor(self, parent, option, index):
+        self.initStyleOption(option, index)
+        font = self._item_font(option, index)
+        editor = QLineEdit(parent)
+        editor.setObjectName("playlistItemEditor")
+        editor.setFont(font)
+        editor.setStyleSheet(self._editor_stylesheet(font, self._editor_background(option, index)))
+        editor.setAutoFillBackground(True)
+        editor.setFrame(False)
+        editor.setTextMargins(0, 0, 0, 0)
+        editor.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        editor.setProperty("_playlistItemFontFamily", font.family())
+        editor.setProperty("_playlistItemFontPt", font.pointSize())
+        editor.setProperty("_playlistItemFontPx", font.pixelSize())
+        return editor
+
+    def _font_saved_on_editor(self, editor) -> QFont | None:
+        family = editor.property("_playlistItemFontFamily")
+        if not isinstance(family, str) or not family:
+            return None
+        point_size = editor.property("_playlistItemFontPt")
+        pixel_size = editor.property("_playlistItemFontPx")
+        font = QFont(family)
+        if isinstance(point_size, int) and point_size > 0:
+            font.setPointSize(point_size)
+        elif isinstance(pixel_size, int) and pixel_size > 0:
+            font.setPixelSize(pixel_size)
+        return font
+
+    def updateEditorGeometry(self, editor, option, index):
+        self.initStyleOption(option, index)
+        rect = self._name_editor_rect(option, index)
+        editor.setGeometry(rect)
+        text_h = option.fontMetrics.height()
+        vpad = max(0, (rect.height() - text_h) // 2)
+        editor.setTextMargins(0, vpad, 0, vpad)
+
+    def setModelData(self, editor, model, index):
+        font = self._font_saved_on_editor(editor)
+        if font is None:
+            raw = index.data(Qt.ItemDataRole.FontRole)
+            font = QFont(raw) if isinstance(raw, QFont) else None
+        super().setModelData(editor, model, index)
+        if font is not None:
+            self._restore_item_font(index, font)
+
+    def destroyEditor(self, editor, index):
+        font = self._font_saved_on_editor(editor)
+        super().destroyEditor(editor, index)
+        if font is not None:
+            self._restore_item_font(index, font)
 
     def _draw_badge(
         self,
@@ -281,6 +397,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         *,
         bg: QColor,
         fg: QColor,
+        font: QFont | None = None,
     ) -> None:
         if rect.width() <= 0 or rect.height() <= 0:
             return
@@ -289,7 +406,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         painter.setBrush(bg)
         painter.drawRoundedRect(rect, self.BADGE_RADIUS, self.BADGE_RADIUS)
         painter.setPen(fg)
-        painter.setFont(self._badge_font)
+        painter.setFont(font or self._badge_font)
         painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
         painter.restore()
 
@@ -346,163 +463,6 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
         painter.restore()
 
-    def _draw_gain_knob(
-        self,
-        painter: QPainter,
-        rect: QRect,
-        volume: float,
-        *,
-        selected: bool,
-    ) -> None:
-        if rect.width() <= 0 or rect.height() <= 0:
-            return
-        painter.save()
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        v = max(0.0, min(1.0, float(volume)))
-        cx = rect.center().x()
-        cy = rect.center().y()
-        radius = min(rect.width(), rect.height()) / 2.0 - 1.0
-
-        body = QColor(get_token("colors.bg_control", "#404040"))
-        if selected:
-            body = QColor(255, 255, 255, 48)
-        painter.setPen(QPen(QColor(0, 0, 0, 90), 1))
-        painter.setBrush(body)
-        painter.drawEllipse(QPointF(cx, cy), radius, radius)
-
-        # Clockwise from 7 o'clock (min) through top to 5 o'clock (max),
-        # matching QDial / master VolumeKnob.
-        # Math degrees (0=east, CCW+): 225° → −45° as value rises.
-        start_deg = 225.0
-        angle_deg = start_deg - 270.0 * v
-        span = 270.0 * v
-
-        accent = QColor(get_token("colors.accent", "#2ad4ea"))
-        pen = QPen(accent, 2.2)
-        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-        painter.setPen(pen)
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        arc_rect = QRect(
-            int(cx - radius + 2),
-            int(cy - radius + 2),
-            int((radius - 2) * 2),
-            int((radius - 2) * 2),
-        )
-        # Qt arcs: 0° at 3 o'clock, CCW positive — negative span = clockwise.
-        painter.drawArc(
-            arc_rect,
-            int(start_deg * 16),
-            int(-span * 16),
-        )
-
-        angle_rad = math.radians(angle_deg)
-        inner = radius * 0.25
-        outer = radius - 3.0
-        x1 = cx + inner * math.cos(angle_rad)
-        y1 = cy - inner * math.sin(angle_rad)
-        x2 = cx + outer * math.cos(angle_rad)
-        y2 = cy - outer * math.sin(angle_rad)
-        painter.setPen(QPen(accent, 2))
-        painter.drawLine(int(x1), int(y1), int(x2), int(y2))
-        painter.restore()
-
-    def _layout_for_option(self, option, index) -> _ColumnLayout:
-        badge_h = self._badge_height(option)
-        item = None
-        widget = option.widget
-        if widget is not None and hasattr(widget, "item"):
-            item = widget.item(index.row())
-        aux_info = self._aux_info_for_item(item)
-        return self._layout_columns(
-            option.rect,
-            badge_h,
-            has_stems=_has_stems_from_index(index),
-            show_wave=aux_info is not None,
-        )
-
-    def _emit_gain_volume(self, playlist, item, volume: float) -> None:
-        if item is None or self._gain_handler is None:
-            return
-        vol = max(0.0, min(1.0, float(volume)))
-        try:
-            self._gain_handler(item, vol)
-        except Exception:
-            return
-        playlist.viewport().update()
-
-    def handle_viewport_event(self, playlist, event) -> bool:
-        """Interactive track-gain knob (same feel as master VolumeKnob)."""
-        etype = event.type()
-        if etype not in (
-            QEvent.Type.MouseButtonPress,
-            QEvent.Type.MouseButtonDblClick,
-            QEvent.Type.MouseMove,
-            QEvent.Type.MouseButtonRelease,
-            QEvent.Type.Wheel,
-        ):
-            return False
-
-        if etype == QEvent.Type.MouseMove and self._gain_drag is not None:
-            if not isinstance(event, QMouseEvent):
-                return False
-            start_vol = float(self._gain_drag["start_vol"])
-            start_y = int(self._gain_drag["start_y"])
-            item = self._gain_drag.get("item")
-            delta = (start_y - event.pos().y()) / _GAIN_DRAG_PX
-            self._emit_gain_volume(playlist, item, start_vol + delta)
-            return True
-
-        if etype == QEvent.Type.MouseButtonRelease and self._gain_drag is not None:
-            self._gain_drag = None
-            return True
-
-        pos = event.position().toPoint() if hasattr(event, "position") else event.pos()
-        item = playlist.itemAt(pos)
-        if item is None:
-            return False
-
-        row = playlist.row(item)
-        index = playlist.model().index(row, 0)
-        option = QStyleOptionViewItem()
-        self.initStyleOption(option, index)
-        option.rect = playlist.visualItemRect(item)
-        option.widget = playlist
-        layout = self._layout_for_option(option, index)
-        if not layout.gain_rect.contains(pos):
-            return False
-
-        volume = _volume_from_index(index)
-
-        if etype == QEvent.Type.MouseButtonDblClick and isinstance(event, QMouseEvent):
-            if event.button() == Qt.MouseButton.LeftButton:
-                # Reset to unity (0 dB).
-                self._emit_gain_volume(playlist, item, gain_db_to_volume(0.0))
-                self._gain_drag = None
-                return True
-
-        if etype == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
-            if event.button() != Qt.MouseButton.LeftButton:
-                return False
-            self._gain_drag = {
-                "item": item,
-                "start_vol": volume,
-                "start_y": pos.y(),
-            }
-            return True
-
-        if etype == QEvent.Type.Wheel and isinstance(event, QWheelEvent):
-            delta = event.angleDelta().y()
-            if delta == 0:
-                return False
-            span = TRACK_GAIN_DB_MAX - TRACK_GAIN_DB_MIN
-            step = (_GAIN_WHEEL_DB / span) if span > 0 else 0.05
-            if delta < 0:
-                step = -step
-            self._emit_gain_volume(playlist, item, volume + step)
-            return True
-
-        return False
-
     def paint(self, painter, option, index):
         self.initStyleOption(option, index)
 
@@ -519,11 +479,19 @@ class PlaylistItemDelegate(QStyledItemDelegate):
 
         aux_info = self._aux_info_for_item(item)
         show_wave = aux_info is not None
+        row_count = widget.count() if widget is not None and hasattr(widget, "count") else row + 1
+        item_font = self._item_font(option, index)
         layout = self._layout_columns(
-            option.rect, badge_h, has_stems=has_stems, show_wave=show_wave
+            option.rect,
+            badge_h,
+            has_stems=has_stems,
+            show_wave=show_wave,
+            fm=option.fontMetrics,
+            row_count=row_count,
         )
 
         painter.save()
+        painter.setClipRect(option.rect)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         mark = _color_from_index(index)
         painter.fillRect(
@@ -539,10 +507,6 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         if mark is not None and mark.isValid():
             strip = QRect(option.rect.left(), option.rect.top(), 3, option.rect.height())
             painter.fillRect(strip, mark)
-        if selected:
-            painter.setPen(QPen(self._color("accent", "#2ad4ea"), 1))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRect(option.rect.adjusted(0, 0, -1, -1))
 
         clear = QColor(0, 0, 0, 0)
         plain_fg = self._color("text_secondary", "#c5d0dc")
@@ -550,7 +514,6 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         duration_text = format_time_ms(_duration_from_index(index))
         bpm_value = _bpm_from_index(index)
         bpm_text = _format_bpm(bpm_value) if bpm_value is not None else "—"
-        gain_vol = _volume_from_index(index)
 
         self._draw_badge(
             painter,
@@ -558,6 +521,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             index_text,
             bg=clear,
             fg=plain_fg,
+            font=item_font,
         )
         if layout.stems_rect is not None:
             self._draw_badge(
@@ -573,6 +537,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             duration_text,
             bg=clear,
             fg=plain_fg,
+            font=item_font,
         )
         self._draw_badge(
             painter,
@@ -580,16 +545,11 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             bpm_text,
             bg=clear,
             fg=self._color("accent", "#2ad4ea"),
-        )
-        self._draw_gain_knob(
-            painter,
-            layout.gain_rect,
-            gain_vol,
-            selected=selected,
+            font=item_font,
         )
 
-        if layout.name_rect.width() > 0:
-            painter.setFont(option.font)
+        if layout.name_rect.width() > 0 and not self._is_editing_index(widget, index):
+            painter.setFont(item_font)
             placeholder = is_item_placeholder(item)
             if placeholder:
                 painter.setPen(self._color("text_muted", "#7d8b9c"))
@@ -648,4 +608,4 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         if self._aux_info_for_item(item) is not None:
             height += _PLAYING_ROW_EXTRA
 
-        return QSize(max(width, 0), max(height, _GAIN_KNOB + self.ROW_V_PAD * 2))
+        return QSize(max(width, 0), height)

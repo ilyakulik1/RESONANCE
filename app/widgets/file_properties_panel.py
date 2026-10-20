@@ -185,7 +185,6 @@ class PreviewPropertiesPanel(QFrame):
             ("channels", "CH"),
             ("bpm", "BPM"),
             ("lufs", "LUFS"),
-            ("gain", "GAIN"),
         )
         for key, title in chips:
             chip = QFrame()
@@ -209,7 +208,6 @@ class PreviewPropertiesPanel(QFrame):
         *,
         bpm: float | None = None,
         lufs: float | None = None,
-        gain_db: float | None = None,
     ) -> None:
         self._file_path = path
         info = read_audio_file_info(path)
@@ -221,8 +219,6 @@ class PreviewPropertiesPanel(QFrame):
             )
         if lufs is not None:
             info["lufs"] = f"{float(lufs):.1f}"
-        if gain_db is not None:
-            info["gain"] = f"{float(gain_db):+.1f}"
         for key, label in self._meta_labels.items():
             label.setText(info.get(key, "—"))
 
@@ -233,12 +229,8 @@ class PreviewPropertiesPanel(QFrame):
             text = f"{bpm:.1f}".rstrip("0").rstrip(".")
             self._meta_labels["bpm"].setText(text)
 
-    def set_loudness(self, lufs: float | None, gain_db: float | None = None) -> None:
+    def set_loudness(self, lufs: float | None) -> None:
         if lufs is None:
             self._meta_labels["lufs"].setText("—")
         else:
             self._meta_labels["lufs"].setText(f"{float(lufs):.1f}")
-        if gain_db is None:
-            self._meta_labels["gain"].setText("—")
-        else:
-            self._meta_labels["gain"].setText(f"{float(gain_db):+.1f}")

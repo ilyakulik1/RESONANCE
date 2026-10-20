@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import threading
+import unicodedata
 from pathlib import Path
 
 from PyQt6.QtCore import QMimeData, QPoint, Qt, QUrl, pyqtSignal
@@ -41,6 +43,108 @@ SORT_NAME = "name"
 SORT_DATE = "date"
 
 
+def _fold_name(text: str) -> str:
+    """Case-insensitive key. macOS stores names in a decomposed form."""
+    if text.isascii():
+        return text.casefold()
+    return unicodedata.normalize("NFC", text).casefold()
+
+
+def _path_under(root: str | None, path: str) -> bool:
+    if not root:
+        return True
+    root_exact = root.rstrip(os.sep)
+    if path == root_exact:
+        return True
+    prefix = root_exact + os.sep
+    return path.startswith(prefix)
+
+
+def _walk_matches(
+    path: str,
+    needle: str,
+    root_limit: str | None,
+    need_mtime: bool,
+    cancelled,
+) -> tuple[list[tuple[str, str, float]], list[tuple[str, str, float]]]:
+    """Match names under path. Skipped files are not stat'd."""
+    dirs: list[tuple[str, str, float]] = []
+    files: list[tuple[str, str, float]] = []
+    seen: set[tuple[int, int]] = set()
+    root_real = os.path.realpath(root_limit) if root_limit else None
+    try:
+        root_stat = os.stat(path, follow_symlinks=True)
+    except OSError:
+        return dirs, files
+    seen.add((root_stat.st_dev, root_stat.st_ino))
+    # (directory path, relative label, folded label)
+    pending: list[tuple[str, str, str]] = [(path, "", "")]
+    while pending:
+        if cancelled():
+            return dirs, files
+        current, dir_label, dir_folded = pending.pop()
+        dir_hit = bool(dir_folded) and needle in dir_folded
+        try:
+            scanned = os.scandir(current)
+        except OSError:
+            continue
+        with scanned:
+            for entry in scanned:
+                name = entry.name
+                if not name or name.startswith("."):
+                    continue
+                full = entry.path
+                try:
+                    is_link = entry.is_symlink()
+                    is_dir = entry.is_dir(follow_symlinks=is_link)
+                except OSError:
+                    continue
+                folded = _fold_name(name)
+                child_label = name if not dir_label else dir_label + os.sep + name
+                matched = dir_hit or needle in folded
+                if not matched and dir_folded:
+                    matched = needle in dir_folded + os.sep + folded
+                if is_dir:
+                    descend = True
+                    if is_link:
+                        try:
+                            link_stat = entry.stat(follow_symlinks=True)
+                        except OSError:
+                            descend = False
+                            link_stat = None
+                        if link_stat is not None:
+                            identity = (link_stat.st_dev, link_stat.st_ino)
+                            if identity in seen:
+                                descend = False
+                            else:
+                                seen.add(identity)
+                        if descend and root_real is not None:
+                            try:
+                                descend = _path_under(root_real, os.path.realpath(full))
+                            except OSError:
+                                descend = False
+                    else:
+                        identity = (root_stat.st_dev, entry.inode())
+                        if identity in seen:
+                            descend = False
+                        else:
+                            seen.add(identity)
+                    if descend:
+                        child_folded = folded if not dir_folded else dir_folded + os.sep + folded
+                        pending.append((full, child_label, child_folded))
+                if not matched:
+                    continue
+                if need_mtime:
+                    try:
+                        mtime = entry.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        mtime = 0.0
+                else:
+                    mtime = 0.0
+                (dirs if is_dir else files).append((child_label, full, mtime))
+    return dirs, files
+
+
 class FileBrowserList(QListWidget):
     """Folder listing with drag-out of audio files (and folders as URLs)."""
 
@@ -48,6 +152,7 @@ class FileBrowserList(QListWidget):
     pathActivated = pyqtSignal(str)  # file or dir double-clicked
     audioSelected = pyqtSignal(str)  # audio file selected / activated
     focused = pyqtSignal()
+    _searchReady = pyqtSignal(int, object, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -59,6 +164,9 @@ class FileBrowserList(QListWidget):
         self._file_icon = self._icon_provider.icon(QFileIconProvider.IconType.File)
         self._sort_mode = SORT_NAME
         self._filter_text = ""
+        self._search_inside = False
+        self._search_token = 0
+        self._searchReady.connect(self._on_search_ready)
         self.setObjectName("fileBrowserList")
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDragEnabled(True)
@@ -131,11 +239,30 @@ class FileBrowserList(QListWidget):
         return self._filter_text
 
     def set_filter_text(self, text: str) -> None:
-        normalized = text.strip().lower()
-        if normalized == self._filter_text:
+        """Live filter of the open folder. Deep search waits for commit_filter."""
+        normalized = _fold_name(text.strip())
+        if normalized == self._filter_text and not self._search_inside:
+            return
+        if self._search_inside and normalized:
             return
         self._filter_text = normalized
         self._reload()
+
+    def commit_filter(self, text: str) -> None:
+        """Run the current query. Inside-folder search starts here."""
+        self._filter_text = _fold_name(text.strip())
+        self._reload()
+
+    def search_inside(self) -> bool:
+        return self._search_inside
+
+    def set_search_inside(self, enabled: bool) -> None:
+        enabled = bool(enabled)
+        if enabled == self._search_inside:
+            return
+        self._search_inside = enabled
+        if not enabled:
+            self._reload()
 
     def _entry_sort_key(self, entry: tuple[str, str, float]):
         name, _full, mtime = entry
@@ -145,42 +272,103 @@ class FileBrowserList(QListWidget):
         return name.lower()
 
     def _reload(self) -> None:
+        self._search_token += 1
+        token = self._search_token
         self.clear()
         path = self._current_path
         if not path or not os.path.isdir(path):
             return
 
+        needle = self._filter_text
+        if needle and self._search_inside:
+            note = QListWidgetItem("Searching…")
+            note.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.addItem(note)
+            root = self._root_limit
+            need_mtime = self._sort_mode == SORT_DATE
+            threading.Thread(
+                target=self._deep_search_thread,
+                args=(token, path, needle, root, need_mtime),
+                daemon=True,
+                name="file-browser-search",
+            ).start()
+            return
+
         dirs: list[tuple[str, str, float]] = []
         files: list[tuple[str, str, float]] = []
-        needle = self._filter_text
+        self._collect_flat(path, needle, dirs, files)
+        self._fill_entries(dirs, files)
+
+    def _deep_search_thread(
+        self,
+        token: int,
+        path: str,
+        needle: str,
+        root: str | None,
+        need_mtime: bool,
+    ) -> None:
+        dirs, files = _walk_matches(
+            path,
+            needle,
+            root,
+            need_mtime,
+            lambda: token != self._search_token,
+        )
+        self._searchReady.emit(token, dirs, files)
+
+    def _on_search_ready(self, token: int, dirs, files) -> None:
+        if token != self._search_token:
+            return
+        self._fill_entries(dirs, files)
+
+    def _fill_entries(
+        self,
+        dirs: list[tuple[str, str, float]],
+        files: list[tuple[str, str, float]],
+    ) -> None:
+        dirs.sort(key=self._entry_sort_key)
+        files.sort(key=self._entry_sort_key)
+        self.setUpdatesEnabled(False)
+        self.clear()
+        try:
+            for name, full, _mtime in dirs:
+                self._add_entry(full, name, is_dir=True)
+            for name, full, _mtime in files:
+                self._add_entry(full, name, is_dir=False)
+        finally:
+            self.setUpdatesEnabled(True)
+
+    def _collect_flat(
+        self,
+        path: str,
+        needle: str,
+        dirs: list[tuple[str, str, float]],
+        files: list[tuple[str, str, float]],
+    ) -> None:
+        need_mtime = self._sort_mode == SORT_DATE
         try:
             with os.scandir(path) as entries:
                 for entry in entries:
                     name = entry.name
                     if name.startswith("."):
                         continue
-                    if needle and needle not in name.lower():
+                    if needle and needle not in _fold_name(name):
                         continue
                     try:
                         is_dir = entry.is_dir(follow_symlinks=False)
-                        mtime = entry.stat(follow_symlinks=False).st_mtime
                     except OSError:
                         continue
-                    full = entry.path
-                    if is_dir:
-                        dirs.append((name, full, mtime))
+                    if need_mtime:
+                        try:
+                            mtime = entry.stat(follow_symlinks=False).st_mtime
+                        except OSError:
+                            mtime = 0.0
                     else:
-                        files.append((name, full, mtime))
+                        mtime = 0.0
+                    bucket = dirs if is_dir else files
+                    bucket.append((name, entry.path, mtime))
         except OSError:
             return
-
-        dirs.sort(key=self._entry_sort_key)
-        files.sort(key=self._entry_sort_key)
-
-        for name, full, _mtime in dirs:
-            self._add_entry(full, name, is_dir=True)
-        for name, full, _mtime in files:
-            self._add_entry(full, name, is_dir=False)
 
     def _add_entry(self, full_path: str, name: str, *, is_dir: bool) -> None:
         item = QListWidgetItem(name)
@@ -349,7 +537,19 @@ class FileBrowserTabPage(QWidget):
         self.search_edit.setClearButtonEnabled(True)
         self.search_edit.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
         self.search_edit.textChanged.connect(self._on_search_changed)
+        self.search_edit.returnPressed.connect(self._commit_search)
         fr.addWidget(self.search_edit, 1)
+
+        self.btn_search_inside = QToolButton()
+        self.btn_search_inside.setObjectName("fileBrowserSearchInside")
+        self.btn_search_inside.setCheckable(True)
+        self.btn_search_inside.setChecked(False)
+        self.btn_search_inside.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.btn_search_inside.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
+        self.btn_search_inside.setText("↳")
+        self.btn_search_inside.setToolTip("Search inside folders (Enter)")
+        self.btn_search_inside.toggled.connect(self._on_search_inside_toggled)
+        fr.addWidget(self.btn_search_inside)
 
         self.sort_combo = QComboBox()
         self.sort_combo.setObjectName("fileBrowserSortCombo")
@@ -447,7 +647,23 @@ class FileBrowserTabPage(QWidget):
             self.list.navigate_to(chosen)
 
     def _on_search_changed(self, text: str) -> None:
-        self.list.set_filter_text(text)
+        if not text.strip():
+            self.list.commit_filter("")
+            return
+        if not self.btn_search_inside.isChecked():
+            self.list.set_filter_text(text)
+
+    def _commit_search(self) -> None:
+        self.list.commit_filter(self.search_edit.text())
+
+    def _on_search_inside_toggled(self, checked: bool) -> None:
+        self.search_edit.setPlaceholderText(
+            "Search in folders, then Enter" if checked else "Search…"
+        )
+        self.btn_search_inside.setToolTip(
+            "Searching inside folders" if checked else "Search inside folders (Enter)"
+        )
+        self.list.set_search_inside(checked)
 
     def _on_sort_changed(self, _index: int) -> None:
         mode = self.sort_combo.currentData()

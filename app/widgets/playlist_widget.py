@@ -121,6 +121,8 @@ class PlaylistWidget(QListWidget):
         self.setWordWrap(False)
         self.setUniformItemSizes(False)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
         self.setEditTriggers(
             QAbstractItemView.EditTrigger.DoubleClicked
             | QAbstractItemView.EditTrigger.EditKeyPressed
@@ -180,11 +182,6 @@ class PlaylistWidget(QListWidget):
 
     def eventFilter(self, obj, event):
         if obj is self.viewport():
-            delegate = self.itemDelegate()
-            if isinstance(delegate, PlaylistItemDelegate):
-                if delegate.handle_viewport_event(self, event):
-                    event.accept()
-                    return True
             etype = event.type()
             if etype == QEvent.Type.Resize:
                 if self._drop_indicator_y_px is not None:

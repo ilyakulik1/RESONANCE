@@ -2,7 +2,7 @@
 
 Each air deck gets its own plugin instances so compressor/limiter state is not
 shared across a crossfade. The chain still behaves as a master insert: it runs
-after per-track EQ/stems/gain and before Int16 conversion.
+after per-track EQ/stems and before Int16 conversion.
 """
 
 from __future__ import annotations

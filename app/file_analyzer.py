@@ -165,9 +165,26 @@ class FileAnalyzer(QObject):
     ) -> None:
         if not file_path:
             return
+        path = os.path.abspath(file_path)
+        # Importing several tracks must not cancel the one already running.
+        # Only an explicit re-analyze jumps the queue.
+        if not force and self._already_queued(path, item):
+            return
         self._enqueue(
-            _AnalyzeJob(os.path.abspath(file_path), item=item, force=force),
-            front=True,
+            _AnalyzeJob(path, item=item, force=force),
+            front=force,
+        )
+
+    def _already_queued(self, file_path: str, item: QListWidgetItem) -> bool:
+        active = self._active
+        if (
+            active is not None
+            and active.file_path == file_path
+            and active.item is item
+        ):
+            return True
+        return any(
+            job.file_path == file_path and job.item is item for job in self._queue
         )
 
     def _enqueue(self, job: _AnalyzeJob, *, front: bool = False) -> None:

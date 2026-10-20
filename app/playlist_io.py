@@ -14,7 +14,7 @@ DURATION_ROLE = Qt.ItemDataRole.UserRole + 1
 BPM_ROLE = Qt.ItemDataRole.UserRole + 2
 FILE_MISSING_ROLE = Qt.ItemDataRole.UserRole + 3
 COLOR_ROLE = Qt.ItemDataRole.UserRole + 4
-GAIN_DB_ROLE = Qt.ItemDataRole.UserRole + 5
+# UserRole + 5 was per-track gain. Kept unused so later roles stay stable.
 LUFS_ROLE = Qt.ItemDataRole.UserRole + 6
 STEMS_ROLE = Qt.ItemDataRole.UserRole + 7
 TRACK_ID_ROLE = Qt.ItemDataRole.UserRole + 8
@@ -116,9 +116,6 @@ def item_to_snapshot(item: QListWidgetItem | None) -> dict | None:
     color = get_item_color(item)
     if color is not None:
         snapshot["color"] = color
-    gain_db = get_item_gain_db(item)
-    if gain_db is not None:
-        snapshot["gain_db"] = gain_db
     lufs = get_item_lufs(item)
     if lufs is not None:
         snapshot["lufs"] = lufs
@@ -222,28 +219,6 @@ def get_item_bpm(item: QListWidgetItem | None) -> float | None:
     if bpm <= 0:
         return None
     return bpm
-
-
-def set_item_gain_db(item: QListWidgetItem, gain_db: float | None) -> None:
-    if gain_db is None:
-        item.setData(GAIN_DB_ROLE, None)
-        return
-    try:
-        item.setData(GAIN_DB_ROLE, float(gain_db))
-    except (TypeError, ValueError):
-        item.setData(GAIN_DB_ROLE, None)
-
-
-def get_item_gain_db(item: QListWidgetItem | None) -> float | None:
-    if item is None:
-        return None
-    value = item.data(GAIN_DB_ROLE)
-    if value is None:
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def set_item_lufs(item: QListWidgetItem, lufs: float | None) -> None:
@@ -566,9 +541,6 @@ def _playlist_item_to_entry(
         color = get_item_color(item)
         if color is not None:
             entry["color"] = color
-        gain_db = get_item_gain_db(item)
-        if gain_db is not None:
-            entry["gain_db"] = gain_db
         if item_has_stems(item):
             entry["stems"] = True
         scene_id = get_item_mixer_scene_id(item)
@@ -598,9 +570,6 @@ def _playlist_item_to_entry(
     color = get_item_color(item)
     if color is not None:
         entry["color"] = color
-    gain_db = get_item_gain_db(item)
-    if gain_db is not None:
-        entry["gain_db"] = gain_db
     if item_has_stems(item):
         entry["stems"] = True
     scene_id = get_item_mixer_scene_id(item)
@@ -652,15 +621,6 @@ def save_playlist_to_file(
     return len(entries)
 
 
-def _gain_from_entry(entry: dict | None) -> float | None:
-    if not isinstance(entry, dict) or "gain_db" not in entry:
-        return None
-    try:
-        return float(entry["gain_db"])
-    except (TypeError, ValueError):
-        return None
-
-
 def _lufs_from_entry(entry: dict | None) -> float | None:
     if not isinstance(entry, dict) or "lufs" not in entry:
         return None
@@ -681,7 +641,6 @@ def _add_placeholder_entry(
     color: str | None = None,
     has_stems: bool = False,
     track_id: str | None = None,
-    gain_db: float | None = None,
     lufs: float | None = None,
     mixer_scene_id: str | None = None,
     audio_channel_id: str | None = None,
@@ -706,8 +665,6 @@ def _add_placeholder_entry(
         set_item_bpm(item, bpm)
     if color is not None:
         set_item_color(item, color)
-    if gain_db is not None:
-        set_item_gain_db(item, gain_db)
     if lufs is not None:
         set_item_lufs(item, lufs)
     if mixer_scene_id:
@@ -736,7 +693,6 @@ def _add_playlist_entry(
     *,
     file_exists: bool | None = None,
     track_id: str | None = None,
-    gain_db: float | None = None,
     lufs: float | None = None,
     mixer_scene_id: str | None = None,
     audio_channel_id: str | None = None,
@@ -770,8 +726,6 @@ def _add_playlist_entry(
             set_item_bpm(item, bpm)
         if color is not None:
             set_item_color(item, color)
-        if gain_db is not None:
-            set_item_gain_db(item, gain_db)
         if lufs is not None:
             set_item_lufs(item, lufs)
         if mixer_scene_id:
@@ -875,7 +829,6 @@ def load_playlist_from_entries(
                 color=color,
                 has_stems=has_stems,
                 track_id=str(entry.get("id") or "").strip() or None,
-                gain_db=_gain_from_entry(entry),
                 lufs=_lufs_from_entry(entry),
                 mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
                 audio_channel_id=str(entry.get("audio_channel_id") or "").strip() or None,
@@ -900,7 +853,6 @@ def load_playlist_from_entries(
             has_stems=has_stems,
             file_exists=exists,
             track_id=str(entry.get("id") or "").strip() or None,
-            gain_db=_gain_from_entry(entry),
             lufs=_lufs_from_entry(entry),
             mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
             audio_channel_id=str(entry.get("audio_channel_id") or "").strip() or None,

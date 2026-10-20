@@ -76,6 +76,31 @@ QLineEdit#fileBrowserSearch:focus {
     border-color: {{colors.border_focus}};
 }
 
+QToolButton#fileBrowserSearchInside {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_secondary}};
+    border: 1px solid {{colors.border}};
+    border-radius: {{radius.sm}};
+    min-width: 22px;
+    max-width: 22px;
+    min-height: {{sizes.button_min_height}};
+    max-height: {{sizes.button_min_height}};
+    padding: 0;
+    font-size: {{typography.size_sm}};
+    font-weight: bold;
+}
+
+QToolButton#fileBrowserSearchInside:hover {
+    background-color: {{colors.bg_control_hover}};
+    color: {{colors.text_primary}};
+}
+
+QToolButton#fileBrowserSearchInside:checked {
+    background-color: {{colors.accent}};
+    color: {{colors.text_on_accent}};
+    border-color: {{colors.accent}};
+}
+
 QComboBox#fileBrowserSortCombo {
     background-color: {{colors.bg_control}};
     color: {{colors.text_primary}};

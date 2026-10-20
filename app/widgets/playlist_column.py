@@ -159,19 +159,9 @@ class PlaylistColumnPanel(QFrame):
             lambda: self._with_current(window.clear_playlist_widget),
         )
         add_tool(
-            "to_project",
-            "Move selected track into project folder",
-            lambda: self._with_current(window.move_selected_track_to_project),
-        )
-        add_tool(
             "copy_to_project",
             "Copy all tracks into project folder",
             lambda: self._with_current(window.copy_playlist_tracks_to_project),
-        )
-        add_tool(
-            "bpm_all",
-            "Analyze all tracks (BPM + waveform + loudness)",
-            lambda: self._with_current(window.analyze_playlist_files),
         )
         add_tool(
             "bpm_one",
@@ -180,7 +170,7 @@ class PlaylistColumnPanel(QFrame):
         )
         add_tool(
             "stems",
-            "Split selected track into stems (vocal / instrumental)",
+            "Split selected tracks into stems (vocal / instrumental)",
             lambda: self._with_current(window.separate_selected_stems),
         )
 

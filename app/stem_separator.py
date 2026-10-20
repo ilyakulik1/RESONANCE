@@ -56,9 +56,10 @@ class StemSeparator(QObject):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._queue: list[tuple[object, str, bool]] = []
+        self._queue: list[tuple[list, str, bool]] = []
         self._worker: _StemWorker | None = None
-        self._current_item = None
+        self._current_items: list = []
+        self._current_path: str | None = None
         self._busy = False
 
     @property
@@ -72,9 +73,18 @@ class StemSeparator(QObject):
             if cached is not None:
                 self.finished.emit(item, path, cached, None)
                 return
-        # Drop duplicate pending jobs for the same path.
-        self._queue = [(it, p, f) for it, p, f in self._queue if p != path]
-        self._queue.append((item, path, bool(force)))
+        if self._current_path == path and self._worker is not None:
+            if item not in self._current_items:
+                self._current_items.append(item)
+            return
+        for index, (items, queued_path, queued_force) in enumerate(self._queue):
+            if queued_path == path:
+                if item not in items:
+                    items.append(item)
+                if force and not queued_force:
+                    self._queue[index] = (items, queued_path, True)
+                return
+        self._queue.append(([item], path, bool(force)))
         self._pump()
 
     def cancel(self) -> None:
@@ -95,8 +105,9 @@ class StemSeparator(QObject):
             self._set_busy(False)
             self.statusChanged.emit("")
             return
-        item, path, force = self._queue.pop(0)
-        self._current_item = item
+        items, path, force = self._queue.pop(0)
+        self._current_items = list(items)
+        self._current_path = path
         self._set_busy(True)
         self.statusChanged.emit(f"Separating stems (MDX HQ5): {path}")
         worker = _StemWorker(path, force=force, parent=self)
@@ -109,13 +120,17 @@ class StemSeparator(QObject):
         self.progress.emit(path, value)
 
     def _on_finished(self, path: str, result: object, error: object) -> None:
-        item = self._current_item
-        self._current_item = None
+        items = list(self._current_items)
+        self._current_items = []
+        self._current_path = None
         worker = self._worker
         self._worker = None
         if worker is not None:
             worker.deleteLater()
         paths = result if isinstance(result, StemPaths) else None
         err = str(error) if error else None
-        self.finished.emit(item, path, paths, err)
+        if not items:
+            items = [None]
+        for item in items:
+            self.finished.emit(item, path, paths, err)
         self._pump()
