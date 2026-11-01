@@ -262,8 +262,8 @@ class MainWindowUi:
         return col
 
     def _build_control_panel(self, window: AudioPlayer) -> QWidget:
-        """Подписи сверху, виджеты снизу; при сужении блоки переносятся."""
-        section = FlowFrame()
+        """Одна строка: BPM слева, ON AIR и время справа."""
+        section = QFrame()
         section.setObjectName("controlPanelSection")
         layout = QVBoxLayout(section)
         layout.setContentsMargins(0, 0, 0, 2)
@@ -277,19 +277,21 @@ class MainWindowUi:
         window.btn_pause = None
         window.btn_stop = None
 
-        flow = FlowLayout()
-        flow.setHorizontalSpacing(12)
-        flow.setVerticalSpacing(6)
-
-        def add_labeled(label_text: str, widget: QWidget) -> None:
-            flow.addWidget(self._labeled_control(label_text, widget))
+        # Playback / fade / playlists stay alive for MIDI, remote, and config,
+        # but they are edited from the pie menu rather than this bar.
+        hidden = QWidget(section)
+        hidden.setObjectName("hiddenControlHost")
+        hidden.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        hidden.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+        hidden.hide()
+        window._hidden_control_host = hidden
 
         window.playback_mode_group = SegmentButtonGroup(
             [("loop", "LOOP"), ("next", "NEXT"), ("stop", "STOP")],
+            hidden,
         )
         window.playback_mode_group.set_value("next")
         window.playback_mode_group.valueChanged.connect(window.on_playback_mode_changed)
-        add_labeled("PLAYBACK MODE", window.playback_mode_group)
         window.radio_next = None
         window.radio_stop = None
         window.radio_loop = None
@@ -300,6 +302,7 @@ class MainWindowUi:
                 ("crossfade", "XFADE"),
                 ("high_cut", "HCUT"),
             ],
+            hidden,
         )
         window.fade_mode_group.set_value("sequential")
         window.fade_mode_group.setToolTip(
@@ -308,10 +311,9 @@ class MainWindowUi:
             "HCUT: resonant high-cut kill with end fadeout, then next starts clean"
         )
         window.fade_mode_group.valueChanged.connect(window.on_fade_mode_changed)
-        add_labeled("FADE MODE", window.fade_mode_group)
         window.btn_fade_mode = None
 
-        fade_ms_wrap = QWidget()
+        fade_ms_wrap = QWidget(hidden)
         fade_ms_wrap.setFixedHeight(control_row_height)
         fade_ms_layout = QHBoxLayout(fade_ms_wrap)
         fade_ms_layout.setContentsMargins(0, 0, 0, 0)
@@ -324,6 +326,7 @@ class MainWindowUi:
             step=100,
             value_width=60,
             editable=True,
+            parent=hidden,
         )
         window.fade_duration_spin = window.fade_duration_stepper.spin_box()
         shortcut_hint = ", ".join(seq for seq, _ms in FADE_PRESET_SHORTCUTS)
@@ -336,7 +339,7 @@ class MainWindowUi:
         fade_ms_layout.addWidget(window.fade_duration_stepper)
         fade_ms_layout.addWidget(fade_ms_unit)
 
-        fade_col = QWidget()
+        fade_col = QWidget(hidden)
         fade_col.setSizePolicy(
             self._hfw_policy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
         )
@@ -368,9 +371,8 @@ class MainWindowUi:
             window._air_fade_preset_buttons[ms] = btn
             preset_row.addWidget(btn)
         fade_col_layout.addLayout(preset_row)
-        add_labeled("FADE", fade_col)
 
-        res_wrap = QWidget()
+        res_wrap = QWidget(hidden)
         res_wrap.setFixedHeight(control_row_height)
         res_layout = QHBoxLayout(res_wrap)
         res_layout.setContentsMargins(0, 0, 0, 0)
@@ -383,6 +385,7 @@ class MainWindowUi:
             step=0.1,
             decimals=2,
             value_width=52,
+            parent=hidden,
         )
         window.high_cut_q_spin = window.high_cut_q_stepper.spin_box()
         window.high_cut_q_spin.setToolTip(
@@ -392,17 +395,17 @@ class MainWindowUi:
         res_unit.setObjectName("fadeMsLabel")
         res_layout.addWidget(window.high_cut_q_stepper)
         res_layout.addWidget(res_unit)
-        add_labeled("RES", res_wrap)
 
-        window.columns_stepper = ValueStepper(window, 1, MAX_PLAYLISTS, 2)
+        window.columns_stepper = ValueStepper(
+            window, 1, MAX_PLAYLISTS, 2, parent=hidden
+        )
         window.columns_spin = window.columns_stepper.spin_box()
         window.columns_value_label = window.columns_stepper._value_label
         window.columns_spin.valueChanged.connect(window.set_playlist_columns)
-        add_labeled("PLAYLISTS", window.columns_stepper)
         window.btn_columns_up = None
         window.btn_columns_down = None
 
-        advance_group = QWidget()
+        advance_group = QWidget(hidden)
         advance_group.setFixedHeight(control_row_height)
         advance_group_layout = QHBoxLayout(advance_group)
         advance_group_layout.setContentsMargins(0, 0, 0, 0)
@@ -422,29 +425,13 @@ class MainWindowUi:
             advance_label,
             alignment=Qt.AlignmentFlag.AlignVCenter,
         )
-        add_labeled("ON SPACE", advance_group)
 
         window.bpm_value_label = QLabel("—")
         window.bpm_value_label.setObjectName("bpmValue")
-        window.bpm_value_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        window.bpm_value_label.setFixedHeight(control_row_height)
-        window.bpm_label = window.bpm_value_label
-        add_labeled("BPM", window.bpm_value_label)
-
-        spacer = QWidget()
-        spacer.setObjectName("controlPanelFlex")
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        spacer.setMinimumSize(0, 0)
-        flow.addWidget(spacer)
-
-        # Справа: ON AIR + Elapsed/Remaining, под ними крупные цифры
-        time_wrap = QWidget()
-        time_wrap.setSizePolicy(
-            self._hfw_policy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        window.bpm_value_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
         )
-        time_layout = QVBoxLayout(time_wrap)
-        time_layout.setContentsMargins(0, 0, 0, 0)
-        time_layout.setSpacing(2)
+        window.bpm_label = window.bpm_value_label
 
         window.time_mode_group = SegmentButtonGroup(
             [("elapsed", "Elapsed"), ("remaining", "Remaining")],
@@ -464,16 +451,6 @@ class MainWindowUi:
         )
         window.btn_space.clicked.connect(window.handle_space)
 
-        time_header = FlowLayout()
-        time_header.setHorizontalSpacing(8)
-        time_header.setVerticalSpacing(2)
-        time_header.addWidget(window.btn_space)
-        time_header.addWidget(window.time_mode_group)
-        time_layout.addLayout(time_header, 0)
-
-        time_values = FlowLayout()
-        time_values.setHorizontalSpacing(8)
-        time_values.setVerticalSpacing(0)
         window.time_large_label = QLabel("--:--")
         window.time_large_label.setObjectName("timeLarge")
         window.time_large_label.setAlignment(
@@ -487,11 +464,28 @@ class MainWindowUi:
         # MM:SS only — hour-wide slots were shoving the EQ.
         self._lock_time_label_width(window.time_large_label, "-00:00")
         self._lock_time_label_width(window.time_duration_label, "00:00")
-        time_values.addWidget(window.time_large_label)
-        time_values.addWidget(window.time_duration_label)
-        time_layout.addLayout(time_values)
 
-        flow.addWidget(time_wrap)
+        row = QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
+        bpm_caption = QLabel("BPM")
+        bpm_caption.setObjectName("sectionLabel")
+        self._apply_readout_font(window.bpm_value_label)
+        row.addWidget(bpm_caption, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(window.bpm_value_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        window.mode_status_label = QLabel("")
+        window.mode_status_label.setObjectName("modeStatus")
+        window.mode_status_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter
+        )
+        self._apply_readout_font(window.mode_status_label)
+        row.addWidget(window.mode_status_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addStretch(1)
+        row.addWidget(window.btn_space, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(window.time_mode_group, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(window.time_large_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        row.addWidget(window.time_duration_label, 0, Qt.AlignmentFlag.AlignVCenter)
+        layout.addLayout(row)
 
         window.time_current_label = window.time_large_label
         window.time_total_label = window.time_duration_label
@@ -500,8 +494,18 @@ class MainWindowUi:
         window.radio_time_elapsed = None
         window.radio_time_remaining = None
 
-        layout.addLayout(flow)
         return section
+
+    @staticmethod
+    def _apply_readout_font(label: QLabel):
+        """BPM value and mode line: bold 16px."""
+        from PyQt6.QtGui import QFont
+
+        font = QFont(label.font())
+        font.setBold(True)
+        font.setPixelSize(16)
+        label.setFont(font)
+        return font
 
     @staticmethod
     def _lock_time_label_width(label: QLabel, sample: str) -> None:

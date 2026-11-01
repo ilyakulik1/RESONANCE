@@ -130,6 +130,7 @@ _HIGH_CUT_END_HZ = 40.0
 HIGH_CUT_Q_DEFAULT = 0.707
 HIGH_CUT_Q_MIN = 0.5
 HIGH_CUT_Q_MAX = 20.0
+HIGH_CUT_Q_PRESETS = (0.71, 1.0, 2.0, 4.0, 8.0)
 # Volume fadeout starts at this fraction of the sweep (avoids residual rumble click).
 _HIGH_CUT_FADEOUT_START = 0.65
 
@@ -247,6 +248,13 @@ class HighCutSweep:
 
 def _clamp_high_cut_q(q: float) -> float:
     return float(max(HIGH_CUT_Q_MIN, min(HIGH_CUT_Q_MAX, float(q))))
+
+
+def high_cut_q_preset_label(q: float) -> str:
+    value = float(q)
+    if abs(value - round(value)) < 1e-6:
+        return str(int(round(value)))
+    return f"{value:.2f}"
 
 
 def high_cut_sweep_hz(progress: float) -> float:

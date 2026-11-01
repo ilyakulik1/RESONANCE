@@ -65,11 +65,16 @@ QLabel#bpmTitle {
     padding: 0;
 }
 
-QLabel#bpmValue {
+QLabel#bpmValue,
+QLabel#modeStatus {
     color: {{colors.text_primary}};
-    font-size: 20px;
+    font-size: 16px;
     font-weight: bold;
     padding: 0;
+}
+
+QLabel#modeStatus {
+    padding: 0 0 0 {{spacing.sm}};
 }
 
 QFrame#timeBlock {
@@ -96,12 +101,14 @@ QLabel#timeDuration {
     color: {{colors.accent_cyan}};
     font-size: {{typography.size_display_sm}};
     font-weight: bold;
+    padding: 0;
 }
 
 QLabel#timeLarge {
     color: {{colors.text_primary}};
     font-size: {{typography.size_display_sm}};
     font-weight: bold;
+    padding: 0;
 }
 
 QLabel#timeCurrent,

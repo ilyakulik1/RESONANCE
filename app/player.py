@@ -8,6 +8,7 @@ from pathlib import Path
 from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QPoint, QMimeData, pyqtSignal
 from PyQt6.QtGui import (
     QAction,
+    QCursor,
     QDragEnterEvent,
     QDropEvent,
     QFont,
@@ -44,6 +45,12 @@ from app.constants import (
     MAX_PLAYLISTS,
     fade_preset_label,
 )
+from app.eq_dsp import (
+    HIGH_CUT_Q_MAX,
+    HIGH_CUT_Q_MIN,
+    HIGH_CUT_Q_PRESETS,
+    high_cut_q_preset_label,
+)
 from app.eq_state import EqState
 from app.midi import (
     FADE_MODE_TAKE_TARGETS,
@@ -66,6 +73,12 @@ from app.pcm_air_player import PcmAirPlayer
 from app.ui.about_dialog import show_about_dialog
 from app.ui.file_dialog import pick_existing_directory
 from app.ui.main_window_ui import MainWindowUi
+from app.ui.settings_dialog import (
+    SettingsDialog,
+    pie_key_from_config,
+    pie_key_to_config,
+)
+from app.ui.widgets.pie_menu import PieItem, PieMenu, PiePage
 from app.ui.tokens import get_token, get_token_int
 from app.ui.icon_loader import icon_size, load_icon
 from app.duration_prober import DurationProber
@@ -154,6 +167,8 @@ class AudioPlayer(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._pie_menu_key = int(Qt.Key.Key_QuoteLeft)
+        self._capturing_pie_key = False
         self.playback_mode = "next"
         self.current_playing_playlist = None
         self.current_playing_item = None
@@ -303,6 +318,12 @@ class AudioPlayer(QMainWindow):
         self._spectrum_timer: QTimer | None = None
 
         self.setup_ui()
+        self._pie_menu = PieMenu(self._pie_pages, self)
+        self._pie_menu.set_shortcut_key(self._pie_menu_key)
+        self._pie_menu.closed.connect(self._on_pie_menu_closed)
+        self.space_advances_checkbox.toggled.connect(lambda _checked: self._sync_mode_readout())
+        self.fade_duration_spin.valueChanged.connect(lambda _value: self._sync_mode_readout())
+        self.high_cut_q_spin.valueChanged.connect(lambda _value: self._sync_mode_readout())
         self._setup_eq_row_splitter()
         self._setup_air_spectrum()
         self._setup_audio_output_devices()
@@ -1268,6 +1289,7 @@ class AudioPlayer(QMainWindow):
         self.fade_duration_spin.setValue(ms)
         self.fade_duration_spin.blockSignals(False)
         self._sync_air_fade_presets()
+        self._sync_mode_readout()
         self.save_config()
 
     def step_fade_preset(self, direction: int) -> None:
@@ -1311,12 +1333,45 @@ class AudioPlayer(QMainWindow):
         if getattr(self, "_routing_playlist_nav_key", False):
             return super().eventFilter(watched, event)
 
+        pie = getattr(self, "_pie_menu", None)
+        pie_open = pie is not None and pie.isVisible()
+        if (
+            isinstance(event, QKeyEvent)
+            and not self._capturing_pie_key
+        ):
+            if event.type() == QEvent.Type.KeyPress and self._is_pie_menu_key(event):
+                if event.isAutoRepeat():
+                    return True if pie_open else super().eventFilter(watched, event)
+                if pie_open:
+                    return True
+                if self._pie_menu_allowed():
+                    self._open_pie_menu()
+                    return True
+            if (
+                event.type() == QEvent.Type.KeyRelease
+                and self._is_pie_menu_key(event)
+                and not event.isAutoRepeat()
+                and pie_open
+            ):
+                pie.confirm()
+                return True
+            if (
+                pie_open
+                and event.type() == QEvent.Type.KeyPress
+                and event.key() == Qt.Key.Key_Escape
+                and not event.isAutoRepeat()
+            ):
+                pie.cancel()
+                return True
+
         if (
             event.type() == QEvent.Type.KeyPress
             and isinstance(event, QKeyEvent)
             and self.isActiveWindow()
             and not self._is_editing_playlist()
         ):
+            if pie_open:
+                return True
             if event.key() == Qt.Key.Key_Space and not event.isAutoRepeat():
                 if event.modifiers() & (
                     Qt.KeyboardModifier.ControlModifier
@@ -1377,6 +1432,150 @@ class AudioPlayer(QMainWindow):
                     return True
 
         return super().eventFilter(watched, event)
+
+    def _is_pie_menu_key(self, event: QKeyEvent) -> bool:
+        if int(event.key()) != int(self._pie_menu_key):
+            return False
+        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
+        return mods == Qt.KeyboardModifier.NoModifier
+
+    def _pie_menu_allowed(self) -> bool:
+        if not self.isActiveWindow():
+            return False
+        if QApplication.activeModalWidget() is not None:
+            return False
+        if self._is_editing_playlist() or self._text_input_focused():
+            return False
+        return True
+
+    def _text_input_focused(self) -> bool:
+        focused = QApplication.focusWidget()
+        if not isinstance(focused, QWidget):
+            return False
+        from PyQt6.QtWidgets import QAbstractSpinBox, QComboBox, QLineEdit, QPlainTextEdit, QTextEdit
+
+        return isinstance(
+            focused, (QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QComboBox)
+        )
+
+    def _open_pie_menu(self) -> None:
+        menu = getattr(self, "_pie_menu", None)
+        if menu is None:
+            return
+        menu.set_shortcut_key(self._pie_menu_key)
+        menu.open_at(QCursor.pos())
+
+    def _on_pie_menu_closed(self) -> None:
+        QTimer.singleShot(0, self._restore_playlist_keyboard_focus)
+
+    def _pie_set_playback(self, mode: str) -> None:
+        self.set_playback_mode(mode)
+        self.save_config()
+
+    def _pie_set_columns(self, count: int) -> None:
+        self.columns_spin.setValue(int(count))
+        self.save_config()
+
+    def _pie_toggle_advance(self) -> None:
+        box = self.space_advances_checkbox
+        box.setChecked(not box.isChecked())
+        self.save_config()
+
+    def _pie_set_q(self, q: float) -> None:
+        if not self._is_high_cut_mode():
+            return
+        q = max(HIGH_CUT_Q_MIN, min(HIGH_CUT_Q_MAX, round(float(q), 2)))
+        self.high_cut_q_stepper.set_value(q)
+        self._sync_mode_readout()
+        self.save_config()
+
+    def _pie_pages(self) -> dict[str, PiePage]:
+        playback_labels = {"loop": "LOOP", "next": "NEXT", "stop": "STOP"}
+        fade_labels = {"sequential": "SEQ", "crossfade": "XFADE", "high_cut": "HCUT"}
+        mode = self.playback_mode if self.playback_mode in playback_labels else "next"
+        fade = self._fade_mode if self._fade_mode in fade_labels else "sequential"
+        ms = int(self.fade_duration_spin.value())
+        q = self._high_cut_q()
+        columns = int(self.columns_spin.value())
+        advance_on = self.space_advances_checkbox.isChecked()
+        res_on = self._is_high_cut_mode()
+
+        def playback_item(key: str) -> PieItem:
+            return PieItem(
+                playback_labels[key],
+                current=mode == key,
+                on_click=lambda k=key: self._pie_set_playback(k),
+            )
+
+        def fade_mode_item(key: str) -> PieItem:
+            return PieItem(
+                fade_labels[key],
+                current=fade == key,
+                on_click=lambda k=key: self.on_fade_mode_changed(k),
+            )
+
+        fade_items = [
+            PieItem(
+                fade_preset_label(preset),
+                current=ms == preset,
+                on_click=lambda value=preset: self.apply_fade_preset(value),
+            )
+            for preset in FADE_PRESETS_MS
+        ]
+
+        return {
+            "root": PiePage(
+                items=[
+                    PieItem("PLAYBACK", playback_labels[mode], submenu="playback"),
+                    PieItem("FADE MODE", fade_labels[fade], submenu="fade_mode"),
+                    PieItem("FADE", f"{ms} ms", submenu="fade"),
+                    PieItem("RES", f"Q {q:.2f}", enabled=res_on, submenu="res"),
+                    PieItem("PLAYLISTS", str(columns), submenu="playlists"),
+                    PieItem(
+                        "ADVANCE",
+                        "ON" if advance_on else "OFF",
+                        current=advance_on,
+                        on_click=self._pie_toggle_advance,
+                    ),
+                ],
+            ),
+            "playback": PiePage(
+                playback_labels[mode],
+                [playback_item(key) for key in ("next", "stop", "loop")],
+                back=True,
+            ),
+            "fade_mode": PiePage(
+                fade_labels[fade],
+                [fade_mode_item(key) for key in ("sequential", "crossfade", "high_cut")],
+                back=True,
+            ),
+            "fade": PiePage(f"{ms} ms", fade_items, back=True),
+            "res": PiePage(
+                f"{q:.2f}",
+                [
+                    PieItem(
+                        high_cut_q_preset_label(preset),
+                        current=abs(q - preset) < 0.02,
+                        enabled=res_on,
+                        on_click=lambda value=preset: self._pie_set_q(value),
+                    )
+                    for preset in HIGH_CUT_Q_PRESETS
+                ],
+                back=True,
+            ),
+            "playlists": PiePage(
+                str(columns),
+                [
+                    PieItem(
+                        str(count),
+                        current=columns == count,
+                        on_click=lambda value=count: self._pie_set_columns(value),
+                    )
+                    for count in range(1, MAX_PLAYLISTS + 1)
+                ],
+                back=True,
+            ),
+        }
 
     def dragEnterEvent(self, event: QDragEnterEvent):
         if event.mimeData().hasUrls():
@@ -2692,6 +2891,7 @@ class AudioPlayer(QMainWindow):
 
     def on_playback_mode_changed(self, mode: str) -> None:
         self.playback_mode = mode
+        self._sync_mode_readout()
 
     def adjust_playlist_columns(self, delta: int) -> None:
         value = self.columns_spin.value() + delta
@@ -3127,6 +3327,7 @@ class AudioPlayer(QMainWindow):
         self.playback_mode = mode
         if hasattr(self, "playback_mode_group"):
             self.playback_mode_group.set_value(mode)
+        self._sync_mode_readout()
 
     def change_playlist_font(self, playlist_num, size):
         playlist = self.get_playlist(playlist_num)
@@ -3372,6 +3573,37 @@ class AudioPlayer(QMainWindow):
             idx = 0
         self.on_fade_mode_changed(order[(idx + 1) % len(order)])
 
+    def _sync_mode_readout(self) -> None:
+        label = getattr(self, "mode_status_label", None)
+        if label is None:
+            return
+        playback = {"loop": "LOOP", "next": "NEXT", "stop": "STOP"}.get(
+            self.playback_mode, "NEXT"
+        )
+        fade = {"sequential": "SEQ", "crossfade": "XFADE", "high_cut": "HCUT"}.get(
+            self._fade_mode, "SEQ"
+        )
+        fade_ms = int(self.fade_duration_spin.value()) if hasattr(self, "fade_duration_spin") else 0
+        advance = (
+            self.space_advances_checkbox.isChecked()
+            if hasattr(self, "space_advances_checkbox")
+            else False
+        )
+        parts = [playback, fade, f"{fade_ms} ms"]
+        tip_parts = [
+            f"Playback {playback}",
+            f"Fade {fade}",
+            f"Transition {fade_ms} ms",
+        ]
+        if self._fade_mode == "high_cut":
+            q = self._high_cut_q() if hasattr(self, "high_cut_q_spin") else 0.0
+            parts.append(f"Q {q:.2f}")
+            tip_parts.append(f"Resonance Q {q:.2f}")
+        parts.append("ADV" if advance else "ADV OFF")
+        tip_parts.append(f"Advance on Space {'on' if advance else 'off'}")
+        label.setText(" · ".join(parts))
+        label.setToolTip(" · ".join(tip_parts))
+
     def _update_fade_mode_ui(self) -> None:
         if hasattr(self, "fade_mode_group") and self.fade_mode_group is not None:
             self.fade_mode_group.blockSignals(True)
@@ -3380,6 +3612,7 @@ class AudioPlayer(QMainWindow):
         self._update_fade_mode_button()
         if hasattr(self, "high_cut_q_stepper") and self.high_cut_q_stepper is not None:
             self.high_cut_q_stepper.set_enabled(self._is_high_cut_mode())
+        self._sync_mode_readout()
 
     def _update_fade_mode_button(self) -> None:
         if not hasattr(self, "btn_fade_mode") or self.btn_fade_mode is None:
@@ -3708,7 +3941,33 @@ class AudioPlayer(QMainWindow):
         self._setup_view_menu()
         self._setup_midi_menu()
         self._setup_remote_menu()
+        self._setup_settings_menu()
         self._setup_about_menu()
+
+    def _setup_settings_menu(self) -> None:
+        # A bare menu-bar action is not shown on macOS. "Settings" in the
+        # title is also pulled into the app menu unless the role is NoRole.
+        menu = self.menuBar().addMenu("Settings")
+        menu.menuAction().setMenuRole(QAction.MenuRole.NoRole)
+        act = QAction("Pie Menu Key…", self)
+        act.setMenuRole(QAction.MenuRole.NoRole)
+        act.triggered.connect(self._show_settings_dialog)
+        menu.addAction(act)
+
+    def _show_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self._pie_menu_key, self)
+        dialog.captureChanged.connect(self._on_pie_key_capture)
+        dialog.exec()
+        self._capturing_pie_key = False
+        chosen = int(dialog.pie_key())
+        if chosen != int(self._pie_menu_key):
+            self._pie_menu_key = chosen
+            if hasattr(self, "_pie_menu"):
+                self._pie_menu.set_shortcut_key(chosen)
+            self.save_config()
+
+    def _on_pie_key_capture(self, capturing: bool) -> None:
+        self._capturing_pie_key = bool(capturing)
 
     def _setup_project_menu(self) -> None:
         menu = self.menuBar().addMenu("Project")
@@ -5028,6 +5287,12 @@ class AudioPlayer(QMainWindow):
                 self._fade_mode = fade_mode
                 self._update_fade_mode_ui()
 
+            raw_pie_key = config.get("pie_menu_key")
+            if isinstance(raw_pie_key, str) and raw_pie_key.strip():
+                self._pie_menu_key = pie_key_from_config(raw_pie_key)
+                if hasattr(self, "_pie_menu"):
+                    self._pie_menu.set_shortcut_key(self._pie_menu_key)
+
             if "master_volume" in config:
                 try:
                     self._playback_volume = max(
@@ -5188,6 +5453,7 @@ class AudioPlayer(QMainWindow):
                     bool(config.get("view_playlists", True))
                 )
             self._sync_view_menu_actions()
+            self._sync_mode_readout()
         except Exception as e:
             print(f"Error loading config: {e}")
 
@@ -5203,6 +5469,7 @@ class AudioPlayer(QMainWindow):
             "time_display_mode": self._time_display_mode,
             "fade_duration_ms": self.fade_duration_spin.value(),
             "fade_mode": self._fade_mode,
+            "pie_menu_key": pie_key_to_config(self._pie_menu_key),
             "master_volume": self._playback_volume,
             "master_eq": self._master_eq_state if self._master_eq_state else {},
             "master_eq_presets": dict(self._master_eq_presets),

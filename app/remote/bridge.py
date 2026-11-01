@@ -140,6 +140,7 @@ class RemoteBridge(QObject):
         stepper = getattr(self._player, "high_cut_q_stepper", None)
         if stepper is not None:
             stepper.set_value(q)
+        self._player._sync_mode_readout()
         self._player.save_config()
 
     def _select_track(self, params: dict, *, take: bool) -> None:
