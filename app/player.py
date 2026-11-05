@@ -1,6 +1,8 @@
 import copy
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -12,7 +14,9 @@ from PyQt6.QtGui import (
     QDragEnterEvent,
     QDropEvent,
     QFont,
+    QContextMenuEvent,
     QKeyEvent,
+    QMouseEvent,
     QKeySequence,
     QShortcut,
 )
@@ -75,8 +79,8 @@ from app.ui.file_dialog import pick_existing_directory
 from app.ui.main_window_ui import MainWindowUi
 from app.ui.settings_dialog import (
     SettingsDialog,
-    pie_key_from_config,
-    pie_key_to_config,
+    normalize_fade_presets,
+    normalize_q_presets,
 )
 from app.ui.widgets.pie_menu import PieItem, PieMenu, PiePage
 from app.ui.tokens import get_token, get_token_int
@@ -156,6 +160,8 @@ def _peek_saved_project_root() -> Path:
 
 class AudioPlayer(QMainWindow):
     _save_as_copied = pyqtSignal(str, str)
+    _PIE_HOLD_MS = 400
+    _PIE_HOLD_SLOP = 12
 
     @property
     def player(self):
@@ -167,8 +173,12 @@ class AudioPlayer(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self._pie_menu_key = int(Qt.Key.Key_QuoteLeft)
-        self._capturing_pie_key = False
+        self._pie_hold_origin: QPoint | None = None
+        self._pie_release_armed = False
+        self._held_context_menu: tuple[QWidget, QPoint] | None = None
+        self._pie_hold_timer = QTimer(self)
+        self._pie_hold_timer.setSingleShot(True)
+        self._pie_hold_timer.timeout.connect(self._on_pie_hold_timeout)
         self.playback_mode = "next"
         self.current_playing_playlist = None
         self.current_playing_item = None
@@ -255,6 +265,9 @@ class AudioPlayer(QMainWindow):
         self._last_playlist_dialog_dir = ""
         self._playlist_titles: dict[int, str] = {}
         self._fade_mode = "sequential"
+        self._fade_presets_ms = list(FADE_PRESETS_MS)
+        self._q_presets = [float(value) for value in HIGH_CUT_Q_PRESETS]
+        self._fade_preset_shortcuts: list[QShortcut] = []
         self._waveform_res_enabled = False
         self._waveform_was_zoomed = False
         self._pending_transition_fade_ms = 0
@@ -319,7 +332,6 @@ class AudioPlayer(QMainWindow):
 
         self.setup_ui()
         self._pie_menu = PieMenu(self._pie_pages, self)
-        self._pie_menu.set_shortcut_key(self._pie_menu_key)
         self._pie_menu.closed.connect(self._on_pie_menu_closed)
         self.space_advances_checkbox.toggled.connect(lambda _checked: self._sync_mode_readout())
         self.fade_duration_spin.valueChanged.connect(lambda _value: self._sync_mode_readout())
@@ -388,6 +400,10 @@ class AudioPlayer(QMainWindow):
         self.resize(1280, 1150)
         self.load_project()
         self.load_config()
+        if hasattr(self, "file_browser"):
+            self.file_browser.project_manager.libraryPathChanged.connect(
+                lambda _path: self.save_config()
+            )
         self._rebuild_playlist_registry()
         self._apply_startup_output_defaults()
         self._setup_fade_preset_shortcuts()
@@ -1278,10 +1294,18 @@ class AudioPlayer(QMainWindow):
         QApplication.instance().installEventFilter(self)
 
     def _setup_fade_preset_shortcuts(self) -> None:
-        for sequence, preset_ms in FADE_PRESET_SHORTCUTS:
+        for shortcut in self._fade_preset_shortcuts:
+            shortcut.setEnabled(False)
+            shortcut.deleteLater()
+        self._fade_preset_shortcuts = []
+        for index, (sequence, _default_ms) in enumerate(FADE_PRESET_SHORTCUTS):
+            if index >= len(self._fade_presets_ms):
+                break
+            preset_ms = int(self._fade_presets_ms[index])
             shortcut = QShortcut(QKeySequence(sequence), self)
             shortcut.setContext(Qt.ShortcutContext.WindowShortcut)
             shortcut.activated.connect(lambda ms=preset_ms: self.apply_fade_preset(ms))
+            self._fade_preset_shortcuts.append(shortcut)
 
     def apply_fade_preset(self, ms: int) -> None:
         ms = max(0, min(5000, int(ms)))
@@ -1294,7 +1318,9 @@ class AudioPlayer(QMainWindow):
 
     def step_fade_preset(self, direction: int) -> None:
         """Move to the next (+) or previous (−) air fade preset, wrapping."""
-        presets = FADE_PRESETS_MS
+        presets = self._fade_presets_ms
+        if not presets:
+            return
         current = int(self.fade_duration_spin.value())
         count = len(presets)
         if current in presets:
@@ -1333,36 +1359,29 @@ class AudioPlayer(QMainWindow):
         if getattr(self, "_routing_playlist_nav_key", False):
             return super().eventFilter(watched, event)
 
+        if self._handle_pie_pointer(watched, event):
+            return True
+
+        if (
+            event.type() == QEvent.Type.MouseButtonPress
+            and isinstance(watched, QWidget)
+            and hasattr(self, "file_browser")
+            and self._widget_belongs_to(watched, self.file_browser)
+        ):
+            clicked = watched
+            QTimer.singleShot(0, lambda widget=clicked: self.file_browser.focus_after_click(widget))
+
         pie = getattr(self, "_pie_menu", None)
         pie_open = pie is not None and pie.isVisible()
         if (
-            isinstance(event, QKeyEvent)
-            and not self._capturing_pie_key
+            pie_open
+            and isinstance(event, QKeyEvent)
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Escape
+            and not event.isAutoRepeat()
         ):
-            if event.type() == QEvent.Type.KeyPress and self._is_pie_menu_key(event):
-                if event.isAutoRepeat():
-                    return True if pie_open else super().eventFilter(watched, event)
-                if pie_open:
-                    return True
-                if self._pie_menu_allowed():
-                    self._open_pie_menu()
-                    return True
-            if (
-                event.type() == QEvent.Type.KeyRelease
-                and self._is_pie_menu_key(event)
-                and not event.isAutoRepeat()
-                and pie_open
-            ):
-                pie.confirm()
-                return True
-            if (
-                pie_open
-                and event.type() == QEvent.Type.KeyPress
-                and event.key() == Qt.Key.Key_Escape
-                and not event.isAutoRepeat()
-            ):
-                pie.cancel()
-                return True
+            pie.cancel()
+            return True
 
         if (
             event.type() == QEvent.Type.KeyPress
@@ -1380,11 +1399,22 @@ class AudioPlayer(QMainWindow):
                     | Qt.KeyboardModifier.ShiftModifier
                 ):
                     return False
+                if self._text_input_focused():
+                    return False
                 self.handle_space()
                 return True
 
             if event.key() == Qt.Key.Key_Escape and not event.isAutoRepeat():
                 self.stop()
+                return True
+
+            if (
+                event.key() in (Qt.Key.Key_Left, Qt.Key.Key_Right)
+                and not self._text_input_focused()
+                and QApplication.activePopupWidget() is None
+                and QApplication.activeModalWidget() is None
+                and self._handle_transition_arrow(event)
+            ):
                 return True
 
             playlist = None
@@ -1433,11 +1463,121 @@ class AudioPlayer(QMainWindow):
 
         return super().eventFilter(watched, event)
 
-    def _is_pie_menu_key(self, event: QKeyEvent) -> bool:
-        if int(event.key()) != int(self._pie_menu_key):
+    def _handle_pie_pointer(self, watched, event) -> bool:
+        if not isinstance(watched, QWidget):
             return False
-        mods = event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier
-        return mods == Qt.KeyboardModifier.NoModifier
+        etype = event.type()
+        pie = getattr(self, "_pie_menu", None)
+        pie_open = pie is not None and pie.isVisible()
+
+        if etype == QEvent.Type.ContextMenu and isinstance(event, QContextMenuEvent):
+            if pie_open:
+                return True
+            if self._pie_hold_origin is not None:
+                self._held_context_menu = (watched, QPoint(event.globalPos()))
+                return True
+            return False
+
+        if not isinstance(event, QMouseEvent):
+            return False
+        right = Qt.MouseButton.RightButton
+
+        if etype == QEvent.Type.MouseButtonPress and event.button() == right:
+            if pie_open:
+                return True
+            self._begin_pie_hold(watched, event.globalPosition().toPoint())
+            return False
+
+        if etype == QEvent.Type.MouseMove and self._pie_hold_origin is not None and not pie_open:
+            delta = event.globalPosition().toPoint() - self._pie_hold_origin
+            if delta.manhattanLength() > self._PIE_HOLD_SLOP:
+                self._cancel_pie_hold()
+            return False
+
+        if etype == QEvent.Type.MouseButtonRelease and event.button() == right:
+            if pie_open:
+                self._held_context_menu = None
+                if self._pie_release_armed:
+                    self._pie_release_armed = False
+                    pie.confirm()
+                return True
+            self._cancel_pie_hold()
+            self._replay_held_context_menu()
+            return False
+        return False
+
+    def _begin_pie_hold(self, watched: QWidget, global_pos: QPoint) -> None:
+        self._cancel_pie_hold()
+        self._held_context_menu = None
+        if watched.window() is not self or not self._pie_menu_allowed():
+            return
+        if QApplication.activePopupWidget() is not None:
+            return
+        self._pie_hold_origin = QPoint(global_pos)
+        self._pie_hold_timer.start(self._PIE_HOLD_MS)
+
+    def _cancel_pie_hold(self) -> None:
+        self._pie_hold_origin = None
+        self._pie_hold_timer.stop()
+
+    def _on_pie_hold_timeout(self) -> None:
+        origin = self._pie_hold_origin
+        self._pie_hold_origin = None
+        if origin is None:
+            return
+        if not (QApplication.mouseButtons() & Qt.MouseButton.RightButton):
+            self._replay_held_context_menu()
+            return
+        if QApplication.activePopupWidget() is not None or not self._pie_menu_allowed():
+            self._held_context_menu = None
+            return
+        if (QCursor.pos() - origin).manhattanLength() > self._PIE_HOLD_SLOP:
+            return
+        self._held_context_menu = None
+        self._release_press_captures(origin)
+        self._open_pie_menu()
+
+    def _replay_held_context_menu(self) -> None:
+        held = self._held_context_menu
+        self._held_context_menu = None
+        if held is None:
+            return
+        widget, global_pos = held
+        if self._handles_own_context_menu(widget):
+            return
+        local = widget.mapFromGlobal(global_pos)
+        QApplication.sendEvent(
+            widget,
+            QContextMenuEvent(QContextMenuEvent.Reason.Mouse, local, global_pos),
+        )
+
+    def _handles_own_context_menu(self, widget: QWidget) -> bool:
+        current: QWidget | None = widget
+        while isinstance(current, QWidget):
+            if callable(getattr(current, "disarm_context_menu", None)):
+                return True
+            current = current.parentWidget()
+        return False
+
+    def _finish_pie_open(self) -> None:
+        menu = getattr(self, "_pie_menu", None)
+        if menu is None or not menu.isVisible():
+            return
+        if QApplication.mouseButtons() & Qt.MouseButton.RightButton:
+            self._pie_release_armed = True
+            return
+        menu.confirm()
+
+    def _release_press_captures(self, global_pos: QPoint) -> None:
+        widget = QApplication.widgetAt(global_pos)
+        while isinstance(widget, QWidget):
+            disarm = getattr(widget, "disarm_context_menu", None)
+            if callable(disarm):
+                disarm()
+            cancel_drag = getattr(widget, "cancel_drag", None)
+            if callable(cancel_drag):
+                cancel_drag()
+            widget = widget.parentWidget()
 
     def _pie_menu_allowed(self) -> bool:
         if not self.isActiveWindow():
@@ -1460,10 +1600,11 @@ class AudioPlayer(QMainWindow):
 
     def _open_pie_menu(self) -> None:
         menu = getattr(self, "_pie_menu", None)
-        if menu is None:
+        if menu is None or menu.isVisible():
             return
-        menu.set_shortcut_key(self._pie_menu_key)
+        self._pie_release_armed = False
         menu.open_at(QCursor.pos())
+        QTimer.singleShot(0, self._finish_pie_open)
 
     def _on_pie_menu_closed(self) -> None:
         QTimer.singleShot(0, self._restore_playlist_keyboard_focus)
@@ -1520,7 +1661,7 @@ class AudioPlayer(QMainWindow):
                 current=ms == preset,
                 on_click=lambda value=preset: self.apply_fade_preset(value),
             )
-            for preset in FADE_PRESETS_MS
+            for preset in self._fade_presets_ms
         ]
 
         return {
@@ -1559,7 +1700,7 @@ class AudioPlayer(QMainWindow):
                         enabled=res_on,
                         on_click=lambda value=preset: self._pie_set_q(value),
                     )
-                    for preset in HIGH_CUT_Q_PRESETS
+                    for preset in self._q_presets
                 ],
                 back=True,
             ),
@@ -3001,6 +3142,113 @@ class AudioPlayer(QMainWindow):
         self.refresh_playlist_footer(playlist)
         self.save_project()
 
+    def show_project_manager(self) -> None:
+        if self._browser_collapsed:
+            self.expand_file_browser()
+        if hasattr(self, "file_browser"):
+            self.file_browser.show_projects_page()
+
+    def import_library_drop(self, payload: dict, playlist, insert_row: int) -> None:
+        """Add dragged library tracks to the open project without copying their files."""
+        if not isinstance(playlist, PlaylistWidget) or not isinstance(payload, dict):
+            return
+        tracks = payload.get("tracks")
+        if not isinstance(tracks, list):
+            tracks = []
+
+        target = playlist
+        row = max(0, min(int(insert_row), playlist.count()))
+        created_tab = False
+        if payload.get("kind") == "playlist":
+            column = self._column_for_playlist(playlist)
+            title = str(payload.get("title") or "")
+            created = column.add_empty_tab(title=title) if column is not None else None
+            if created is not None:
+                target = created
+                row = 0
+                created_tab = True
+                self._apply_imported_playlist_font(column, created, payload.get("font_size"))
+
+        if not tracks and not created_tab:
+            return
+
+        inserted, skipped = self._insert_library_tracks(target, tracks, row)
+        if not inserted and not created_tab:
+            self.statusBar().showMessage("Nothing added — source files are missing.", 4000)
+            return
+        if inserted:
+            target._select_items(inserted)
+            self.last_selected_playlist = target.playlist_num
+            self.load_preview_track(target.playlist_num, inserted[-1])
+        self.refresh_playlist_footer(target)
+        self.save_project()
+        message = f"Added {len(inserted)} track(s)."
+        if skipped:
+            message += f" Skipped {skipped} missing file(s)."
+        self.statusBar().showMessage(message, 4000)
+
+    def _apply_imported_playlist_font(self, column, playlist, font_size) -> None:
+        try:
+            size = int(font_size)
+        except (TypeError, ValueError):
+            return
+        size = max(8, min(30, size))
+        playlist._font_size = size
+        family = get_token("typography.font_family_ui", "Arial")
+        playlist.set_playlist_font(QFont(family, size))
+        if column is not None and column.current_playlist() is playlist:
+            column.font_spin.blockSignals(True)
+            column.font_spin.setValue(size)
+            column.font_spin.blockSignals(False)
+
+    def _insert_library_tracks(self, playlist, tracks: list, insert_at: int):
+        inserted = []
+        skipped = 0
+        row = max(0, min(int(insert_at), playlist.count()))
+        for raw in tracks:
+            if not isinstance(raw, dict):
+                continue
+            snapshot = copy.deepcopy(raw)
+            snapshot.pop("source_root", None)
+            file_path = str(snapshot.get("path") or "").strip()
+            if not file_path:
+                item = playlist.add_placeholder_item(
+                    display_name=str(snapshot.get("name") or "").strip() or None,
+                    row=row,
+                )
+                row += 1
+                self._apply_snapshot_settings(item, snapshot)
+                inserted.append(item)
+                continue
+            if not os.path.isfile(file_path):
+                skipped += 1
+                continue
+            file_path = os.path.abspath(file_path)
+            snapshot["path"] = file_path
+            item = playlist.add_item_with_path(
+                file_path,
+                display_name=str(snapshot.get("name") or "").strip() or None,
+                load_duration=snapshot.get("duration_ms") is None,
+                file_exists=True,
+                row=row,
+            )
+            row += 1
+            if snapshot.get("duration_ms") is not None:
+                try:
+                    set_item_duration(item, int(snapshot["duration_ms"]))
+                except (TypeError, ValueError):
+                    pass
+            lufs = snapshot.get("lufs")
+            if isinstance(lufs, (int, float)):
+                self._track_lufs[file_path] = float(lufs)
+            self._apply_snapshot_settings(item, snapshot)
+            channel = snapshot.get("audio_channel_id")
+            if channel and str(channel) in self._known_mixer_channel_ids():
+                set_item_audio_channel_id(item, str(channel))
+            playlist.fileImported.emit(item, file_path)
+            inserted.append(item)
+        return inserted, skipped
+
     def refresh_playlist_footer(self, playlist: PlaylistWidget | None = None) -> None:
         columns = getattr(self, "playlist_columns", None) or []
         targets: list[PlaylistWidget] = []
@@ -3248,7 +3496,7 @@ class AudioPlayer(QMainWindow):
 
         self._update_playlist_focus_highlight()
         if hasattr(self, "file_browser") and self.file_browser is not None:
-            self.file_browser._update_focus_highlight()
+            self.file_browser.update_focus_highlight()
 
         if self._retain_playlist_focus_num is None:
             return
@@ -3564,14 +3812,39 @@ class AudioPlayer(QMainWindow):
         self.on_fade_mode_changed(mode)
         self.handle_space()
 
-    def toggle_fade_mode(self) -> None:
-        """Cycle SEQ → XFADE → HCUT (kept for compatibility)."""
+    def step_fade_mode(self, direction: int) -> None:
+        """Move to the next (+) or previous (−) fade mode, wrapping."""
         order = ("sequential", "crossfade", "high_cut")
         try:
             idx = order.index(self._fade_mode)
         except ValueError:
             idx = 0
-        self.on_fade_mode_changed(order[(idx + 1) % len(order)])
+        self.on_fade_mode_changed(order[(idx + int(direction)) % len(order)])
+
+    def _handle_transition_arrow(self, event: QKeyEvent) -> bool:
+        mods = event.modifiers() & ~(
+            Qt.KeyboardModifier.KeypadModifier | Qt.KeyboardModifier.GroupSwitchModifier
+        )
+        blocked = (
+            Qt.KeyboardModifier.ControlModifier
+            | Qt.KeyboardModifier.AltModifier
+            | Qt.KeyboardModifier.MetaModifier
+        )
+        if mods & blocked:
+            return False
+        shift = Qt.KeyboardModifier.ShiftModifier
+        if mods not in (Qt.KeyboardModifier.NoModifier, shift):
+            return False
+        direction = 1 if event.key() == Qt.Key.Key_Right else -1
+        if mods == shift:
+            self.step_fade_mode(direction)
+        else:
+            self.step_fade_preset(direction)
+        return True
+
+    def toggle_fade_mode(self) -> None:
+        """Cycle SEQ → XFADE → HCUT (kept for compatibility)."""
+        self.step_fade_mode(1)
 
     def _sync_mode_readout(self) -> None:
         label = getattr(self, "mode_status_label", None)
@@ -3944,31 +4217,6 @@ class AudioPlayer(QMainWindow):
         self._setup_settings_menu()
         self._setup_about_menu()
 
-    def _setup_settings_menu(self) -> None:
-        # A bare menu-bar action is not shown on macOS. "Settings" in the
-        # title is also pulled into the app menu unless the role is NoRole.
-        menu = self.menuBar().addMenu("Settings")
-        menu.menuAction().setMenuRole(QAction.MenuRole.NoRole)
-        act = QAction("Pie Menu Key…", self)
-        act.setMenuRole(QAction.MenuRole.NoRole)
-        act.triggered.connect(self._show_settings_dialog)
-        menu.addAction(act)
-
-    def _show_settings_dialog(self) -> None:
-        dialog = SettingsDialog(self._pie_menu_key, self)
-        dialog.captureChanged.connect(self._on_pie_key_capture)
-        dialog.exec()
-        self._capturing_pie_key = False
-        chosen = int(dialog.pie_key())
-        if chosen != int(self._pie_menu_key):
-            self._pie_menu_key = chosen
-            if hasattr(self, "_pie_menu"):
-                self._pie_menu.set_shortcut_key(chosen)
-            self.save_config()
-
-    def _on_pie_key_capture(self, capturing: bool) -> None:
-        self._capturing_pie_key = bool(capturing)
-
     def _setup_project_menu(self) -> None:
         menu = self.menuBar().addMenu("Project")
         act_new = QAction("New Project", self)
@@ -3985,6 +4233,10 @@ class AudioPlayer(QMainWindow):
         act_save_as = QAction("Save Project As…", self)
         act_save_as.triggered.connect(self.save_project_as)
         menu.addAction(act_save_as)
+        menu.addSeparator()
+        act_library = QAction("Project Manager", self)
+        act_library.triggered.connect(self.show_project_manager)
+        menu.addAction(act_library)
 
     def _setup_view_menu(self) -> None:
         menu = self.menuBar().addMenu("View")
@@ -4420,6 +4672,26 @@ class AudioPlayer(QMainWindow):
         if clipboard is not None:
             clipboard.setText(url)
 
+    def _setup_settings_menu(self) -> None:
+        # A bare menu-bar action is not shown on macOS. "Settings" in the
+        # title is also pulled into the app menu unless the role is NoRole.
+        menu = self.menuBar().addMenu("Settings")
+        menu.menuAction().setMenuRole(QAction.MenuRole.NoRole)
+        act = QAction("Presets…", self)
+        act.setMenuRole(QAction.MenuRole.NoRole)
+        act.triggered.connect(self._show_settings_dialog)
+        menu.addAction(act)
+
+    def _show_settings_dialog(self) -> None:
+        dialog = SettingsDialog(self._fade_presets_ms, self._q_presets, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        self._fade_presets_ms = dialog.fade_presets()
+        self._q_presets = dialog.q_presets()
+        self._setup_fade_preset_shortcuts()
+        self._sync_air_fade_presets()
+        self.save_config()
+
     def _setup_about_menu(self) -> None:
         menu = self.menuBar().addMenu("About")
         act_about = QAction(f"About {APP_NAME}…", self)
@@ -4547,6 +4819,10 @@ class AudioPlayer(QMainWindow):
             move_act.setEnabled(False)
             move_act.setText("Already in project")
 
+        reveal_act = menu.addAction("Show in Finder")
+        reveal_paths = self._existing_track_paths(targets)
+        reveal_act.setEnabled(bool(reveal_paths))
+
         color_menu = menu.addMenu("Mark color")
         current_colors = {get_item_color(target) for target in targets}
         current_color = next(iter(current_colors)) if len(current_colors) == 1 else object()
@@ -4616,6 +4892,9 @@ class AudioPlayer(QMainWindow):
         if chosen is move_act and move_act.isEnabled():
             self.move_selected_track_to_project(playlist)
             return
+        if chosen is reveal_act and reveal_act.isEnabled():
+            self._reveal_tracks_in_finder(reveal_paths)
+            return
         for act, hex_color in color_actions:
             if chosen is act:
                 for target in targets:
@@ -4639,6 +4918,33 @@ class AudioPlayer(QMainWindow):
                 self.save_project()
                 self.save_config()
                 return
+
+    def _existing_track_paths(self, items) -> list[str]:
+        paths: list[str] = []
+        seen: set[str] = set()
+        for item in items:
+            if is_item_placeholder(item):
+                continue
+            path = get_item_file_path(item)
+            if not path:
+                continue
+            abs_path = os.path.abspath(path)
+            if abs_path in seen or not os.path.exists(abs_path):
+                continue
+            seen.add(abs_path)
+            paths.append(abs_path)
+        return paths
+
+    def _reveal_tracks_in_finder(self, paths: list[str]) -> None:
+        if not paths:
+            return
+        if sys.platform == "darwin":
+            subprocess.run(["open", "-R", *paths], check=False)
+            return
+        if sys.platform == "win32":
+            subprocess.run(["explorer", f"/select,{paths[0]}"], check=False)
+            return
+        subprocess.run(["xdg-open", os.path.dirname(paths[0]) or "."], check=False)
 
     def _retarget_path_references(self, old_path: str, new_path: str) -> None:
         old_abs = os.path.abspath(old_path)
@@ -5272,6 +5578,11 @@ class AudioPlayer(QMainWindow):
                 if hasattr(self, "time_mode_group"):
                     self.time_mode_group.set_value("elapsed")
 
+            if isinstance(config.get("fade_presets_ms"), list):
+                self._fade_presets_ms = normalize_fade_presets(config["fade_presets_ms"])
+            if isinstance(config.get("high_cut_q_presets"), list):
+                self._q_presets = normalize_q_presets(config["high_cut_q_presets"])
+
             if "fade_duration_ms" in config:
                 self.fade_duration_spin.setValue(config["fade_duration_ms"])
                 self._sync_air_fade_presets()
@@ -5286,12 +5597,6 @@ class AudioPlayer(QMainWindow):
             if fade_mode in ("crossfade", "sequential", "high_cut"):
                 self._fade_mode = fade_mode
                 self._update_fade_mode_ui()
-
-            raw_pie_key = config.get("pie_menu_key")
-            if isinstance(raw_pie_key, str) and raw_pie_key.strip():
-                self._pie_menu_key = pie_key_from_config(raw_pie_key)
-                if hasattr(self, "_pie_menu"):
-                    self._pie_menu.set_shortcut_key(self._pie_menu_key)
 
             if "master_volume" in config:
                 try:
@@ -5373,6 +5678,17 @@ class AudioPlayer(QMainWindow):
                         raw_tabs = proj_data.get("browser_tabs")
                 except (OSError, json.JSONDecodeError):
                     raw_tabs = None
+            library_path = config.get("project_library_path")
+            if (
+                isinstance(library_path, str)
+                and library_path
+                and os.path.isdir(library_path)
+                and hasattr(self, "file_browser")
+            ):
+                self.file_browser.project_manager.set_library_path(library_path, notify=False)
+            if config.get("side_panel_page") == "projects" and hasattr(self, "file_browser"):
+                self.file_browser.set_side_page("projects")
+
             if isinstance(raw_tabs, list) and hasattr(self, "file_browser"):
                 tabs: list[tuple[str, str]] = []
                 for entry in raw_tabs:
@@ -5468,8 +5784,9 @@ class AudioPlayer(QMainWindow):
             "space_advances_selection": self.space_advances_checkbox.isChecked(),
             "time_display_mode": self._time_display_mode,
             "fade_duration_ms": self.fade_duration_spin.value(),
+            "fade_presets_ms": list(self._fade_presets_ms),
+            "high_cut_q_presets": list(self._q_presets),
             "fade_mode": self._fade_mode,
-            "pie_menu_key": pie_key_to_config(self._pie_menu_key),
             "master_volume": self._playback_volume,
             "master_eq": self._master_eq_state if self._master_eq_state else {},
             "master_eq_presets": dict(self._master_eq_presets),
@@ -5490,6 +5807,16 @@ class AudioPlayer(QMainWindow):
             "preview_autoplay": self._preview_autoplay,
             "browser_autoplay": self._browser_autoplay,
             "browser_collapsed": self._browser_collapsed,
+            "project_library_path": (
+                self.file_browser.project_library_path()
+                if hasattr(self, "file_browser")
+                else ""
+            ),
+            "side_panel_page": (
+                self.file_browser.side_page()
+                if hasattr(self, "file_browser")
+                else "files"
+            ),
             "properties_collapsed": self._properties_collapsed,
             "track_eq": dict(self._track_eq_state),
             "track_lufs": dict(self._track_lufs),
@@ -8271,14 +8598,6 @@ class AudioPlayer(QMainWindow):
                 self.player.play()
                 self._apply_fade_in()
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Right:
-            self.next_track()
-        elif event.key() == Qt.Key.Key_Left:
-            self.previous_track()
-        else:
-            super().keyPressEvent(event)
-
     def closeEvent(self, event):
         self._save_eq_for_bound_path()
         self._cancel_crossfade()
@@ -8306,6 +8625,8 @@ class AudioPlayer(QMainWindow):
             self._spectrum_timer.stop()
         if hasattr(self, "video_mixer") and self.video_mixer is not None:
             self.video_mixer.shutdown()
+        if hasattr(self, "file_browser"):
+            self.file_browser.project_manager.shutdown()
         self.save_project(wait=True)
         self.project.shutdown_writer()
         self.save_config(wait=True)

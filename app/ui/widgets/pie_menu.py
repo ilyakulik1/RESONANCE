@@ -1,4 +1,4 @@
-"""Marking menu: hold the key, aim with the mouse, release to choose."""
+"""Marking menu: hold the right mouse button, aim, release to choose."""
 
 from __future__ import annotations
 
@@ -68,7 +68,7 @@ def _qcolor(token: str, fallback: str) -> QColor:
 
 
 class PieMenu(QWidget):
-    """Hold-to-aim radial menu. Release the key on a slice to run it."""
+    """Hold-to-aim radial menu. Release the right button on a slice to run it."""
 
     closed = pyqtSignal()
 
@@ -81,7 +81,6 @@ class PieMenu(QWidget):
         self._center_hover = False
         self._open_submenu = -1
         self._list_hover = -1
-        self._shortcut_key = int(Qt.Key.Key_QuoteLeft)
         self._emitting_close = False
         self._closing = False
         self._track = QTimer(self)
@@ -98,9 +97,6 @@ class PieMenu(QWidget):
             | Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.NoDropShadowWindowHint
         )
-
-    def set_shortcut_key(self, key: int) -> None:
-        self._shortcut_key = int(key)
 
     def open_at(self, global_pos: QPoint) -> None:
         self._closing = False
@@ -311,20 +307,7 @@ class PieMenu(QWidget):
             self.cancel()
             event.accept()
             return
-        if int(event.key()) == self._shortcut_key:
-            event.accept()
-            return
         super().keyPressEvent(event)
-
-    def keyReleaseEvent(self, event: QKeyEvent) -> None:  # noqa: N802
-        if event.isAutoRepeat():
-            event.accept()
-            return
-        if int(event.key()) == self._shortcut_key:
-            self.confirm()
-            event.accept()
-            return
-        super().keyReleaseEvent(event)
 
     def hideEvent(self, event) -> None:  # noqa: N802
         self._track.stop()

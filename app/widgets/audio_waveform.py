@@ -638,6 +638,14 @@ class AudioWaveform(QWidget):
             self.unsetCursor()
         self.update()
 
+    def cancel_drag(self) -> None:
+        """Abort a press that became a long-press pie menu instead of a drag."""
+        if self.drag_mode == DragMode.NONE:
+            return
+        self.drag_mode = DragMode.NONE
+        self.unsetCursor()
+        self.update()
+
     def mouseReleaseEvent(self, event):
         if self.drag_mode == DragMode.NONE:
             return

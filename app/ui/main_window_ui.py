@@ -204,7 +204,7 @@ class MainWindowUi:
 
         browser_expand = QPushButton("»")
         browser_expand.setObjectName("browserExpandBtn")
-        browser_expand.setToolTip("Expand file browser")
+        browser_expand.setToolTip("Expand side panel")
         browser_expand.setFixedWidth(18)
         browser_expand.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         browser_expand.setSizePolicy(

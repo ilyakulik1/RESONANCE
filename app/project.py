@@ -593,6 +593,103 @@ def copy_project_trees(src_root: Path | str, dest_root: Path | str) -> Path:
     return dest
 
 
+def read_project_state(root: Path | str) -> ProjectState | None:
+    """Load one project folder without changing the active project or its caches."""
+    root_path = Path(root)
+    path = project_file_path(root_path)
+    if not path.is_file():
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Error loading project: {exc}")
+        return None
+    if not isinstance(data, dict):
+        return None
+
+    name = str(data.get("name") or root_path.name).strip() or "Project"
+    columns: list[ProjectColumnState] = []
+    raw_columns = data.get("columns")
+    if isinstance(raw_columns, list) and raw_columns:
+        for entry in raw_columns[:MAX_PLAYLISTS]:
+            if isinstance(entry, dict):
+                columns.append(_column_state_from_dict(entry, root_path))
+            else:
+                columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()]))
+    else:
+        raw_playlists = data.get("playlists")
+        if isinstance(raw_playlists, list):
+            for entry in raw_playlists[:MAX_PLAYLISTS]:
+                if isinstance(entry, dict):
+                    columns.append(
+                        ProjectColumnState(
+                            tabs=[_playlist_state_from_dict(entry, root_path)],
+                            active_tab=0,
+                        )
+                    )
+                else:
+                    columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()]))
+
+    while len(columns) < MAX_PLAYLISTS:
+        columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
+    columns = columns[:MAX_PLAYLISTS]
+
+    timelines: dict[str, dict] = {}
+    raw_timelines = data.get("track_timelines")
+    if isinstance(raw_timelines, dict):
+        for key, value in raw_timelines.items():
+            if not isinstance(value, dict):
+                continue
+            timelines[_instance_key_from_storage(str(key), root_path)] = value
+
+    track_eq: dict[str, dict] = {}
+    raw_eq = data.get("track_eq")
+    if isinstance(raw_eq, dict):
+        for key, value in raw_eq.items():
+            if not isinstance(value, dict):
+                continue
+            track_eq[_instance_key_from_storage(str(key), root_path)] = value
+
+    track_lufs: dict[str, float] = {}
+    raw_lufs = data.get("track_lufs")
+    if isinstance(raw_lufs, dict):
+        for key, value in raw_lufs.items():
+            if not isinstance(value, (int, float)):
+                continue
+            abs_path, _exists = resolve_project_path(str(key), root_path)
+            track_lufs[abs_path] = float(value)
+
+    track_stems: dict[str, dict] = {}
+    raw_stems = data.get("track_stems")
+    if isinstance(raw_stems, dict):
+        for key, value in raw_stems.items():
+            if not isinstance(value, dict):
+                continue
+            track_stems[_instance_key_from_storage(str(key), root_path)] = (
+                _stem_dict_from_storage(value, root_path)
+            )
+
+    video_mixer = data.get("video_mixer")
+    if not isinstance(video_mixer, dict):
+        video_mixer = None
+    else:
+        video_mixer = resolve_mixer_dict(video_mixer, root_path)
+
+    columns_count = int(data.get("playlist_columns") or 2)
+    columns_count = max(1, min(MAX_PLAYLISTS, columns_count))
+    return ProjectState(
+        name=name,
+        columns=columns,
+        playlist_columns=columns_count,
+        track_timelines=timelines,
+        track_eq=track_eq,
+        track_lufs=track_lufs,
+        track_stems=track_stems,
+        video_mixer=video_mixer,
+    )
+
+
 class ProjectManager:
     """Owns the active project root and persists project.json + analysis."""
 
@@ -732,101 +829,7 @@ class ProjectManager:
             self.flush_save()
 
     def load_raw(self) -> ProjectState | None:
-        path = self.project_file
-        if not path.is_file():
-            return None
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, json.JSONDecodeError) as exc:
-            print(f"Error loading project: {exc}")
-            return None
-
-        if not isinstance(data, dict):
-            return None
-
-        name = str(data.get("name") or self.root.name).strip() or "Project"
-        self.name = name
-        root = self.root
-
-        columns: list[ProjectColumnState] = []
-        raw_columns = data.get("columns")
-        if isinstance(raw_columns, list) and raw_columns:
-            for entry in raw_columns[:MAX_PLAYLISTS]:
-                if isinstance(entry, dict):
-                    columns.append(_column_state_from_dict(entry, root))
-                else:
-                    columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()]))
-        else:
-            # v1: flat playlists[] → one tab per column
-            raw_playlists = data.get("playlists")
-            if isinstance(raw_playlists, list):
-                for entry in raw_playlists[:MAX_PLAYLISTS]:
-                    if isinstance(entry, dict):
-                        columns.append(
-                            ProjectColumnState(
-                                tabs=[_playlist_state_from_dict(entry, root)],
-                                active_tab=0,
-                            )
-                        )
-                    else:
-                        columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()]))
-
-        while len(columns) < MAX_PLAYLISTS:
-            columns.append(ProjectColumnState(tabs=[ProjectPlaylistState()], active_tab=0))
-        columns = columns[:MAX_PLAYLISTS]
-
-        timelines: dict[str, dict] = {}
-        raw_timelines = data.get("track_timelines")
-        if isinstance(raw_timelines, dict):
-            for key, value in raw_timelines.items():
-                if not isinstance(value, dict):
-                    continue
-                timelines[_instance_key_from_storage(str(key), root)] = value
-
-        track_eq: dict[str, dict] = {}
-        raw_eq = data.get("track_eq")
-        if isinstance(raw_eq, dict):
-            for key, value in raw_eq.items():
-                if not isinstance(value, dict):
-                    continue
-                track_eq[_instance_key_from_storage(str(key), root)] = value
-
-        track_lufs: dict[str, float] = {}
-        raw_lufs = data.get("track_lufs")
-        if isinstance(raw_lufs, dict):
-            for key, value in raw_lufs.items():
-                if not isinstance(value, (int, float)):
-                    continue
-                abs_path, _ = resolve_project_path(str(key), root)
-                track_lufs[abs_path] = float(value)
-
-        track_stems: dict[str, dict] = {}
-        raw_stems = data.get("track_stems")
-        if isinstance(raw_stems, dict):
-            for key, value in raw_stems.items():
-                if not isinstance(value, dict):
-                    continue
-                track_stems[_instance_key_from_storage(str(key), root)] = (
-                    _stem_dict_from_storage(value, root)
-                )
-
-        video_mixer = data.get("video_mixer")
-        if not isinstance(video_mixer, dict):
-            video_mixer = None
-        else:
-            video_mixer = resolve_mixer_dict(video_mixer, root)
-
-        columns_count = int(data.get("playlist_columns") or 2)
-        columns_count = max(1, min(MAX_PLAYLISTS, columns_count))
-
-        return ProjectState(
-            name=name,
-            columns=columns,
-            playlist_columns=columns_count,
-            track_timelines=timelines,
-            track_eq=track_eq,
-            track_lufs=track_lufs,
-            track_stems=track_stems,
-            video_mixer=video_mixer,
-        )
+        state = read_project_state(self.root)
+        if state is not None:
+            self.name = state.name
+        return state

@@ -35,6 +35,7 @@ from app.ui.icon_loader import icon_size, load_icon
 from app.ui.tokens import get_token, get_token_int
 from app.ui.widgets.section_header import SectionHeader
 from app.widgets.audio_waveform import AudioWaveform
+from app.widgets.project_manager import ProjectManagerPanel
 
 ENTRY_PATH_ROLE = Qt.ItemDataRole.UserRole
 ENTRY_IS_DIR_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -168,6 +169,8 @@ class FileBrowserList(QListWidget):
         self._search_token = 0
         self._searchReady.connect(self._on_search_ready)
         self.setObjectName("fileBrowserList")
+        self.setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
+        self.viewport().setAttribute(Qt.WidgetAttribute.WA_MacShowFocusRect, False)
         self.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.setDragEnabled(True)
         self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
@@ -704,17 +707,12 @@ class FileBrowserPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(4)
 
-        header_row = QHBoxLayout()
-        header_row.setSpacing(4)
-        header_row.addWidget(SectionHeader("FILES"), 1)
         self.btn_collapse = QToolButton()
         self.btn_collapse.setObjectName("fileBrowserCollapseBtn")
         self.btn_collapse.setText("«")
-        self.btn_collapse.setToolTip("Collapse file browser")
+        self.btn_collapse.setToolTip("Collapse side panel")
         self.btn_collapse.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.btn_collapse.clicked.connect(self.collapseRequested.emit)
-        header_row.addWidget(self.btn_collapse)
-        layout.addLayout(header_row)
 
         self.tabs = QTabWidget()
         self.tabs.setObjectName("fileBrowserTabs")
@@ -733,8 +731,6 @@ class FileBrowserPanel(QWidget):
         add_btn.clicked.connect(self.add_user_tab)
         self.tabs.setCornerWidget(add_btn, Qt.Corner.TopRightCorner)
 
-        layout.addWidget(self.tabs, 1)
-
         self._project_page = FileBrowserTabPage(
             self._project_root,
             root_limit=self._project_root,
@@ -750,14 +746,27 @@ class FileBrowserPanel(QWidget):
             0, QTabBar.ButtonPosition.LeftSide, None
         )
 
-        layout.addWidget(self._build_preview_panel())
+        files_page = QWidget()
+        files_layout = QVBoxLayout(files_page)
+        files_layout.setContentsMargins(0, 0, 0, 0)
+        files_layout.setSpacing(4)
+        files_layout.addWidget(self.tabs, 1)
+        files_layout.addWidget(self._build_preview_panel())
         self.btn_browser_eject.clicked.connect(self._on_eject_clicked)
 
-        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.add_user_tab)
+        self.project_manager = ProjectManagerPanel(self)
 
-        app = QApplication.instance()
-        if app is not None:
-            app.focusChanged.connect(self._on_app_focus_changed)
+        self.mode_tabs = QTabWidget()
+        self.mode_tabs.setObjectName("libraryModeTabs")
+        self.mode_tabs.setDocumentMode(True)
+        self.mode_tabs.setTabPosition(QTabWidget.TabPosition.North)
+        self.mode_tabs.addTab(files_page, "Files")
+        self.mode_tabs.addTab(self.project_manager, "Projects")
+        self.mode_tabs.setCornerWidget(self.btn_collapse, Qt.Corner.TopRightCorner)
+        self.mode_tabs.currentChanged.connect(self._on_mode_changed)
+        layout.addWidget(self.mode_tabs, 1)
+
+        QShortcut(QKeySequence("Ctrl+T"), self, activated=self.add_user_tab)
 
     def _on_eject_clicked(self) -> None:
         """Unload the current browser preview track."""
@@ -884,6 +893,93 @@ class FileBrowserPanel(QWidget):
     def project_root(self) -> str:
         return self._project_root
 
+    def side_page(self) -> str:
+        if self.mode_tabs.currentWidget() is self.project_manager:
+            return "projects"
+        return "files"
+
+    def set_side_page(self, page: str) -> None:
+        target = self.project_manager if page == "projects" else self.mode_tabs.widget(0)
+        if target is not None:
+            self.mode_tabs.setCurrentWidget(target)
+
+    def show_projects_page(self) -> None:
+        self.set_side_page("projects")
+        self.project_manager.focus_search()
+
+    def project_library_path(self) -> str:
+        return self.project_manager.library_path()
+
+    def _on_mode_changed(self, _index: int) -> None:
+        if not self.isVisible():
+            return
+        self.focus_keyboard_target()
+
+    def focus_after_click(self, clicked: QWidget | None) -> None:
+        edit = self._line_edit_ancestor(clicked)
+        if edit is not None and self._widget_belongs_to(edit, self):
+            if QApplication.focusWidget() != edit:
+                edit.setFocus(Qt.FocusReason.MouseFocusReason)
+            self.update_focus_highlight()
+            return
+        self.focus_keyboard_target()
+
+    @staticmethod
+    def _line_edit_ancestor(widget: QWidget | None) -> QLineEdit | None:
+        current = widget
+        while isinstance(current, QWidget):
+            if isinstance(current, QLineEdit):
+                return current
+            current = current.parentWidget()
+        return None
+
+    def focus_keyboard_target(self) -> None:
+        """Move keyboard focus into the visible Files or Projects page."""
+        focused = QApplication.focusWidget()
+        if self.side_page() == "projects":
+            if isinstance(focused, QLineEdit) and self._widget_belongs_to(
+                focused, self.project_manager
+            ):
+                self.update_focus_highlight()
+                return
+            if not self._widget_belongs_to(focused, self.project_manager.tree):
+                self.project_manager.tree.setFocus(Qt.FocusReason.OtherFocusReason)
+        else:
+            page = self.tabs.currentWidget()
+            if isinstance(page, FileBrowserTabPage):
+                if isinstance(focused, QLineEdit) and self._widget_belongs_to(
+                    focused, page
+                ):
+                    self.update_focus_highlight()
+                    return
+                if not self._widget_belongs_to(focused, page.list):
+                    page.list.setFocus(Qt.FocusReason.OtherFocusReason)
+        self.update_focus_highlight()
+
+    def update_focus_highlight(self) -> None:
+        focused = QApplication.focusWidget()
+        projects_active = self._widget_belongs_to(focused, self.project_manager)
+        for index in range(self.tabs.count()):
+            page = self.tabs.widget(index)
+            if not isinstance(page, FileBrowserTabPage):
+                continue
+            active = (not projects_active) and self._widget_belongs_to(focused, page)
+            self._set_frame_active(page.search_edit, active)
+        self._set_frame_active(self.project_manager.search_edit, projects_active)
+
+    @staticmethod
+    def _set_frame_active(frame: QFrame | None, active: bool) -> None:
+        if frame is None:
+            return
+        previous = frame.property("browserActive")
+        if bool(previous) == bool(active):
+            return
+        frame.setProperty("browserActive", bool(active))
+        style = frame.style()
+        style.unpolish(frame)
+        style.polish(frame)
+        frame.update()
+
     @staticmethod
     def _widget_belongs_to(widget: QWidget | None, ancestor: QWidget) -> bool:
         if not isinstance(widget, QWidget) or not isinstance(ancestor, QWidget):
@@ -894,26 +990,6 @@ class FileBrowserPanel(QWidget):
                 return True
             current = current.parentWidget()
         return False
-
-    def _on_app_focus_changed(self, _old: QWidget | None, _new: QWidget | None) -> None:
-        self._update_focus_highlight()
-
-    def _update_focus_highlight(self) -> None:
-        focused = QApplication.focusWidget()
-        for i in range(self.tabs.count()):
-            page = self.tabs.widget(i)
-            if not isinstance(page, FileBrowserTabPage):
-                continue
-            is_active = self._widget_belongs_to(focused, page.list)
-            frame = page.list_frame
-            previous = frame.property("browserActive")
-            if bool(previous) == bool(is_active):
-                continue
-            frame.setProperty("browserActive", is_active)
-            style = frame.style()
-            style.unpolish(frame)
-            style.polish(frame)
-            frame.update()
 
     def set_project_root(
         self, path: str, title: str | None = None, *, reload: bool = True

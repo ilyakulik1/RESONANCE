@@ -30,6 +30,7 @@ from PyQt6.QtWidgets import (
 )
 
 from app.audio_utils import is_audio_file
+from app.project_library import LIBRARY_TRACKS_MIME
 from app.playlist_io import (
     DEFAULT_PLACEHOLDER_NAME,
     clone_playlist_item,
@@ -221,6 +222,11 @@ class PlaylistWidget(QListWidget):
             item.setSelected(True)
             self.setCurrentItem(item)
         return item
+
+    def disarm_context_menu(self) -> None:
+        """Drop a right-click that turned into a long-press instead of a menu."""
+        self._context_menu_armed = False
+        self._right_press_pos = None
 
     def _emit_track_context_menu(self, viewport_pos: QPoint) -> None:
         if self._context_menu_guard:
@@ -471,7 +477,11 @@ class PlaylistWidget(QListWidget):
         self.focused.emit(self.playlist_num)
 
     def _accepts_drag(self, mime) -> bool:
-        return mime.hasUrls() or mime.hasFormat(TRACK_MIME)
+        return (
+            mime.hasUrls()
+            or mime.hasFormat(TRACK_MIME)
+            or mime.hasFormat(LIBRARY_TRACKS_MIME)
+        )
 
     def _clear_other_drop_indicators(self) -> None:
         if not self._playlists:
@@ -524,7 +534,9 @@ class PlaylistWidget(QListWidget):
         if not self._accepts_drag(event.mimeData()):
             event.ignore()
             return
-        if event.mimeData().hasFormat(TRACK_MIME) and is_copy_drop_modifier(event.modifiers()):
+        if event.mimeData().hasFormat(LIBRARY_TRACKS_MIME):
+            event.setDropAction(Qt.DropAction.CopyAction)
+        elif event.mimeData().hasFormat(TRACK_MIME) and is_copy_drop_modifier(event.modifiers()):
             event.setDropAction(Qt.DropAction.CopyAction)
         event.accept()
 
@@ -535,6 +547,10 @@ class PlaylistWidget(QListWidget):
 
         self._update_drop_indicator(event.position())
         self._clear_other_drop_indicators()
+        if event.mimeData().hasFormat(LIBRARY_TRACKS_MIME):
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
         if event.mimeData().hasFormat(TRACK_MIME) and is_copy_drop_modifier(
             event.modifiers()
         ):
@@ -550,6 +566,24 @@ class PlaylistWidget(QListWidget):
     def dropEvent(self, event: QDropEvent):
         target_row = self.drop_insert_row()
         self._clear_drop_indicator()
+
+        if event.mimeData().hasFormat(LIBRARY_TRACKS_MIME):
+            try:
+                payload = json.loads(
+                    bytes(event.mimeData().data(LIBRARY_TRACKS_MIME)).decode("utf-8")
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                event.ignore()
+                return
+            window = self.window()
+            handler = getattr(window, "import_library_drop", None)
+            if not isinstance(payload, dict) or not callable(handler):
+                event.ignore()
+                return
+            handler(payload, self, target_row)
+            event.setDropAction(Qt.DropAction.CopyAction)
+            event.accept()
+            return
 
         if event.mimeData().hasUrls():
             vp_pos = self._cursor_viewport_pos()

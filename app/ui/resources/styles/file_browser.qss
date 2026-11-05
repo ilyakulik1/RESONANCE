@@ -36,14 +36,11 @@ QListWidget#fileBrowserList::item:hover:!selected {
     background-color: {{colors.bg_item_hover}};
 }
 
-QFrame#fileBrowserListFrame {
+QFrame#fileBrowserListFrame,
+QFrame#projectManagerFrame {
     background-color: {{colors.bg_surface}};
     border-radius: {{radius.lg}};
-    border: 2px solid transparent;
-}
-
-QFrame#fileBrowserListFrame[browserActive="true"] {
-    border-color: {{colors.border_focus}};
+    border: none;
 }
 
 QFrame#fileBrowserToolbar {
@@ -54,16 +51,19 @@ QFrame#fileBrowserFilterRow {
     background-color: transparent;
 }
 
-QLabel#fileBrowserPath {
+QLabel#fileBrowserPath,
+QLabel#projectManagerPath,
+QLabel#projectManagerStatus {
     color: {{colors.text_muted}};
     font-size: {{typography.size_sm}};
     padding: 0 {{spacing.sm}};
 }
 
-QLineEdit#fileBrowserSearch {
+QLineEdit#fileBrowserSearch,
+QLineEdit#projectManagerSearch {
     background-color: {{colors.bg_control}};
     color: {{colors.text_primary}};
-    border: 1px solid {{colors.border}};
+    border: 2px solid {{colors.border}};
     border-radius: {{radius.sm}};
     padding: 2px 6px;
     font-size: {{typography.size_sm}};
@@ -72,7 +72,10 @@ QLineEdit#fileBrowserSearch {
     selection-color: {{colors.text_on_accent}};
 }
 
-QLineEdit#fileBrowserSearch:focus {
+QLineEdit#fileBrowserSearch:focus,
+QLineEdit#projectManagerSearch:focus,
+QLineEdit#fileBrowserSearch[browserActive="true"],
+QLineEdit#projectManagerSearch[browserActive="true"] {
     border-color: {{colors.border_focus}};
 }
 
@@ -215,4 +218,63 @@ QPushButton#browserExpandBtn {
 
 QPushButton#browserExpandBtn:hover {
     background-color: {{colors.bg_control_hover}};
+}
+
+QTabWidget#libraryModeTabs::pane {
+    border: none;
+    background: transparent;
+    top: 0;
+}
+
+QTabWidget#libraryModeTabs QTabBar::tab {
+    background-color: {{colors.bg_control}};
+    color: {{colors.text_secondary}};
+    font-size: {{typography.size_xs}};
+    padding: 2px 8px;
+    margin-right: 1px;
+    border: 1px solid {{colors.border}};
+    border-bottom: none;
+}
+
+QTabWidget#libraryModeTabs QTabBar::tab:selected {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.accent}};
+}
+
+QTabWidget#libraryModeTabs QTabBar::tab:hover:!selected {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QToolButton#projectManagerTool {
+    color: {{colors.text_primary}};
+    background-color: {{colors.bg_control}};
+    border: 1px solid {{colors.border}};
+    padding: 1px 6px;
+    font-size: {{typography.size_xs}};
+}
+
+QToolButton#projectManagerTool:hover {
+    background-color: {{colors.bg_control_hover}};
+}
+
+QTreeWidget#projectManagerTree {
+    background-color: {{colors.bg_surface}};
+    color: {{colors.text_primary}};
+    border: none;
+    outline: none;
+    padding: {{spacing.xs}} {{spacing.sm}};
+}
+
+QTreeWidget#projectManagerTree::item {
+    padding: 2px 4px;
+    border: none;
+}
+
+QTreeWidget#projectManagerTree::item:selected {
+    background-color: {{colors.accent_blue}};
+    color: {{colors.text_on_accent}};
+}
+
+QTreeWidget#projectManagerTree::item:hover:!selected {
+    background-color: {{colors.bg_item_hover}};
 }

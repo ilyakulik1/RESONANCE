@@ -243,6 +243,48 @@ def load_peaks(file_path: str, num_bars: int | None = None) -> list[float] | Non
     return resample_peaks(entry.peaks, num_bars)
 
 
+def transplant_analysis(
+    src_path: str,
+    src_dir: Path | str | None,
+    dest_path: str,
+) -> bool:
+    """Copy a waveform/BPM cache entry onto a new file path in the active cache.
+
+    ``src_dir`` is the source project's analysis folder. The active cache stays
+    pointed at the open project.
+    """
+    if not src_path or not dest_path:
+        return False
+    if os.path.abspath(src_path) == os.path.abspath(dest_path):
+        return False
+    entry = _analysis_in_dir(src_path, Path(src_dir) if src_dir else None)
+    if entry is None:
+        entry = _analysis_in_dir(src_path, get_config_path("analysis_cache"))
+    if entry is None or not entry.peaks:
+        return False
+    return save_analysis(
+        dest_path,
+        bpm=entry.bpm,
+        peaks=entry.peaks,
+        num_bars=entry.num_bars,
+        lufs=entry.lufs,
+    )
+
+
+def _analysis_in_dir(file_path: str, folder: Path | None) -> AnalysisCacheEntry | None:
+    if folder is None or not folder.is_dir():
+        return None
+    fp = _file_fingerprint(file_path)
+    if fp is not None:
+        digest, mtime, size = fp
+        candidate = folder / f"{digest}_{int(mtime)}_{size}.npz"
+        if candidate.is_file():
+            loaded = _load_npz(candidate, file_path)
+            if loaded is not None:
+                return loaded
+    return _load_by_digest(file_path, folder=folder)
+
+
 def relocate_analysis(old_path: str, new_path: str) -> bool:
     """Copy analysis entry from old file path key to new path key."""
     entry = load_analysis(old_path)

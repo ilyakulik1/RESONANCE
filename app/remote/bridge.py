@@ -304,8 +304,11 @@ class RemoteBridge(QObject):
             "master_volume": float(player._playback_volume),
             "fade_mode": player._fade_mode,
             "fade_duration_ms": int(player.fade_duration_spin.value()),
-            "fade_presets_ms": list(FADE_PRESETS_MS),
-            "fade_preset_labels": [fade_preset_label(ms) for ms in FADE_PRESETS_MS],
+            "fade_presets_ms": list(getattr(player, "_fade_presets_ms", FADE_PRESETS_MS)),
+            "fade_preset_labels": [
+                fade_preset_label(ms)
+                for ms in getattr(player, "_fade_presets_ms", FADE_PRESETS_MS)
+            ],
             "high_cut_q": float(player._high_cut_q()),
             "high_cut_q_min": HIGH_CUT_Q_MIN,
             "high_cut_q_max": HIGH_CUT_Q_MAX,
