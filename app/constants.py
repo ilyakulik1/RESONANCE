@@ -4,9 +4,26 @@ MAX_TABS_PER_COLUMN = 20
 APP_NAME = "RESONANCE"
 DEFAULT_FADE_MS = 1500
 FADE_PRESETS_MS = (0, 200, 400, 800, 2000)
-# Audio mixer: immutable Main + up to this many aux strips
+# Audio mixer: immutable Main + up to this many extra strips
 MAIN_CHANNEL_ID = "main"
 MAX_AUX_CHANNELS = 7
+# Program channels crossfade with the air transition. Samples play over them.
+CHANNEL_KIND_PROGRAM = "program"
+CHANNEL_KIND_SAMPLE = "sample"
+
+
+def normalize_channel_kind(entry: dict | None) -> str:
+    """Return ``program`` or ``sample``. Main is always program."""
+    if not isinstance(entry, dict):
+        return CHANNEL_KIND_PROGRAM
+    if entry.get("is_main"):
+        return CHANNEL_KIND_PROGRAM
+    kind = str(entry.get("kind") or "").strip().lower()
+    if kind == CHANNEL_KIND_SAMPLE:
+        return CHANNEL_KIND_SAMPLE
+    if kind == CHANNEL_KIND_PROGRAM:
+        return CHANNEL_KIND_PROGRAM
+    return CHANNEL_KIND_SAMPLE
 # Air / music (Control Panel FADE)
 FADE_PRESET_SHORTCUTS: tuple[tuple[str, int], ...] = (
     ("Ctrl+Shift+1", 0),

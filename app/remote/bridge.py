@@ -14,6 +14,7 @@ from app.playlist_io import (
     get_item_color,
     get_item_duration,
     get_item_file_path,
+    get_item_notes,
     get_item_track_id,
     is_item_file_missing,
 )
@@ -176,8 +177,13 @@ class RemoteBridge(QObject):
         row = playlist.row(item)
         if row < 0:
             return
-        playlist.takeItem(row)
-        self._player.refresh_playlist_footer(playlist)
+        with self._player.playlist_edit():
+            if item is self._player.current_playing_item:
+                self._player._clear_air_deck()
+            self._player._stop_aux_playback_for_item(item)
+            playlist.takeItem(row)
+            self._player.refresh_playlist_footer(playlist)
+            self._player.save_project()
 
     def _activate_tab(self, params: dict) -> None:
         playlist_num = params.get("playlist_num")
@@ -207,7 +213,7 @@ class RemoteBridge(QObject):
         if not (0 <= column_index < len(columns)):
             return
         title = str(params.get("title") or "").strip() or None
-        columns[column_index].add_empty_tab(title=title)
+        columns[column_index].add_tab_interactive(title=title)
 
     def _delete_playlist(self, params: dict) -> None:
         playlist_num = int(params.get("playlist_num", 0))
@@ -354,6 +360,7 @@ class RemoteBridge(QObject):
                             "row": row,
                             "name": player.get_track_display_name(item, path),
                             "duration_ms": get_item_duration(item),
+                            "notes": get_item_notes(item),
                             "bpm": get_item_bpm(item),
                             "color": get_item_color(item),
                             "missing": is_item_file_missing(item),

@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from contextlib import nullcontext
 
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QRect, QEvent
 from PyQt6.QtGui import (
@@ -33,6 +34,7 @@ from app.audio_utils import is_audio_file
 from app.project_library import LIBRARY_TRACKS_MIME
 from app.playlist_io import (
     DEFAULT_PLACEHOLDER_NAME,
+    clear_item_audio,
     clone_playlist_item,
     ensure_item_track_id,
     get_item_file_path,
@@ -102,6 +104,8 @@ class PlaylistWidget(QListWidget):
     selectionNavigated = pyqtSignal(object)
     tracksChanged = pyqtSignal()
     fileImported = pyqtSignal(object, str)  # item, absolute file path
+    auxSeekRequested = pyqtSignal(object, float, bool)  # item, ratio, scrubbing
+    auxStopRequested = pyqtSignal(object)
 
     def __init__(self, name, playlist_num, parent=None):
         super().__init__(parent)
@@ -135,6 +139,8 @@ class PlaylistWidget(QListWidget):
         self._right_press_pos: QPoint | None = None
         self._context_menu_armed = False
         self._context_menu_guard = False
+        self._aux_scrub_item = None
+        self._aux_scrub_ratio = 0.0
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
         self.viewport().setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
 
@@ -188,14 +194,30 @@ class PlaylistWidget(QListWidget):
                 if self._drop_indicator_y_px is not None:
                     self._drop_overlay.show_at(self._drop_indicator_y_px)
             elif etype == QEvent.Type.MouseButtonPress and isinstance(event, QMouseEvent):
+                pos = event.position().toPoint()
+                if event.button() == Qt.MouseButton.LeftButton and self._begin_aux_scrub(pos):
+                    event.accept()
+                    return True
                 if event.button() == Qt.MouseButton.RightButton:
-                    pos = event.position().toPoint()
                     self._select_item_at(pos)
                     self._right_press_pos = pos
                     self._context_menu_armed = True
                     event.accept()
                     return True
+            elif etype == QEvent.Type.MouseMove and isinstance(event, QMouseEvent):
+                if self._aux_scrub_item is not None and self._scrub_aux_to(event.position().toPoint()):
+                    event.accept()
+                    return True
             elif etype == QEvent.Type.MouseButtonRelease and isinstance(event, QMouseEvent):
+                if (
+                    event.button() == Qt.MouseButton.LeftButton
+                    and self._aux_scrub_item is not None
+                ):
+                    self._scrub_aux_to(event.position().toPoint(), scrubbing=False)
+                    self._aux_scrub_item = None
+                    self.viewport().releaseMouse()
+                    event.accept()
+                    return True
                 if event.button() == Qt.MouseButton.RightButton:
                     if self._context_menu_armed:
                         pos = event.position().toPoint()
@@ -222,6 +244,44 @@ class PlaylistWidget(QListWidget):
             item.setSelected(True)
             self.setCurrentItem(item)
         return item
+
+    def _begin_aux_scrub(self, viewport_pos: QPoint) -> bool:
+        """Seek or stop a playing sample from its mini-wave. Consume the click."""
+        delegate = self.itemDelegate()
+        if not isinstance(delegate, PlaylistItemDelegate):
+            return False
+        hit = delegate.aux_interaction(self, viewport_pos)
+        if hit is None:
+            return False
+        action, item, ratio = hit
+        if item not in self.selectedItems():
+            self.clearSelection()
+            item.setSelected(True)
+            self.setCurrentItem(item)
+        if action == "stop":
+            self._aux_scrub_item = None
+            self.auxStopRequested.emit(item)
+            return True
+        self._aux_scrub_item = item
+        self._aux_scrub_ratio = float(ratio)
+        self.viewport().grabMouse()
+        self.auxSeekRequested.emit(item, float(ratio), True)
+        return True
+
+    def _scrub_aux_to(self, viewport_pos: QPoint, *, scrubbing: bool = True) -> bool:
+        item = self._aux_scrub_item
+        if item is None:
+            return False
+        delegate = self.itemDelegate()
+        ratio = None
+        if isinstance(delegate, PlaylistItemDelegate):
+            ratio = delegate.aux_seek_ratio(self, item, viewport_pos)
+        if ratio is None:
+            ratio = self._aux_scrub_ratio
+        else:
+            self._aux_scrub_ratio = float(ratio)
+        self.auxSeekRequested.emit(item, float(ratio), bool(scrubbing))
+        return True
 
     def disarm_context_menu(self) -> None:
         """Drop a right-click that turned into a long-press instead of a menu."""
@@ -344,6 +404,35 @@ class PlaylistWidget(QListWidget):
         set_item_file_path(item, path)
         self._item_paths[id(item)] = path
         set_item_file_missing(item, not os.path.isfile(path))
+
+    def _playlist_edit(self):
+        window = self.window()
+        edit = getattr(window, "playlist_edit", None)
+        if callable(edit):
+            return edit()
+        return nullcontext()
+
+    def clear_item_audio(self, item: QListWidgetItem) -> None:
+        """Remove the file and keep the row as an empty track."""
+        clear_item_audio(item)
+        self._item_paths.pop(id(item), None)
+        self.viewport().update()
+
+    def edit(self, index, *args):
+        started = super().edit(index, *args)
+        if started:
+            window = self.window()
+            begin = getattr(window, "_begin_playlist_edit", None)
+            if callable(begin):
+                begin()
+        return started
+
+    def closeEditor(self, editor, hint):
+        super().closeEditor(editor, hint)
+        window = self.window()
+        end = getattr(window, "_end_playlist_edit", None)
+        if callable(end):
+            end()
 
     def update_item_path(self, item: QListWidgetItem, file_path: str) -> None:
         """Retarget an existing playlist item to a new file path."""
@@ -566,6 +655,10 @@ class PlaylistWidget(QListWidget):
     def dropEvent(self, event: QDropEvent):
         target_row = self.drop_insert_row()
         self._clear_drop_indicator()
+        with self._playlist_edit():
+            self._drop_event_body(event, target_row)
+
+    def _drop_event_body(self, event: QDropEvent, target_row: int) -> None:
 
         if event.mimeData().hasFormat(LIBRARY_TRACKS_MIME):
             try:
@@ -802,7 +895,9 @@ class PlaylistWidget(QListWidget):
     def move_item_up(self):
         """Переместить выбранный элемент вверх"""
         current_row = self.currentRow()
-        if current_row > 0:
+        if current_row <= 0:
+            return
+        with self._playlist_edit():
             item = self.takeItem(current_row)
             self.insertItem(current_row - 1, item)
             self._adopt_item(item)
@@ -811,7 +906,9 @@ class PlaylistWidget(QListWidget):
     def move_item_down(self):
         """Переместить выбранный элемент вниз"""
         current_row = self.currentRow()
-        if current_row < self.count() - 1:
+        if current_row < 0 or current_row >= self.count() - 1:
+            return
+        with self._playlist_edit():
             item = self.takeItem(current_row)
             self.insertItem(current_row + 1, item)
             self._adopt_item(item)
@@ -820,7 +917,9 @@ class PlaylistWidget(QListWidget):
     def move_item_top(self):
         """Переместить выбранный элемент в начало"""
         current_row = self.currentRow()
-        if current_row > 0:
+        if current_row <= 0:
+            return
+        with self._playlist_edit():
             item = self.takeItem(current_row)
             self.insertItem(0, item)
             self._adopt_item(item)
@@ -829,7 +928,9 @@ class PlaylistWidget(QListWidget):
     def move_item_bottom(self):
         """Переместить выбранный элемент в конец"""
         current_row = self.currentRow()
-        if current_row < self.count() - 1:
+        if current_row < 0 or current_row >= self.count() - 1:
+            return
+        with self._playlist_edit():
             item = self.takeItem(current_row)
             self.insertItem(self.count(), item)
             self._adopt_item(item)

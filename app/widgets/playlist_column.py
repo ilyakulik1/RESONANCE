@@ -85,7 +85,7 @@ class PlaylistColumnPanel(QFrame):
         add_btn.setText("+")
         add_btn.setToolTip("New playlist")
         add_btn.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        add_btn.clicked.connect(self.add_empty_tab)
+        add_btn.clicked.connect(self.add_tab_interactive)
 
         del_btn = QToolButton()
         del_btn.setObjectName("playlistDeleteTab")
@@ -215,6 +215,14 @@ class PlaylistColumnPanel(QFrame):
             if isinstance(pl, PlaylistWidget):
                 result.append(pl)
         return result
+
+    def add_tab_interactive(self, *, title: str | None = None) -> PlaylistWidget | None:
+        window = self.window_ref
+        edit = getattr(window, "playlist_edit", None)
+        if not callable(edit):
+            return self.add_empty_tab(title=title)
+        with edit():
+            return self.add_empty_tab(title=title)
 
     def add_empty_tab(self, *, title: str | None = None) -> PlaylistWidget | None:
         if self.tabs.count() >= MAX_TABS_PER_COLUMN:
@@ -382,6 +390,15 @@ class PlaylistColumnPanel(QFrame):
                 return
 
         window = self.window_ref
+        edit = getattr(window, "playlist_edit", None)
+        if callable(edit):
+            with edit():
+                self._delete_tab_now(index, pl)
+            return
+        self._delete_tab_now(index, pl)
+
+    def _delete_tab_now(self, index: int, pl) -> None:
+        window = self.window_ref
         if isinstance(pl, PlaylistWidget):
             if window.current_playing_playlist == pl.playlist_num:
                 for media_player in window._players:
@@ -420,8 +437,17 @@ class PlaylistColumnPanel(QFrame):
         if not ok:
             return
         name = text.strip()
-        if not name:
+        if not name or name == current:
             return
+        window = self.window_ref
+        edit = getattr(window, "playlist_edit", None)
+        if callable(edit):
+            with edit():
+                self._apply_tab_name(index, name)
+            return
+        self._apply_tab_name(index, name)
+
+    def _apply_tab_name(self, index: int, name: str) -> None:
         self.tabs.setTabText(index, name)
         page = self.tabs.widget(index)
         pl = getattr(page, "playlist_widget", None) if page else None

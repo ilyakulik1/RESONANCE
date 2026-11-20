@@ -241,10 +241,18 @@
 
       const meta = document.createElement("div");
       meta.className = "meta";
+      (Array.isArray(track.notes) ? track.notes : []).forEach((label) => {
+        const chip = document.createElement("span");
+        chip.className = "note-chip";
+        chip.textContent = String(label);
+        meta.appendChild(chip);
+      });
       const bits = [formatTime(track.duration_ms)];
       const bpm = formatBpm(track.bpm);
       if (bpm) bits.push(`${bpm} BPM`);
-      meta.textContent = bits.join(" · ");
+      const time = document.createElement("span");
+      time.textContent = bits.join(" · ");
+      meta.appendChild(time);
 
       const more = document.createElement("button");
       more.type = "button";

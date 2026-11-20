@@ -1,0 +1,201 @@
+/* Console mixer strips */
+
+QFrame#audioMixerPanel {
+    background-color: #121316;
+    border: none;
+}
+
+QScrollArea#mixerScroll {
+    background: transparent;
+    border: none;
+}
+
+QScrollArea#mixerScroll QWidget#mixerStripsHost {
+    background: transparent;
+}
+
+QFrame#mixerChannelStrip,
+QFrame#mixerMasterStrip,
+QFrame#mixerAddStrip {
+    background-color: #1c1e22;
+    border: 1px solid #2c2e34;
+    border-radius: 8px;
+}
+
+QFrame#mixerChannelStrip[channelKind="program"] {
+    border-top: 3px solid #3ec4d0;
+}
+
+QFrame#mixerChannelStrip[channelKind="sample"] {
+    border-top: 3px solid #e0a15a;
+}
+
+QFrame#mixerMasterStrip {
+    border-top: 3px solid #e2e2e4;
+    background-color: #191b1f;
+}
+
+QFrame#mixerAddStrip {
+    border-top: 3px solid #3a3c42;
+    background-color: #16181c;
+}
+
+QLabel#mixerStripName {
+    color: {{colors.text_primary}};
+    font-size: {{typography.size_xs}};
+    font-weight: 700;
+}
+
+QLabel#mixerKindBadge {
+    font-size: 8px;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 2px;
+}
+
+QLabel#mixerKindBadge[channelKind="program"] {
+    color: #9ee7ee;
+    background-color: #16343a;
+}
+
+QLabel#mixerKindBadge[channelKind="sample"] {
+    color: #f0d7a4;
+    background-color: #3a2e18;
+}
+
+QLabel#mixerTransportTime,
+QLabel#mixerLimLabel,
+QLabel#mixerSubName {
+    color: {{colors.text_muted}};
+    font-size: 8px;
+}
+
+QLabel#mixerTransportTime {
+    color: #f0d7a4;
+    font-family: {{typography.font_family_mono}};
+}
+
+QPushButton#mixerMuteBtn,
+QPushButton#mixerCueBtn,
+QPushButton#mixerStopBtn,
+QPushButton#mixerMasterEqBtn,
+QPushButton#mixerLimBypass,
+QPushButton#mixerAddBtn,
+QPushButton#mixerDeleteBtn {
+    min-width: 0;
+    min-height: 16px;
+    max-height: 18px;
+    padding: 0 4px;
+    border-radius: 2px;
+    border: 1px solid #3a3c42;
+    background-color: #2a2c31;
+    color: {{colors.text_secondary}};
+    font-size: 8px;
+    font-weight: 700;
+}
+
+QPushButton#mixerMuteBtn:hover,
+QPushButton#mixerCueBtn:hover,
+QPushButton#mixerStopBtn:hover,
+QPushButton#mixerMasterEqBtn:hover,
+QPushButton#mixerLimBypass:hover,
+QPushButton#mixerAddBtn:hover,
+QPushButton#mixerDeleteBtn:hover {
+    background-color: #3a3c44;
+}
+
+QPushButton#mixerMuteBtn:checked {
+    background-color: #c45c5c;
+    border-color: #e08a8a;
+    color: #1a1212;
+}
+
+QPushButton#mixerStopBtn:enabled {
+    color: #f3d0d0;
+}
+
+QPushButton#mixerCueBtn:disabled,
+QPushButton#mixerStopBtn:disabled,
+QPushButton#mixerAddBtn:disabled {
+    color: #5c5e66;
+    background-color: #222428;
+}
+
+QPushButton#mixerLimBypass:checked {
+    background-color: #3ecf7a;
+    border-color: #8ee7b0;
+    color: #102016;
+}
+
+QPushButton#mixerDeleteBtn {
+    min-width: 16px;
+    max-width: 22px;
+    padding: 0;
+    color: {{colors.text_muted}};
+}
+
+QSlider#stemFaderSlider[mixerCap="true"]::groove:vertical {
+    background: #0c0d10;
+    width: 6px;
+    border-radius: 3px;
+    border: 1px solid #2a2c30;
+}
+
+QSlider#stemFaderSlider[mixerCap="true"]::handle:vertical {
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+        stop:0 #f4f4f6, stop:0.42 #c6c6cc, stop:0.5 #7e8088, stop:1 #dedee2);
+    height: 22px;
+    width: 22px;
+    margin: 0 -8px;
+    border-radius: 2px;
+    border: 1px solid #5c5e66;
+}
+
+QSlider#stemFaderSlider[mixerCap="true"]::add-page:vertical,
+QSlider#stemFaderSlider[mixerCap="true"]::sub-page:vertical {
+    background: #0c0d10;
+    border-radius: 3px;
+}
+
+QSlider#mixerSampleSeek {
+    min-height: 12px;
+    max-height: 14px;
+}
+
+QSlider#mixerSampleSeek::groove:horizontal {
+    height: 4px;
+    background: #2a2c30;
+    border-radius: 2px;
+}
+
+QSlider#mixerSampleSeek::sub-page:horizontal {
+    background: #e0a15a;
+    border-radius: 2px;
+}
+
+QSlider#mixerSampleSeek::handle:horizontal {
+    width: 8px;
+    height: 10px;
+    margin: -4px 0;
+    background: #f2e2c4;
+    border-radius: 2px;
+}
+
+QSlider#mixerThrSlider::groove:horizontal {
+    height: 3px;
+    background: #2a2c30;
+    border-radius: 1px;
+}
+
+QSlider#mixerThrSlider::handle:horizontal {
+    width: 8px;
+    height: 10px;
+    margin: -4px 0;
+    background: #d0d0d4;
+    border-radius: 1px;
+}
+
+QSlider#mixerThrSlider::sub-page:horizontal {
+    background: #3ecf7a;
+    border-radius: 1px;
+}

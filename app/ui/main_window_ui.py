@@ -144,7 +144,7 @@ class MainWindowUi:
         window.audio_mixer_panel.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
         )
-        window.audio_mixer_panel.setMinimumHeight(0)
+        window.audio_mixer_panel.setMinimumHeight(230)
         window.audio_mixer_panel.setMaximumHeight(16777215)
 
         props_tabs = QTabWidget()

@@ -320,10 +320,24 @@ input[type="range"]::-webkit-slider-thumb {
 }
 
 .meta {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 4px;
   color: var(--muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   text-align: right;
+}
+
+.note-chip {
+  background: #2ad4ea;
+  color: #0c1218;
+  border-radius: 5px;
+  padding: 1px 5px;
+  font-size: 10px;
+  line-height: 14px;
+  white-space: nowrap;
 }
 
 .more {

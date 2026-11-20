@@ -20,9 +20,16 @@ STEMS_ROLE = Qt.ItemDataRole.UserRole + 7
 TRACK_ID_ROLE = Qt.ItemDataRole.UserRole + 8
 MIXER_SCENE_ROLE = Qt.ItemDataRole.UserRole + 9
 AUDIO_CHANNEL_ROLE = Qt.ItemDataRole.UserRole + 10
+NOTES_ROLE = Qt.ItemDataRole.UserRole + 11
 
 TRACKS_CLIPBOARD_MIME = "application/x-simpleaudioplayer-tracks"
 DEFAULT_PLACEHOLDER_NAME = "New Track"
+MAX_TRACK_NOTES = 8
+MAX_NOTE_CATALOG = 40
+NOTE_LABEL_MAX = 48
+
+# Cue marks shown on a playlist row, in menu order. Custom labels follow these.
+BUILTIN_TRACK_NOTES: tuple[str, ...] = ("с точки", "с выхода")
 
 # Preset mark colors for playlist tracks (stored as #RRGGBB).
 TRACK_COLOR_PRESETS: tuple[tuple[str, str], ...] = (
@@ -121,6 +128,9 @@ def item_to_snapshot(item: QListWidgetItem | None) -> dict | None:
         snapshot["lufs"] = lufs
     if item_has_stems(item):
         snapshot["stems"] = True
+    notes = get_item_notes(item)
+    if notes:
+        snapshot["notes"] = notes
     scene_id = get_item_mixer_scene_id(item)
     if scene_id:
         snapshot["mixer_scene_id"] = scene_id
@@ -137,6 +147,17 @@ def set_item_file_path(item: QListWidgetItem, file_path: str) -> None:
     path = os.path.abspath(file_path)
     item.setData(FILE_PATH_ROLE, path)
     item.setData(Qt.ItemDataRole.ToolTipRole, path)
+
+
+def clear_item_audio(item: QListWidgetItem) -> None:
+    """Drop the file from a row and leave the empty track in place."""
+    item.setData(FILE_PATH_ROLE, None)
+    item.setData(Qt.ItemDataRole.ToolTipRole, None)
+    set_item_file_missing(item, False)
+    set_item_duration(item, None)
+    set_item_bpm(item, None)
+    set_item_lufs(item, None)
+    set_item_has_stems(item, False)
 
 
 def get_item_file_path(item: QListWidgetItem | None) -> str | None:
@@ -277,6 +298,81 @@ def item_has_stems(item: QListWidgetItem | None) -> bool:
     if item is None:
         return False
     return bool(item.data(STEMS_ROLE))
+
+
+def normalize_note_label(value) -> str | None:
+    if value is None:
+        return None
+    text = " ".join(str(value).split())
+    if not text:
+        return None
+    if len(text) > NOTE_LABEL_MAX:
+        text = text[:NOTE_LABEL_MAX].rstrip()
+    return text or None
+
+
+def unique_notes(value, *, limit: int | None = None) -> list[str]:
+    """Ordered, case-insensitive unique note labels."""
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = [value]
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return []
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        label = normalize_note_label(item)
+        if label is None:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        result.append(label)
+        if limit is not None and len(result) >= limit:
+            break
+    return result
+
+
+def normalize_notes(value) -> list[str]:
+    return unique_notes(value, limit=MAX_TRACK_NOTES)
+
+
+def merge_note_catalog(labels) -> list[str]:
+    """Built-in cue marks first, then any extra labels."""
+    return unique_notes(
+        (*BUILTIN_TRACK_NOTES, *unique_notes(labels)),
+        limit=MAX_NOTE_CATALOG,
+    )
+
+
+def notes_contain(notes, label: str) -> bool:
+    key = str(label).casefold()
+    return any(note.casefold() == key for note in notes)
+
+
+def set_item_notes(item: QListWidgetItem, notes) -> None:
+    cleaned = normalize_notes(notes)
+    item.setData(NOTES_ROLE, cleaned or None)
+
+
+def get_item_notes(item: QListWidgetItem | None) -> list[str]:
+    if item is None:
+        return []
+    return normalize_notes(item.data(NOTES_ROLE))
+
+
+def _notes_from_entry(entry) -> list[str]:
+    if not isinstance(entry, dict):
+        return []
+    if "notes" in entry:
+        return normalize_notes(entry.get("notes"))
+    if "note" in entry:
+        return normalize_notes(entry.get("note"))
+    return []
 
 
 def _normalize_color(value: str | None) -> str | None:
@@ -456,6 +552,7 @@ def _parse_playlist_file(
             bool,
             str | None,
             bool,
+            list[str],
         ]
     ],
     int,
@@ -476,6 +573,7 @@ def _parse_playlist_file(
             bool,
             str | None,
             bool,
+            list[str],
         ]
     ] = []
     skipped = 0
@@ -483,9 +581,10 @@ def _parse_playlist_file(
         file_path, display_name, timeline, bpm, duration_ms, color, has_stems = (
             _parse_playlist_entry(entry)
         )
+        notes = _notes_from_entry(entry)
         if not file_path:
             parsed.append(
-                (None, display_name, timeline, bpm, duration_ms, False, color, has_stems)
+                (None, display_name, timeline, bpm, duration_ms, False, color, has_stems, notes)
             )
             continue
         resolved_path, exists = _resolve_file_path(file_path)
@@ -499,6 +598,7 @@ def _parse_playlist_file(
                 exists,
                 color,
                 has_stems,
+                notes,
             )
         )
     return parsed, skipped
@@ -543,6 +643,9 @@ def _playlist_item_to_entry(
             entry["color"] = color
         if item_has_stems(item):
             entry["stems"] = True
+        notes = get_item_notes(item)
+        if notes:
+            entry["notes"] = notes
         scene_id = get_item_mixer_scene_id(item)
         if scene_id:
             entry["mixer_scene_id"] = scene_id
@@ -572,6 +675,9 @@ def _playlist_item_to_entry(
         entry["color"] = color
     if item_has_stems(item):
         entry["stems"] = True
+    notes = get_item_notes(item)
+    if notes:
+        entry["notes"] = notes
     scene_id = get_item_mixer_scene_id(item)
     if scene_id:
         entry["mixer_scene_id"] = scene_id
@@ -644,6 +750,7 @@ def _add_placeholder_entry(
     lufs: float | None = None,
     mixer_scene_id: str | None = None,
     audio_channel_id: str | None = None,
+    notes: list[str] | None = None,
 ) -> None:
     item: QListWidgetItem | None = None
     if hasattr(playlist_widget, "add_placeholder_item"):
@@ -673,6 +780,8 @@ def _add_placeholder_entry(
         set_item_audio_channel_id(item, audio_channel_id)
     if has_stems:
         set_item_has_stems(item, True)
+    if notes:
+        set_item_notes(item, notes)
 
     if timeline_states is not None and timeline is not None:
         key = get_item_track_id(item)
@@ -696,6 +805,7 @@ def _add_playlist_entry(
     lufs: float | None = None,
     mixer_scene_id: str | None = None,
     audio_channel_id: str | None = None,
+    notes: list[str] | None = None,
 ) -> None:
     if file_exists is None:
         file_exists = os.path.isfile(file_path)
@@ -734,6 +844,8 @@ def _add_playlist_entry(
             set_item_audio_channel_id(item, audio_channel_id)
         if has_stems:
             set_item_has_stems(item, True)
+        if notes:
+            set_item_notes(item, notes)
 
     if timeline_states is not None and timeline is not None and item is not None:
         key = get_item_track_id(item) or os.path.abspath(file_path)
@@ -765,6 +877,7 @@ def load_playlist_from_file(
         exists,
         color,
         has_stems,
+        notes,
     ) in parsed:
         if not file_path:
             _add_placeholder_entry(
@@ -776,6 +889,7 @@ def load_playlist_from_file(
                 duration_ms=duration_ms,
                 color=color,
                 has_stems=has_stems,
+                notes=notes,
             )
             added += 1
             continue
@@ -790,6 +904,7 @@ def load_playlist_from_file(
             color=color,
             has_stems=has_stems,
             file_exists=exists,
+            notes=notes,
         )
         added += 1
         if not exists:
@@ -832,6 +947,7 @@ def load_playlist_from_entries(
                 lufs=_lufs_from_entry(entry),
                 mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
                 audio_channel_id=str(entry.get("audio_channel_id") or "").strip() or None,
+                notes=_notes_from_entry(entry),
             )
             added += 1
             continue
@@ -856,6 +972,7 @@ def load_playlist_from_entries(
             lufs=_lufs_from_entry(entry),
             mixer_scene_id=str(entry.get("mixer_scene_id") or "").strip() or None,
             audio_channel_id=str(entry.get("audio_channel_id") or "").strip() or None,
+            notes=_notes_from_entry(entry),
         )
         added += 1
         if not exists:

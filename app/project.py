@@ -31,7 +31,7 @@ from app.analysis_cache import (
 )
 from app.config import get_config_path
 from app.constants import MAX_PLAYLISTS
-from app.playlist_io import is_track_instance_id
+from app.playlist_io import is_track_instance_id, merge_note_catalog
 from app.stems import set_stems_dir
 
 PROJECT_FILENAME = "project.json"
@@ -224,6 +224,7 @@ class ProjectState:
     track_lufs: dict[str, float] = field(default_factory=dict)
     track_stems: dict[str, dict] = field(default_factory=dict)
     video_mixer: dict | None = None
+    note_labels: list[str] = field(default_factory=list)
 
     @property
     def playlists(self) -> list[ProjectPlaylistState]:
@@ -421,6 +422,7 @@ def _payload_from_state(state: ProjectState, root: Path, name: str) -> dict:
             if isinstance(state.video_mixer, dict)
             else None
         ),
+        "note_labels": merge_note_catalog(state.note_labels),
     }
 
 
@@ -678,6 +680,19 @@ def read_project_state(root: Path | str) -> ProjectState | None:
 
     columns_count = int(data.get("playlist_columns") or 2)
     columns_count = max(1, min(MAX_PLAYLISTS, columns_count))
+    harvested_notes: list = []
+    for column in columns:
+        for tab in column.tabs:
+            for track in tab.tracks:
+                raw_notes = track.get("notes") if isinstance(track, dict) else None
+                if isinstance(raw_notes, (list, tuple)):
+                    harvested_notes.extend(raw_notes)
+                elif isinstance(raw_notes, str):
+                    harvested_notes.append(raw_notes)
+    raw_labels = data.get("note_labels")
+    if not isinstance(raw_labels, (list, tuple)):
+        raw_labels = []
+    note_labels = merge_note_catalog([*raw_labels, *harvested_notes])
     return ProjectState(
         name=name,
         columns=columns,
@@ -687,6 +702,7 @@ def read_project_state(root: Path | str) -> ProjectState | None:
         track_lufs=track_lufs,
         track_stems=track_stems,
         video_mixer=video_mixer,
+        note_labels=note_labels,
     )
 
 

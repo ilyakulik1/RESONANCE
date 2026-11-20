@@ -5,6 +5,7 @@ import subprocess
 import sys
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from PyQt6.QtCore import Qt, QTimer, QUrl, QEvent, QPoint, QMimeData, pyqtSignal
@@ -23,7 +24,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow,
-    QFileDialog, QMessageBox, QAbstractItemView, QWidget,
+    QFileDialog, QInputDialog, QMessageBox, QAbstractItemView, QWidget,
     QProgressBar, QLabel, QMenu,
 )
 
@@ -42,12 +43,15 @@ from app.bpm_detector import BpmDetector
 from app.config import get_config_path
 from app.constants import (
     APP_NAME,
+    CHANNEL_KIND_PROGRAM,
+    CHANNEL_KIND_SAMPLE,
     FADE_PRESETS_MS,
     FADE_PRESET_SHORTCUTS,
     MAIN_CHANNEL_ID,
     MAX_AUX_CHANNELS,
     MAX_PLAYLISTS,
     fade_preset_label,
+    normalize_channel_kind,
 )
 from app.eq_dsp import (
     HIGH_CUT_Q_MAX,
@@ -87,7 +91,9 @@ from app.ui.tokens import get_token, get_token_int
 from app.ui.icon_loader import icon_size, load_icon
 from app.duration_prober import DurationProber
 from app.volume_fader import VolumeFader
+from app.playlist_history import EditHistory
 from app.playlist_io import (
+    BUILTIN_TRACK_NOTES,
     TRACK_COLOR_PRESETS,
     TRACKS_CLIPBOARD_MIME,
     ensure_item_track_id,
@@ -98,12 +104,16 @@ from app.playlist_io import (
     get_item_file_path,
     get_item_lufs,
     get_item_mixer_scene_id,
+    get_item_notes,
     get_item_track_id,
     is_track_instance_id,
     item_has_stems,
     item_to_snapshot,
     is_item_placeholder,
     load_playlist_from_entries,
+    merge_note_catalog,
+    normalize_note_label,
+    notes_contain,
     set_item_audio_channel_id,
     set_item_bpm,
     set_item_color,
@@ -111,6 +121,7 @@ from app.playlist_io import (
     set_item_has_stems,
     set_item_lufs,
     set_item_mixer_scene_id,
+    set_item_notes,
 )
 from app.project import (
     ProjectColumnState,
@@ -201,6 +212,7 @@ class AudioPlayer(QMainWindow):
                 "id": MAIN_CHANNEL_ID,
                 "name": "Main",
                 "is_main": True,
+                "kind": CHANNEL_KIND_PROGRAM,
                 "fader_db": 0.0,
                 "mute": False,
             }
@@ -208,6 +220,11 @@ class AudioPlayer(QMainWindow):
         self._aux_players: dict[str, PcmAirPlayer] = {}
         self._aux_channel_meta: dict[str, dict] = {}
         self._mixer_channel_counter = 1
+        # Which program strip each crossfade deck is currently feeding.
+        self._deck_channel_id = [MAIN_CHANNEL_ID, MAIN_CHANNEL_ID]
+        self._pending_program_channel_id = MAIN_CHANNEL_ID
+        self._program_item = None
+        self._program_playlist = None
         for air_player in self._players:
             air_player.set_external_mix(True)
         self._mix_bus.sampleRateChanged.connect(self._on_mix_bus_sample_rate)
@@ -235,6 +252,8 @@ class AudioPlayer(QMainWindow):
         self._track_eq_state: dict[str, dict] = {}
         self._track_lufs: dict[str, float] = {}
         self._track_stem_state: dict[str, TrackStemState] = {}
+        self._track_note_labels: list[str] = merge_note_catalog(None)
+        self._edit_history = EditHistory()
         self._eq_bound_path: str | None = None
         self._eq_bound_item = None
         self._displayed_track_key: str | None = None
@@ -443,6 +462,7 @@ class AudioPlayer(QMainWindow):
                     "id": c["id"],
                     "name": c["name"],
                     "is_main": bool(c.get("is_main")),
+                    "kind": normalize_channel_kind(c),
                     "fader_db": float(c.get("fader_db", 0.0)),
                     "mute": bool(c.get("mute", False)),
                 }
@@ -479,6 +499,7 @@ class AudioPlayer(QMainWindow):
                             "id": MAIN_CHANNEL_ID,
                             "name": str(entry.get("name") or "Main"),
                             "is_main": True,
+                            "kind": CHANNEL_KIND_PROGRAM,
                             "fader_db": float(entry.get("fader_db", 0.0)),
                             "mute": bool(entry.get("mute", False)),
                         }
@@ -486,16 +507,15 @@ class AudioPlayer(QMainWindow):
                     continue
                 if len([c for c in loaded if not c.get("is_main")]) >= MAX_AUX_CHANNELS:
                     continue
-                player = PcmAirPlayer(self)
-                player.set_external_mix(True)
-                player.set_mix_sample_rate(self._mix_bus.sample_rate())
-                player.audioOutput().setVolume(1.0)
-                self._aux_players[cid] = player
+                kind = normalize_channel_kind(entry)
+                if kind == CHANNEL_KIND_SAMPLE:
+                    self._aux_players[cid] = self._make_aux_player()
                 loaded.append(
                     {
                         "id": cid,
                         "name": str(entry.get("name") or cid),
                         "is_main": False,
+                        "kind": kind,
                         "fader_db": float(entry.get("fader_db", 0.0)),
                         "mute": bool(entry.get("mute", False)),
                     }
@@ -507,6 +527,7 @@ class AudioPlayer(QMainWindow):
                     "id": MAIN_CHANNEL_ID,
                     "name": "Main",
                     "is_main": True,
+                    "kind": CHANNEL_KIND_PROGRAM,
                     "fader_db": 0.0,
                     "mute": False,
                 },
@@ -536,27 +557,46 @@ class AudioPlayer(QMainWindow):
         if panel is not None:
             panel.set_peaks(peaks)
 
+    def _make_aux_player(self) -> PcmAirPlayer:
+        player = PcmAirPlayer(self)
+        player.set_external_mix(True)
+        player.set_mix_sample_rate(self._mix_bus.sample_rate())
+        player.audioOutput().setVolume(1.0)
+        return player
+
+    def _channel_info(self, channel_id: str) -> dict | None:
+        cid = str(channel_id or "")
+        return next((c for c in self._mixer_channels if c["id"] == cid), None)
+
+    def _is_sample_channel(self, channel_id: str) -> bool:
+        return normalize_channel_kind(self._channel_info(channel_id)) == CHANNEL_KIND_SAMPLE
+
+    def _is_program_channel(self, channel_id: str) -> bool:
+        info = self._channel_info(channel_id)
+        return info is not None and normalize_channel_kind(info) == CHANNEL_KIND_PROGRAM
+
     def _rebuild_mix_bus_channels(self) -> None:
         channels: list[MixBusChannel] = []
+        deck_owner = list(getattr(self, "_deck_channel_id", None) or [MAIN_CHANNEL_ID, MAIN_CHANNEL_ID])
         for info in self._mixer_channels:
             cid = str(info["id"])
-            if info.get("is_main"):
-                sources = [
-                    (
-                        self._players[0].read_float_interleaved,
-                        self._outputs[0].effective_volume,
-                    ),
-                    (
-                        self._players[1].read_float_interleaved,
-                        self._outputs[1].effective_volume,
-                    ),
-                ]
+            kind = normalize_channel_kind(info)
+            sources = []
+            if kind == CHANNEL_KIND_PROGRAM:
+                for idx, player in enumerate(self._players):
+                    if idx < len(deck_owner) and deck_owner[idx] == cid:
+                        sources.append(
+                            (
+                                player.read_float_interleaved,
+                                self._outputs[idx].effective_volume,
+                            )
+                        )
             else:
                 player = self._aux_players.get(cid)
                 if player is None:
                     continue
                 out = player.audioOutput()
-                sources = [(player.read_float_interleaved, out.effective_volume)]
+                sources.append((player.read_float_interleaved, out.effective_volume))
             channels.append(
                 MixBusChannel(
                     channel_id=cid,
@@ -583,7 +623,12 @@ class AudioPlayer(QMainWindow):
             return cid
         return MAIN_CHANNEL_ID
 
-    def add_mixer_channel(self) -> str | None:
+    def add_mixer_channel(self, kind: str = CHANNEL_KIND_SAMPLE) -> str | None:
+        kind = (
+            CHANNEL_KIND_PROGRAM
+            if str(kind) == CHANNEL_KIND_PROGRAM
+            else CHANNEL_KIND_SAMPLE
+        )
         aux_count = sum(1 for c in self._mixer_channels if not c.get("is_main"))
         if aux_count >= MAX_AUX_CHANNELS:
             return None
@@ -592,17 +637,17 @@ class AudioPlayer(QMainWindow):
         while cid in self._known_mixer_channel_ids():
             self._mixer_channel_counter += 1
             cid = f"ch{self._mixer_channel_counter}"
-        name = f"Ch {self._mixer_channel_counter}"
-        player = PcmAirPlayer(self)
-        player.set_external_mix(True)
-        player.set_mix_sample_rate(self._mix_bus.sample_rate())
-        player.audioOutput().setVolume(1.0)
-        self._aux_players[cid] = player
+        if kind == CHANNEL_KIND_PROGRAM:
+            name = f"PGM {self._mixer_channel_counter}"
+        else:
+            name = f"SMP {self._mixer_channel_counter}"
+            self._aux_players[cid] = self._make_aux_player()
         self._mixer_channels.append(
             {
                 "id": cid,
                 "name": name,
                 "is_main": False,
+                "kind": kind,
                 "fader_db": 0.0,
                 "mute": False,
             }
@@ -613,6 +658,38 @@ class AudioPlayer(QMainWindow):
         self.save_config()
         return cid
 
+    def set_mixer_channel_kind(self, channel_id: str, kind: str) -> None:
+        cid = str(channel_id or "").strip()
+        info = self._channel_info(cid)
+        if info is None or info.get("is_main"):
+            return
+        kind = (
+            CHANNEL_KIND_PROGRAM
+            if str(kind) == CHANNEL_KIND_PROGRAM
+            else CHANNEL_KIND_SAMPLE
+        )
+        if normalize_channel_kind(info) == kind:
+            return
+        info["kind"] = kind
+        if kind == CHANNEL_KIND_SAMPLE:
+            for idx, assigned in enumerate(self._deck_channel_id):
+                if assigned == cid:
+                    self._deck_channel_id[idx] = MAIN_CHANNEL_ID
+            if cid not in self._aux_players:
+                self._aux_players[cid] = self._make_aux_player()
+        else:
+            self._stop_sample_channel(cid)
+            player = self._aux_players.pop(cid, None)
+            if player is not None:
+                try:
+                    player.stop()
+                except Exception:
+                    pass
+                player.deleteLater()
+        self._rebuild_mix_bus_channels()
+        self._refresh_mixer_panel()
+        self.save_config()
+
     def remove_mixer_channel(self, channel_id: str) -> None:
         cid = str(channel_id or "").strip()
         if not cid or cid == MAIN_CHANNEL_ID:
@@ -620,6 +697,7 @@ class AudioPlayer(QMainWindow):
         info = next((c for c in self._mixer_channels if c["id"] == cid), None)
         if info is None or info.get("is_main"):
             return
+        self._stop_sample_channel(cid)
         player = self._aux_players.pop(cid, None)
         if player is not None:
             try:
@@ -627,6 +705,9 @@ class AudioPlayer(QMainWindow):
             except Exception:
                 pass
             player.deleteLater()
+        for idx, assigned in enumerate(self._deck_channel_id):
+            if assigned == cid:
+                self._deck_channel_id[idx] = MAIN_CHANNEL_ID
         self._aux_channel_meta.pop(cid, None)
         self._mixer_channels = [c for c in self._mixer_channels if c["id"] != cid]
         self._rebuild_mix_bus_channels()
@@ -646,6 +727,20 @@ class AudioPlayer(QMainWindow):
                     set_item_audio_channel_id(
                         item, None if new_id == MAIN_CHANNEL_ID else new_id
                     )
+
+    def rename_mixer_channel(self, channel_id: str, name: str) -> None:
+        info = self._channel_info(channel_id)
+        if info is None:
+            return
+        cleaned = " ".join(str(name or "").split())[:32]
+        if not cleaned or cleaned == str(info.get("name") or ""):
+            return
+        info["name"] = cleaned
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is not None:
+            panel.set_channel_name(channel_id, cleaned)
+        self._refresh_aux_playlist_overlays(relayout=False)
+        self.save_config()
 
     def _set_mixer_channel_fader(self, channel_id: str, fader_db: float) -> None:
         for info in self._mixer_channels:
@@ -680,6 +775,7 @@ class AudioPlayer(QMainWindow):
             threshold=self._mix_bus.limiter.threshold,
         )
         self._sync_mixer_midi_labels()
+        self._sync_mixer_transport()
 
     def _stop_all_aux_channels(self) -> None:
         for player in self._aux_players.values():
@@ -689,6 +785,7 @@ class AudioPlayer(QMainWindow):
                 pass
         self._aux_channel_meta.clear()
         self._refresh_aux_playlist_overlays(relayout=True)
+        self._sync_mixer_transport()
 
     def _apply_item_dsp_to_player(self, player: PcmAirPlayer, item, file_path: str) -> None:
         if item is not None:
@@ -889,6 +986,8 @@ class AudioPlayer(QMainWindow):
             if isinstance(timeline, TimelineState):
                 range_end = int(timeline.range_end_ms or 0)
                 self._apply_aux_timeline_volume(cid)
+            if meta.get("_scrubbing"):
+                continue
             effective_end = range_end if range_end > 0 else player_dur
             # MP3 container duration can exceed decoded PCM — allow a small slack.
             if effective_end > 0 and position >= max(0, effective_end - 40):
@@ -927,6 +1026,138 @@ class AudioPlayer(QMainWindow):
             return
         self._aux_channel_meta.pop(cid, None)
         self._refresh_aux_playlist_overlays(relayout=True)
+        self._sync_mixer_transport()
+
+    def _sample_span(self, channel_id: str) -> tuple[int, int]:
+        """Absolute start and end (ms) of the sample's trimmed region."""
+        player = self._aux_players.get(channel_id)
+        meta = self._aux_channel_meta.get(channel_id)
+        if player is None or meta is None:
+            return 0, 0
+        start = 0
+        end = int(player.duration() or 0)
+        timeline = meta.get("timeline")
+        if isinstance(timeline, TimelineState):
+            start = max(0, int(timeline.range_start_ms or 0))
+            range_end = int(timeline.range_end_ms or 0)
+            if range_end > start:
+                end = range_end
+        if end <= start:
+            item = meta.get("item")
+            probed = int(get_item_duration(item) or 0) if item is not None else 0
+            if probed > start:
+                end = probed
+        return start, max(start, end)
+
+    def _sample_title(self, meta: dict) -> str:
+        item = meta.get("item")
+        if item is not None:
+            text = str(item.text() or "").strip()
+            if text:
+                return text
+        path = str(meta.get("path") or "")
+        return os.path.basename(path) if path else ""
+
+    def stop_sample_channel(self, channel_id: str) -> None:
+        self._stop_sample_channel(channel_id)
+
+    def _stop_sample_channel(self, channel_id: str) -> None:
+        cid = str(channel_id or "").strip()
+        player = self._aux_players.get(cid)
+        if player is not None:
+            try:
+                player.stop()
+            except Exception:
+                pass
+        self._clear_aux_channel_overlay(cid)
+
+    def rewind_sample_channel(self, channel_id: str) -> None:
+        start, _end = self._sample_span(channel_id)
+        self.seek_sample_channel(channel_id, start, scrubbing=False)
+
+    def _seek_sample_relative(self, channel_id: str, relative_ms: int) -> None:
+        start, _end = self._sample_span(channel_id)
+        scrubbing = False
+        panel = getattr(self, "audio_mixer_panel", None)
+        strips = getattr(panel, "_strips", None) if panel is not None else None
+        strip = strips.get(channel_id) if isinstance(strips, dict) else None
+        if strip is not None:
+            scrubbing = bool(getattr(strip, "_scrubbing", False))
+        self.seek_sample_channel(
+            channel_id, start + int(relative_ms), scrubbing=scrubbing
+        )
+
+    def seek_sample_channel(
+        self, channel_id: str, position_ms: int, *, scrubbing: bool = False
+    ) -> None:
+        cid = str(channel_id or "").strip()
+        player = self._aux_players.get(cid)
+        meta = self._aux_channel_meta.get(cid)
+        if player is None or meta is None:
+            return
+        if player.playbackState() != QMediaPlayer.PlaybackState.PlayingState:
+            return
+        start, end = self._sample_span(cid)
+        if end <= start:
+            return
+        pos = max(start, min(int(position_ms), max(start, end - 1)))
+        meta["_scrubbing"] = bool(scrubbing)
+        meta["_stall_ticks"] = 0
+        meta["_stall_pos"] = None
+        player.setPosition(pos)
+        self._apply_aux_timeline_volume(cid)
+        self._sync_mixer_transport()
+        self._refresh_aux_playlist_overlays(relayout=False)
+
+    def _seek_sample_item(self, item, ratio: float, scrubbing: bool = False) -> None:
+        if item is None:
+            return
+        ratio = max(0.0, min(1.0, float(ratio)))
+        for cid, meta in self._aux_channel_meta.items():
+            if meta.get("item") is not item:
+                continue
+            start, end = self._sample_span(cid)
+            span = max(0, end - start)
+            self.seek_sample_channel(cid, int(start + ratio * span), scrubbing=scrubbing)
+            return
+
+    def _sync_mixer_transport(self) -> None:
+        panel = getattr(self, "audio_mixer_panel", None)
+        if panel is None:
+            return
+        live = set(self._aux_channel_meta)
+        for cid in panel.strip_ids():
+            meta = self._aux_channel_meta.get(cid)
+            if meta is None:
+                if cid in getattr(self, "_mixer_transport_live", set()) or cid in live:
+                    panel.set_channel_transport(
+                        cid, playing=False, position_ms=0, duration_ms=0, title=""
+                    )
+                continue
+            player = self._aux_players.get(cid)
+            if player is None:
+                continue
+            start, end = self._sample_span(cid)
+            rel_dur = max(0, end - start)
+            rel_pos = max(0, min(rel_dur, int(player.position()) - start))
+            panel.set_channel_transport(
+                cid,
+                playing=True,
+                position_ms=rel_pos,
+                duration_ms=rel_dur,
+                title=self._sample_title(meta),
+            )
+        self._mixer_transport_live = set(live)
+        on_air: set[str] = set()
+        for idx, assigned in enumerate(self._deck_channel_id):
+            if (
+                self._players[idx].playbackState()
+                == QMediaPlayer.PlaybackState.PlayingState
+            ):
+                on_air.add(assigned)
+        if on_air != getattr(self, "_mixer_on_air_ids", None):
+            self._mixer_on_air_ids = set(on_air)
+            panel.set_program_on_air(on_air)
 
     def _stop_aux_playback_for_item(self, item) -> bool:
         """Stop any aux one-shot for this playlist item and hide its mini-wave."""
@@ -984,6 +1215,8 @@ class AudioPlayer(QMainWindow):
                 item = meta.get("item")
                 if item is not None:
                     duration = int(get_item_duration(item) or 0)
+            if meta.get("_scrubbing"):
+                continue
             position = int(player.position())
             if duration > 0 and position >= max(0, duration - 40):
                 finished.append(cid)
@@ -1103,6 +1336,7 @@ class AudioPlayer(QMainWindow):
                 fade_out_ms=int(timeline.fade_out_ms or 0),
             )
         self._refresh_aux_playlist_overlays(relayout=True)
+        self._sync_mixer_transport()
         return True
 
     def _apply_preview_output_volume(self, volume: float) -> None:
@@ -1740,6 +1974,11 @@ class AudioPlayer(QMainWindow):
 
         vp_pos = target_playlist.viewport().mapFromGlobal(QCursor.pos())
         target_item = target_playlist.itemAt(vp_pos)
+        with self.playlist_edit():
+            self._drop_audio_on_playlist(event, target_playlist, target_item)
+        return
+
+    def _drop_audio_on_playlist(self, event: QDropEvent, target_playlist, target_item) -> None:
         if target_item is not None and is_item_placeholder(target_item):
             assigned = False
             for url in event.mimeData().urls():
@@ -1775,10 +2014,22 @@ class AudioPlayer(QMainWindow):
         panel = getattr(self, "audio_mixer_panel", None)
         if panel is None:
             return
-        panel.addChannelRequested.connect(self.add_mixer_channel)
+        panel.addProgramRequested.connect(
+            lambda: self.add_mixer_channel(CHANNEL_KIND_PROGRAM)
+        )
+        panel.addSampleRequested.connect(
+            lambda: self.add_mixer_channel(CHANNEL_KIND_SAMPLE)
+        )
         panel.removeChannelRequested.connect(self.remove_mixer_channel)
+        panel.channelRenameRequested.connect(self.rename_mixer_channel)
+        panel.channelKindRequested.connect(self.set_mixer_channel_kind)
         panel.channelFaderChanged.connect(self._set_mixer_channel_fader)
         panel.channelMuteChanged.connect(self._set_mixer_channel_mute)
+        panel.sampleStopRequested.connect(self.stop_sample_channel)
+        panel.sampleRewindRequested.connect(self.rewind_sample_channel)
+        panel.sampleSeekRequested.connect(
+            lambda cid, rel_ms: self._seek_sample_relative(cid, rel_ms)
+        )
         panel.masterVolumeChanged.connect(self._on_mixer_master_volume)
         panel.limiterBypassChanged.connect(self._on_limiter_bypass)
         panel.limiterThresholdChanged.connect(self._on_limiter_threshold)
@@ -2179,6 +2430,8 @@ class AudioPlayer(QMainWindow):
                 set_item_has_stems(item, True)
         elif snapshot.get("stems"):
             set_item_has_stems(item, True)
+        if snapshot.get("notes"):
+            set_item_notes(item, snapshot.get("notes"))
         if snapshot.get("mixer_scene_id"):
             set_item_mixer_scene_id(item, str(snapshot.get("mixer_scene_id")))
 
@@ -2704,6 +2957,12 @@ class AudioPlayer(QMainWindow):
             return
         from app.stems import is_readable_stem_wav
 
+        with self.playlist_edit():
+            self._store_separated_stems(item, file_path, paths)
+
+    def _store_separated_stems(self, item, file_path: str, paths) -> None:
+        from app.stems import is_readable_stem_wav
+
         if not (
             is_readable_stem_wav(paths.vocals) and is_readable_stem_wav(paths.instrumental)
         ):
@@ -2869,6 +3128,16 @@ class AudioPlayer(QMainWindow):
             playlist.trackContextMenuRequested.connect(
                 self._on_playlist_track_context_menu
             )
+            try:
+                playlist.auxSeekRequested.disconnect(self._seek_sample_item)
+            except TypeError:
+                pass
+            playlist.auxSeekRequested.connect(self._seek_sample_item)
+            try:
+                playlist.auxStopRequested.disconnect(self._stop_aux_playback_for_item)
+            except TypeError:
+                pass
+            playlist.auxStopRequested.connect(self._stop_aux_playback_for_item)
         self._wire_playlist_aux_overlays()
 
     def _on_playlist_file_imported(self, item, file_path: str) -> None:
@@ -3105,42 +3374,43 @@ class AudioPlayer(QMainWindow):
         insert_at = playlist.currentRow() + 1 if playlist.currentRow() >= 0 else playlist.count()
         insert_at = max(0, min(insert_at, playlist.count()))
         inserted = []
-        for snapshot in tracks:
-            if not isinstance(snapshot, dict):
-                continue
-            file_path = str(snapshot.get("path") or "").strip()
-            if not file_path:
-                item = playlist.add_placeholder_item(
+        with self.playlist_edit():
+            for snapshot in tracks:
+                if not isinstance(snapshot, dict):
+                    continue
+                file_path = str(snapshot.get("path") or "").strip()
+                if not file_path:
+                    item = playlist.add_placeholder_item(
+                        display_name=str(snapshot.get("name") or "").strip() or None,
+                        row=insert_at,
+                    )
+                    insert_at += 1
+                    self._apply_snapshot_settings(item, snapshot)
+                    inserted.append(item)
+                    continue
+                item = playlist.add_item_with_path(
+                    file_path,
                     display_name=str(snapshot.get("name") or "").strip() or None,
+                    load_duration=snapshot.get("duration_ms") is None,
+                    file_exists=os.path.isfile(file_path),
                     row=insert_at,
                 )
                 insert_at += 1
+                if snapshot.get("duration_ms") is not None:
+                    try:
+                        set_item_duration(item, int(snapshot["duration_ms"]))
+                    except (TypeError, ValueError):
+                        pass
                 self._apply_snapshot_settings(item, snapshot)
                 inserted.append(item)
-                continue
-            item = playlist.add_item_with_path(
-                file_path,
-                display_name=str(snapshot.get("name") or "").strip() or None,
-                load_duration=snapshot.get("duration_ms") is None,
-                file_exists=os.path.isfile(file_path),
-                row=insert_at,
-            )
-            insert_at += 1
-            if snapshot.get("duration_ms") is not None:
-                try:
-                    set_item_duration(item, int(snapshot["duration_ms"]))
-                except (TypeError, ValueError):
-                    pass
-            self._apply_snapshot_settings(item, snapshot)
-            inserted.append(item)
-            playlist.fileImported.emit(item, os.path.abspath(file_path))
-        if not inserted:
-            return
-        playlist._select_items(inserted)
-        self.last_selected_playlist = playlist.playlist_num
-        self.load_preview_track(playlist.playlist_num, inserted[-1])
-        self.refresh_playlist_footer(playlist)
-        self.save_project()
+                playlist.fileImported.emit(item, os.path.abspath(file_path))
+            if not inserted:
+                return
+            playlist._select_items(inserted)
+            self.last_selected_playlist = playlist.playlist_num
+            self.load_preview_track(playlist.playlist_num, inserted[-1])
+            self.refresh_playlist_footer(playlist)
+            self.save_project()
 
     def show_project_manager(self) -> None:
         if self._browser_collapsed:
@@ -3172,7 +3442,14 @@ class AudioPlayer(QMainWindow):
         if not tracks and not created_tab:
             return
 
-        inserted, skipped = self._insert_library_tracks(target, tracks, row)
+        with self.playlist_edit():
+            if created_tab:
+                target = created
+            inserted, skipped = self._insert_library_tracks(target, tracks, row)
+            self._finish_library_import(target, inserted, skipped, created_tab)
+        return
+
+    def _finish_library_import(self, target, inserted, skipped, created_tab) -> None:
         if not inserted and not created_tab:
             self.statusBar().showMessage("Nothing added — source files are missing.", 4000)
             return
@@ -3671,6 +3948,11 @@ class AudioPlayer(QMainWindow):
         start_ms: int | None = None,
     ) -> None:
         incoming_idx = 1 - self._active_player_idx
+        target = self._pending_program_channel_id or self._deck_channel_id[self._active_player_idx]
+        if not self._is_program_channel(target):
+            target = MAIN_CHANNEL_ID
+        self._deck_channel_id[incoming_idx] = target
+        self._rebuild_mix_bus_channels()
         self._crossfade_active = True
         self._high_cut_active = False
         self._crossfade_fade_in_ms = max(1, fade_ms)
@@ -3757,7 +4039,19 @@ class AudioPlayer(QMainWindow):
             self.waveform.set_position(self._pending_start_ms)
         self._try_begin_pending_playback()
 
+    def _remember_program_identity(self) -> None:
+        self._program_item = self.current_playing_item
+        self._program_playlist = self.current_playing_playlist
+
+    def _assign_active_program_deck(self) -> None:
+        target = self._pending_program_channel_id or MAIN_CHANNEL_ID
+        if not self._is_program_channel(target):
+            target = MAIN_CHANNEL_ID
+        self._deck_channel_id[self._active_player_idx] = target
+        self._rebuild_mix_bus_channels()
+
     def _prepare_incoming_track(self, file_path: str, abs_path: str) -> None:
+        self._remember_program_identity()
         next_key = self._adopt_item_settings(self.current_playing_item)
         is_new_track = (
             self._displayed_track_key != next_key
@@ -4211,6 +4505,7 @@ class AudioPlayer(QMainWindow):
 
     def _setup_menus(self) -> None:
         self._setup_project_menu()
+        self._setup_edit_menu()
         self._setup_view_menu()
         self._setup_midi_menu()
         self._setup_remote_menu()
@@ -4237,6 +4532,35 @@ class AudioPlayer(QMainWindow):
         act_library = QAction("Project Manager", self)
         act_library.triggered.connect(self.show_project_manager)
         menu.addAction(act_library)
+
+    def _setup_edit_menu(self) -> None:
+        menu = self.menuBar().addMenu("Edit")
+        menu.aboutToShow.connect(self._sync_edit_menu_actions)
+        self._act_undo = QAction("Undo", self)
+        self._act_undo.setShortcuts(
+            [QKeySequence(QKeySequence.StandardKey.Undo), QKeySequence("Ctrl+Z")]
+        )
+        self._act_undo.triggered.connect(self.undo_playlist_edit)
+        menu.addAction(self._act_undo)
+        self._act_redo = QAction("Redo", self)
+        self._act_redo.setShortcuts(
+            [
+                QKeySequence(QKeySequence.StandardKey.Redo),
+                QKeySequence("Ctrl+Shift+Z"),
+            ]
+        )
+        self._act_redo.triggered.connect(self.redo_playlist_edit)
+        menu.addAction(self._act_redo)
+
+    def _sync_edit_menu_actions(self) -> None:
+        history = getattr(self, "_edit_history", None)
+        can_undo = bool(history and history.can_undo())
+        can_redo = bool(history and history.can_redo())
+        if self._text_input_focused() or self._is_editing_playlist():
+            can_undo = True
+            can_redo = True
+        self._act_undo.setEnabled(can_undo)
+        self._act_redo.setEnabled(can_redo)
 
     def _setup_view_menu(self) -> None:
         menu = self.menuBar().addMenu("View")
@@ -4783,6 +5107,414 @@ class AudioPlayer(QMainWindow):
     def _show_about_dialog(self) -> None:
         show_about_dialog(self)
 
+    @contextmanager
+    def playlist_edit(self):
+        """Record one playlist edit so Ctrl+Z can restore the previous state."""
+        history = getattr(self, "_edit_history", None)
+        if history is None or history.locked:
+            yield
+            return
+        history.begin(self._capture_edit_snapshot)
+        try:
+            yield
+        finally:
+            history.end(self._capture_edit_snapshot)
+
+    def _begin_playlist_edit(self) -> None:
+        history = getattr(self, "_edit_history", None)
+        if history is not None:
+            history.begin(self._capture_edit_snapshot)
+
+    def _end_playlist_edit(self) -> None:
+        history = getattr(self, "_edit_history", None)
+        if history is not None:
+            history.end(self._capture_edit_snapshot)
+
+    def _capture_edit_snapshot(self) -> dict:
+        if hasattr(self, "_save_current_timeline_state"):
+            self._save_current_timeline_state()
+        columns = []
+        for column in getattr(self, "playlist_columns", []) or []:
+            state = column.collect_column_state()
+            columns.append(
+                {
+                    "active_tab": int(state.active_tab),
+                    "tabs": [
+                        {
+                            "title": tab.title,
+                            "font_size": int(tab.font_size or 13),
+                            "tracks": copy.deepcopy(tab.tracks),
+                        }
+                        for tab in state.tabs
+                    ],
+                }
+            )
+        selected: list[str] = []
+        current_id = None
+        focused = self._focused_playlist() if hasattr(self, "playlists") else None
+        if focused is not None and focused.currentItem() is not None:
+            current_id = get_item_track_id(focused.currentItem())
+        for playlist in getattr(self, "playlists", []) or []:
+            for item in playlist.selected_track_items():
+                track_id = get_item_track_id(item)
+                if track_id:
+                    selected.append(track_id)
+        aux_ids = {}
+        for channel_id, meta in getattr(self, "_aux_channel_meta", {}).items():
+            track_id = get_item_track_id(meta.get("item"))
+            if track_id:
+                aux_ids[str(channel_id)] = track_id
+        return {
+            "columns": columns,
+            "track_timelines": {
+                key: self._timeline_state_to_dict(value)
+                for key, value in self._track_timeline_state.items()
+            },
+            "track_eq": copy.deepcopy(self._track_eq_state),
+            "track_lufs": {
+                key: float(value) for key, value in self._track_lufs.items()
+            },
+            "track_stems": {
+                key: state.to_dict() for key, state in self._track_stem_state.items()
+            },
+            "note_labels": list(self._track_note_labels),
+            "selected_ids": selected,
+            "current_id": current_id,
+            "playing_id": get_item_track_id(self.current_playing_item),
+            "preview_id": get_item_track_id(getattr(self, "_preview_item", None)),
+            "aux_ids": aux_ids,
+        }
+
+    def _find_track_item(self, track_id: str | None):
+        if not track_id:
+            return None, None
+        for playlist in getattr(self, "playlists", []) or []:
+            for row in range(playlist.count()):
+                item = playlist.item(row)
+                if get_item_track_id(item) == track_id:
+                    return playlist, item
+        return None, None
+
+    def _restore_edit_snapshot(self, snap: dict) -> None:
+        history = self._edit_history
+        history.locked = True
+        try:
+            from PyQt6.QtMultimedia import QMediaPlayer as _QMP
+
+            playing_state = (
+                self.player.playbackState() if hasattr(self, "player") else None
+            )
+            live_playing_id = get_item_track_id(self.current_playing_item)
+            live_path = self._current_file_path
+            displayed_preview_key = getattr(self, "_preview_displayed_track_key", None)
+            live_aux = {
+                str(channel_id): get_item_track_id(meta.get("item"))
+                for channel_id, meta in getattr(self, "_aux_channel_meta", {}).items()
+            }
+
+            self._track_timeline_state = {
+                key: self._timeline_state_from_dict(data)
+                for key, data in (snap.get("track_timelines") or {}).items()
+                if isinstance(data, dict)
+            }
+            self._track_eq_state = copy.deepcopy(snap.get("track_eq") or {})
+            self._track_lufs = {
+                key: float(value)
+                for key, value in (snap.get("track_lufs") or {}).items()
+                if isinstance(value, (int, float))
+            }
+            self._track_stem_state = {}
+            for key, data in (snap.get("track_stems") or {}).items():
+                stem = TrackStemState.from_dict(data if isinstance(data, dict) else None)
+                if stem is not None:
+                    self._track_stem_state[key] = stem
+            self._track_note_labels = merge_note_catalog(snap.get("note_labels"))
+
+            columns = getattr(self, "playlist_columns", []) or []
+            plain_columns = snap.get("columns") or []
+            for index, column in enumerate(columns):
+                plain = plain_columns[index] if index < len(plain_columns) else {}
+                tabs = [
+                    ProjectPlaylistState(
+                        title=str(tab.get("title") or ""),
+                        font_size=int(tab.get("font_size") or 13),
+                        tracks=copy.deepcopy(tab.get("tracks") or []),
+                    )
+                    for tab in (plain.get("tabs") or [])
+                    if isinstance(tab, dict)
+                ]
+                column.load_column_state(
+                    ProjectColumnState(
+                        tabs=tabs or [ProjectPlaylistState()],
+                        active_tab=int(plain.get("active_tab") or 0),
+                    )
+                )
+
+            self._rebuild_playlist_registry()
+            self._adopt_all_playlist_settings()
+            self._mark_playlist_stems_badges()
+            self._apply_restored_selection(snap)
+            self._rebind_after_playlist_restore(
+                live_playing_id,
+                live_path,
+                playing_state == _QMP.PlaybackState.PlayingState,
+                displayed_preview_key,
+                live_aux,
+                snap,
+            )
+            for playlist in self.playlists:
+                self.refresh_playlist_footer(playlist)
+            if not self.project.is_untitled():
+                self.save_project()
+            self.save_config()
+        finally:
+            history.locked = False
+
+    def _apply_restored_selection(self, snap: dict) -> None:
+        selected = set(snap.get("selected_ids") or [])
+        current_id = snap.get("current_id")
+        for playlist in self.playlists:
+            playlist.blockSignals(True)
+            playlist.clearSelection()
+            current = None
+            for row in range(playlist.count()):
+                item = playlist.item(row)
+                track_id = get_item_track_id(item)
+                if track_id in selected:
+                    item.setSelected(True)
+                if current_id and track_id == current_id:
+                    current = item
+            if current is not None:
+                playlist.setCurrentItem(current)
+                self.last_selected_playlist = playlist.playlist_num
+            playlist.blockSignals(False)
+            playlist.viewport().update()
+
+    def _rebind_after_playlist_restore(
+        self,
+        live_playing_id,
+        live_path,
+        was_playing: bool,
+        displayed_preview_key,
+        live_aux: dict,
+        snap: dict,
+    ) -> None:
+        self.current_playing_item = None
+        if was_playing and live_playing_id and live_path:
+            playlist, item = self._find_track_item(live_playing_id)
+            path = get_item_file_path(item)
+            if (
+                item is not None
+                and playlist is not None
+                and path
+                and os.path.abspath(path) == os.path.abspath(live_path)
+            ):
+                self.current_playing_item = item
+                self.current_playing_playlist = playlist.playlist_num
+
+        for channel_id, track_id in live_aux.items():
+            meta = self._aux_channel_meta.get(channel_id)
+            if meta is None:
+                continue
+            _playlist, item = self._find_track_item(track_id)
+            if item is not None:
+                meta["item"] = item
+            else:
+                self._clear_aux_channel_overlay(channel_id)
+
+        preview_id = snap.get("preview_id")
+        playlist, item = self._find_track_item(preview_id)
+        if item is None:
+            if getattr(self, "_preview_item", None) is not None or getattr(
+                self, "_preview_file_path", None
+            ):
+                self._clear_preview_deck()
+            return
+        self._preview_item = item
+        self._preview_playlist_num = playlist.playlist_num
+        if get_item_track_id(item) != displayed_preview_key:
+            self.load_preview_track(playlist.playlist_num, item)
+
+    def _text_history_shortcut(self, method: str) -> bool:
+        if not (self._text_input_focused() or self._is_editing_playlist()):
+            return False
+        focused = QApplication.focusWidget()
+        action = getattr(focused, method, None)
+        if callable(action):
+            action()
+        return True
+
+    def undo_playlist_edit(self) -> None:
+        if self._text_history_shortcut("undo"):
+            return
+        history = self._edit_history
+        if history.depth or history.locked:
+            return
+        previous = history.pop_undo(self._capture_edit_snapshot())
+        if previous is None:
+            self.statusBar().showMessage("Nothing to undo", 2000)
+            return
+        self._restore_edit_snapshot(previous)
+        self.statusBar().showMessage("Undone", 2000)
+
+    def redo_playlist_edit(self) -> None:
+        if self._text_history_shortcut("redo"):
+            return
+        history = self._edit_history
+        if history.depth or history.locked:
+            return
+        nxt = history.pop_redo(self._capture_edit_snapshot())
+        if nxt is None:
+            self.statusBar().showMessage("Nothing to redo", 2000)
+            return
+        self._restore_edit_snapshot(nxt)
+        self.statusBar().showMessage("Redone", 2000)
+
+    def _drop_track_instance_settings(self, item) -> None:
+        track_id = get_item_track_id(item)
+        if not track_id:
+            return
+        self._track_timeline_state.pop(track_id, None)
+        self._track_eq_state.pop(track_id, None)
+        self._track_stem_state.pop(track_id, None)
+
+    def remove_audio_from_tracks(self, playlist: PlaylistWidget, targets) -> None:
+        actionable = [
+            item
+            for item in targets
+            if item is not None and not is_item_placeholder(item)
+        ]
+        if not actionable:
+            return
+        with self.playlist_edit():
+            preview_cleared = False
+            for item in actionable:
+                if item is self.current_playing_item:
+                    self._clear_air_deck()
+                self._stop_aux_playback_for_item(item)
+                if item is getattr(self, "_preview_item", None):
+                    preview_cleared = True
+                playlist.clear_item_audio(item)
+                self._drop_track_instance_settings(item)
+            if preview_cleared:
+                current = playlist.currentItem()
+                if current is not None:
+                    self.load_preview_track(playlist.playlist_num, current)
+                else:
+                    self._clear_preview_deck()
+            playlist.viewport().update()
+            self.refresh_playlist_footer(playlist)
+            self.save_project()
+
+    def assign_audio_to_track(self, playlist: PlaylistWidget, item) -> None:
+        if item is None:
+            return
+        file_path, _selected = QFileDialog.getOpenFileName(
+            self,
+            "Assign Audio",
+            self._playlist_dialog_dir(),
+            "Audio Files (*.mp3 *.wav *.m4a *.flac *.aac)",
+        )
+        if not file_path:
+            return
+        self._remember_playlist_dialog_path(file_path)
+        with self.playlist_edit():
+            if not playlist.assign_file_to_item(item, file_path):
+                return
+            self.load_preview_track(playlist.playlist_num, item)
+            self.refresh_playlist_footer(playlist)
+            self.save_project()
+
+    def _absorb_playlist_notes_into_catalog(self) -> None:
+        found = list(self._track_note_labels)
+        for playlist in getattr(self, "playlists", []) or []:
+            for row in range(playlist.count()):
+                found.extend(get_item_notes(playlist.item(row)))
+        self._track_note_labels = merge_note_catalog(found)
+
+    def _note_catalog(self) -> list[str]:
+        self._absorb_playlist_notes_into_catalog()
+        return list(self._track_note_labels)
+
+    def _set_track_notes(self, playlist: PlaylistWidget, targets, notes) -> None:
+        with self.playlist_edit():
+            for target in targets:
+                set_item_notes(target, notes)
+            playlist.viewport().update()
+            self.save_project()
+
+    def _add_note_to_targets(self, playlist: PlaylistWidget, targets, label: str) -> None:
+        canonical = normalize_note_label(label)
+        if canonical is None:
+            return
+        for existing in self._track_note_labels:
+            if existing.casefold() == canonical.casefold():
+                canonical = existing
+                break
+        else:
+            self._track_note_labels = merge_note_catalog([*self._track_note_labels, canonical])
+            self.save_config()
+        with self.playlist_edit():
+            for target in targets:
+                current = get_item_notes(target)
+                if notes_contain(current, canonical):
+                    continue
+                set_item_notes(target, [*current, canonical])
+            playlist.viewport().update()
+            self.save_project()
+
+    def _toggle_track_note(self, playlist: PlaylistWidget, targets, label: str) -> None:
+        if all(notes_contain(get_item_notes(target), label) for target in targets):
+            with self.playlist_edit():
+                for target in targets:
+                    set_item_notes(
+                        target,
+                        [
+                            note
+                            for note in get_item_notes(target)
+                            if note.casefold() != label.casefold()
+                        ],
+                    )
+                playlist.viewport().update()
+                self.save_project()
+            return
+        self._add_note_to_targets(playlist, targets, label)
+
+    def _prompt_add_track_note(self, playlist: PlaylistWidget, targets) -> None:
+        text, ok = QInputDialog.getText(self, "Add note", "Note:")
+        if not ok:
+            return
+        label = normalize_note_label(text)
+        if label is None:
+            return
+        self._add_note_to_targets(playlist, targets, label)
+
+    def _remove_track_note_label(self, label: str) -> None:
+        key = label.casefold()
+        if key in {builtin.casefold() for builtin in BUILTIN_TRACK_NOTES}:
+            return
+        with self.playlist_edit():
+            self._track_note_labels = [
+                note for note in self._track_note_labels if note.casefold() != key
+            ]
+            self._strip_note_label(key)
+            self._track_note_labels = merge_note_catalog(self._track_note_labels)
+            self.save_project()
+            self.save_config()
+
+    def _strip_note_label(self, key: str) -> None:
+        for playlist in getattr(self, "playlists", []) or []:
+            dirty = False
+            for row in range(playlist.count()):
+                item = playlist.item(row)
+                current = get_item_notes(item)
+                kept = [note for note in current if note.casefold() != key]
+                if kept != current:
+                    set_item_notes(item, kept)
+                    dirty = True
+            if dirty:
+                playlist.viewport().update()
+
     def _on_playlist_track_context_menu(self, global_pos: QPoint) -> None:
         playlist = self.sender()
         if not isinstance(playlist, PlaylistWidget):
@@ -4822,6 +5554,38 @@ class AudioPlayer(QMainWindow):
         reveal_act = menu.addAction("Show in Finder")
         reveal_paths = self._existing_track_paths(targets)
         reveal_act.setEnabled(bool(reveal_paths))
+
+        remove_audio_act = menu.addAction("Remove audio")
+        remove_audio_act.setEnabled(
+            any(not is_item_placeholder(target) for target in targets)
+        )
+        remove_audio_act.setStatusTip("Turn the track into an empty slot")
+        assign_audio_act = menu.addAction("Assign audio…")
+        assign_audio_act.setEnabled(item is not None)
+
+        note_menu = menu.addMenu("Note")
+        note_sets = [get_item_notes(target) for target in targets]
+        clear_notes_act = note_menu.addAction("None")
+        clear_notes_act.setCheckable(True)
+        clear_notes_act.setChecked(all(not notes for notes in note_sets))
+        catalog = self._note_catalog()
+        builtin_keys = {label.casefold() for label in BUILTIN_TRACK_NOTES}
+        note_actions: list[tuple[object, str]] = []
+        for label in catalog:
+            act = note_menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(all(notes_contain(notes, label) for notes in note_sets))
+            note_actions.append((act, label))
+        note_menu.addSeparator()
+        add_note_act = note_menu.addAction("Add note…")
+        remove_note_menu = note_menu.addMenu("Delete note")
+        remove_note_actions: list[tuple[object, str]] = []
+        for label in catalog:
+            if label.casefold() in builtin_keys:
+                continue
+            act = remove_note_menu.addAction(label)
+            remove_note_actions.append((act, label))
+        remove_note_menu.setEnabled(bool(remove_note_actions))
 
         color_menu = menu.addMenu("Mark color")
         current_colors = {get_item_color(target) for target in targets}
@@ -4863,6 +5627,13 @@ class AudioPlayer(QMainWindow):
         for info in self._mixer_channels:
             cid = str(info["id"])
             label = str(info.get("name") or cid)
+            if not info.get("is_main"):
+                kind_label = (
+                    "program"
+                    if normalize_channel_kind(info) == CHANNEL_KIND_PROGRAM
+                    else "sample"
+                )
+                label = f"{label} ({kind_label})"
             act = channel_menu.addAction(label)
             act.setCheckable(True)
             act.setChecked(current_channel == cid)
@@ -4895,28 +5666,51 @@ class AudioPlayer(QMainWindow):
         if chosen is reveal_act and reveal_act.isEnabled():
             self._reveal_tracks_in_finder(reveal_paths)
             return
+        if chosen is remove_audio_act and remove_audio_act.isEnabled():
+            self.remove_audio_from_tracks(playlist, targets)
+            return
+        if chosen is assign_audio_act and assign_audio_act.isEnabled():
+            self.assign_audio_to_track(playlist, item)
+            return
+        if chosen is clear_notes_act:
+            self._set_track_notes(playlist, targets, [])
+            return
+        if chosen is add_note_act:
+            self._prompt_add_track_note(playlist, targets)
+            return
+        for act, label in note_actions:
+            if chosen is act:
+                self._toggle_track_note(playlist, targets, label)
+                return
+        for act, label in remove_note_actions:
+            if chosen is act:
+                self._remove_track_note_label(label)
+                return
         for act, hex_color in color_actions:
             if chosen is act:
-                for target in targets:
-                    set_item_color(target, hex_color)
-                playlist.viewport().update()
-                self.save_project()
+                with self.playlist_edit():
+                    for target in targets:
+                        set_item_color(target, hex_color)
+                    playlist.viewport().update()
+                    self.save_project()
                 return
         for act, scene_id in scene_actions:
             if chosen is act:
-                for target in targets:
-                    set_item_mixer_scene_id(target, scene_id)
-                playlist.viewport().update()
-                self.save_project()
+                with self.playlist_edit():
+                    for target in targets:
+                        set_item_mixer_scene_id(target, scene_id)
+                    playlist.viewport().update()
+                    self.save_project()
                 return
         for act, channel_id in channel_actions:
             if chosen is act:
-                for target in targets:
-                    set_item_audio_channel_id(target, channel_id)
-                    self._retarget_playback_after_channel_change(target)
-                playlist.viewport().update()
-                self.save_project()
-                self.save_config()
+                with self.playlist_edit():
+                    for target in targets:
+                        set_item_audio_channel_id(target, channel_id)
+                        self._retarget_playback_after_channel_change(target)
+                    playlist.viewport().update()
+                    self.save_project()
+                    self.save_config()
                 return
 
     def _existing_track_paths(self, items) -> list[str]:
@@ -5120,6 +5914,7 @@ class AudioPlayer(QMainWindow):
                 for path, state in self._track_stem_state.items()
             },
             video_mixer=self._export_video_mixer_state(),
+            note_labels=self._note_catalog(),
         )
 
     def _import_mixer_media_for_save(self) -> bool:
@@ -5402,6 +6197,8 @@ class AudioPlayer(QMainWindow):
         self.refresh_playlist_display()
 
     def _apply_project_state(self, state: ProjectState) -> None:
+        if getattr(self, "_edit_history", None) is not None:
+            self._edit_history.clear()
         self.project.name = state.name
         self._track_timeline_state = {
             path: self._timeline_state_from_dict(data)
@@ -5445,6 +6242,15 @@ class AudioPlayer(QMainWindow):
             column.load_column_state(column_states[i])
 
         self._rebuild_playlist_registry()
+        # The note menu is app-wide. A new or opened project adds its labels
+        # without dropping ones created elsewhere.
+        self._track_note_labels = merge_note_catalog(
+            [
+                *self._track_note_labels,
+                *(getattr(state, "note_labels", None) or []),
+            ]
+        )
+        self._absorb_playlist_notes_into_catalog()
         self._adopt_all_playlist_settings()
         self._mark_playlist_stems_badges()
 
@@ -5668,6 +6474,11 @@ class AudioPlayer(QMainWindow):
                 if hasattr(self, "btn_waveform_res"):
                     self.btn_waveform_res.setChecked(self._waveform_res_enabled)
 
+            if isinstance(config.get("note_labels"), list):
+                self._track_note_labels = merge_note_catalog(
+                    [*self._track_note_labels, *config["note_labels"]]
+                )
+
             raw_tabs = config.get("browser_tabs")
             if not isinstance(raw_tabs, list) and self.project.project_file.is_file():
                 # One-time migrate tabs previously stored in project.json
@@ -5817,6 +6628,7 @@ class AudioPlayer(QMainWindow):
                 if hasattr(self, "file_browser")
                 else "files"
             ),
+            "note_labels": list(self._track_note_labels),
             "properties_collapsed": self._properties_collapsed,
             "track_eq": dict(self._track_eq_state),
             "track_lufs": dict(self._track_lufs),
@@ -5954,21 +6766,24 @@ class AudioPlayer(QMainWindow):
             return
 
         self._remember_playlist_dialog_path(files[0])
-        for file_path in files:
-            playlist.add_file(file_path)
-        self.refresh_playlist_footer(playlist)
+        with self.playlist_edit():
+            for file_path in files:
+                playlist.add_file(file_path)
+            self.refresh_playlist_footer(playlist)
+            self.save_project()
 
     def add_placeholder_to_playlist_widget(self, playlist: PlaylistWidget) -> None:
         insert_at = playlist.currentRow() + 1 if playlist.currentRow() >= 0 else playlist.count()
         insert_at = max(0, min(insert_at, playlist.count()))
-        item = playlist.add_placeholder_item(row=insert_at)
-        playlist._select_items([item])
-        playlist.tracksChanged.emit()
-        self.last_selected_playlist = playlist.playlist_num
-        self.load_preview_track(playlist.playlist_num, item)
-        self.refresh_playlist_footer(playlist)
+        with self.playlist_edit():
+            item = playlist.add_placeholder_item(row=insert_at)
+            playlist._select_items([item])
+            playlist.tracksChanged.emit()
+            self.last_selected_playlist = playlist.playlist_num
+            self.load_preview_track(playlist.playlist_num, item)
+            self.refresh_playlist_footer(playlist)
+            self.save_project()
         playlist.editItem(item)
-        self.save_project()
 
     def remove_from_playlist_widget(self, playlist: PlaylistWidget):
         rows = playlist.selected_rows()
@@ -5976,9 +6791,17 @@ class AudioPlayer(QMainWindow):
             current_row = playlist.currentRow()
             if current_row >= 0:
                 rows = [current_row]
-        for row in reversed(rows):
-            playlist.takeItem(row)
-        self.refresh_playlist_footer(playlist)
+        if not rows:
+            return
+        with self.playlist_edit():
+            for row in reversed(rows):
+                item = playlist.item(row)
+                if item is self.current_playing_item:
+                    self._clear_air_deck()
+                self._stop_aux_playback_for_item(item)
+                playlist.takeItem(row)
+            self.refresh_playlist_footer(playlist)
+            self.save_project()
 
     def clear_playlist_widget(self, playlist: PlaylistWidget):
         if playlist.count() == 0:
@@ -5994,6 +6817,11 @@ class AudioPlayer(QMainWindow):
         if answer != QMessageBox.StandardButton.Yes:
             return
 
+        with self.playlist_edit():
+            self._clear_playlist_contents(playlist)
+            self.save_project()
+
+    def _clear_playlist_contents(self, playlist: PlaylistWidget) -> None:
         playlist.clear()
         if self.current_playing_playlist == playlist.playlist_num:
             for media_player in self._players:
@@ -6001,6 +6829,8 @@ class AudioPlayer(QMainWindow):
             self._cancel_crossfade()
             self.current_playing_playlist = None
             self.current_playing_item = None
+            self._program_item = None
+            self._program_playlist = None
             self._current_file_path = None
             self.waveform.set_waveform([])
             self.track_info.setText("No track selected")
@@ -6035,9 +6865,17 @@ class AudioPlayer(QMainWindow):
         current_item = playlist.currentItem()
         if not current_item:
             return False
+        file_path = get_item_file_path(current_item)
+        channel_id = self._resolve_target_channel_id(current_item)
+        if self._is_sample_channel(channel_id):
+            return self._play_file_on_aux(
+                channel_id,
+                file_path,
+                item=current_item,
+                playlist_num=playlist_num,
+            )
         self.current_playing_playlist = playlist_num
         self.current_playing_item = current_item
-        file_path = get_item_file_path(current_item)
         return self.play_file(
             file_path,
             space_triggered=space_triggered,
@@ -6360,6 +7198,11 @@ class AudioPlayer(QMainWindow):
         self._set_output_volume(self._playback_volume)
         self.current_playing_playlist = None
         self.current_playing_item = None
+        self._program_item = None
+        self._program_playlist = None
+        self._deck_channel_id = [MAIN_CHANNEL_ID, MAIN_CHANNEL_ID]
+        self._pending_program_channel_id = MAIN_CHANNEL_ID
+        self._rebuild_mix_bus_channels()
         self._current_file_path = None
         self._displayed_track_path = None
         self._displayed_track_key = None
@@ -6626,7 +7469,7 @@ class AudioPlayer(QMainWindow):
         self._stop_preview_for_air()
 
         channel_id = self._resolve_target_channel_id(self._preview_item)
-        if channel_id != MAIN_CHANNEL_ID:
+        if self._is_sample_channel(channel_id):
             return self._play_file_on_aux(
                 channel_id,
                 self._preview_file_path,
@@ -7582,23 +8425,26 @@ class AudioPlayer(QMainWindow):
             return False
 
         channel_id = self._resolve_target_channel_id(self.current_playing_item)
-        if channel_id != MAIN_CHANNEL_ID:
+        if self._is_sample_channel(channel_id):
             item = self.current_playing_item
             playlist_num = self.current_playing_playlist
-            # Aux samples use playlist mini-wave, not the ON AIR deck.
-            if (
-                self._current_file_path
-                or self._displayed_track_path
-                or bool(getattr(self.waveform, "waveform_data", None))
-            ):
-                self._clear_air_deck()
-            return self._play_file_on_aux(
+            started = self._play_file_on_aux(
                 channel_id,
                 file_path,
                 item=item,
                 playlist_num=playlist_num,
                 start_ms=start_ms,
             )
+            # A sample rides on top of the program. Put the on-air identity back
+            # if this call temporarily pointed it at the sample.
+            if item is not self._program_item:
+                self.current_playing_item = self._program_item
+                self.current_playing_playlist = self._program_playlist
+            return started
+
+        self._pending_program_channel_id = (
+            channel_id if self._is_program_channel(channel_id) else MAIN_CHANNEL_ID
+        )
 
         if self._queue_play_after_stop_fade(
             file_path,
@@ -7661,6 +8507,8 @@ class AudioPlayer(QMainWindow):
             self._pending_transition_fade_ms = fade_ms
 
         def begin_playback():
+            self._remember_program_identity()
+            self._assign_active_program_deck()
             self.volume_fader.cancel()
             self._cancel_pending_playback()
             other_idx = 1 - self._active_player_idx
@@ -7827,6 +8675,10 @@ class AudioPlayer(QMainWindow):
                 continue
             path = get_item_file_path(self.current_playing_item)
             if not path or not os.path.isfile(path):
+                continue
+            if self._is_sample_channel(
+                self._resolve_target_channel_id(self.current_playing_item)
+            ):
                 continue
             # Fresh start: do not keep end-latch; force reload after EOF/pause.
             self._range_end_latched = False
@@ -8516,6 +9368,8 @@ class AudioPlayer(QMainWindow):
             self._sweep_finished_aux_overlays()
             if self._aux_channel_meta:
                 self._refresh_aux_playlist_overlays(relayout=False)
+        if not self._is_window_resizing:
+            self._sync_mixer_transport()
 
     def _on_player_playback_state_changed(self, player_idx: int, state) -> None:
         if player_idx != self._active_player_idx:

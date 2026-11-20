@@ -3,8 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable
 
-from PyQt6.QtCore import Qt, QRect, QSize
-from PyQt6.QtGui import QColor, QFont, QPainter, QPen
+from PyQt6.QtCore import Qt, QPoint, QRect, QSize
+from PyQt6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PyQt6.QtWidgets import (
     QAbstractItemView,
     QLineEdit,
@@ -18,10 +18,12 @@ from app.playlist_io import (
     BPM_ROLE,
     COLOR_ROLE,
     DURATION_ROLE,
+    NOTES_ROLE,
     STEMS_ROLE,
     get_item_file_path,
     is_item_file_missing,
     is_item_placeholder,
+    normalize_notes,
 )
 from app.time_utils import format_time_ms
 from app.ui.tokens import get_token
@@ -72,6 +74,10 @@ def _has_stems_from_index(index) -> bool:
     return bool(index.data(STEMS_ROLE))
 
 
+def _notes_from_index(index) -> list[str]:
+    return normalize_notes(index.data(NOTES_ROLE))
+
+
 def _format_bpm(bpm: float) -> str:
     if bpm == int(bpm):
         return str(int(bpm))
@@ -85,6 +91,7 @@ class _ColumnLayout:
     time_rect: QRect
     bpm_rect: QRect
     stems_rect: QRect | None
+    note_rects: tuple[tuple[str, QRect], ...]
     wave_rect: QRect | None
 
 
@@ -140,12 +147,17 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         bpm_w = fm.horizontalAdvance("000.0") + pad
         return index_w, time_w, bpm_w
 
+    def _note_badge_width(self, text: str) -> int:
+        width = QFontMetrics(self._badge_font).horizontalAdvance(text) + self.META_PAD * 2
+        return max(24, width)
+
     def _layout_columns(
         self,
         rect: QRect,
         badge_h: int,
         *,
         has_stems: bool,
+        notes: list[str],
         show_wave: bool,
         fm,
         row_count: int,
@@ -175,16 +187,26 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             time_w,
             badge_h,
         )
+        cursor = time_rect.left() - self.COL_GAP
         stems_rect = None
-        name_right = time_rect.left() - self.COL_GAP
         if has_stems:
             stems_rect = QRect(
-                time_rect.left() - self.COL_GAP - self.STEMS_BADGE_W,
+                cursor - self.STEMS_BADGE_W,
                 badge_y,
                 self.STEMS_BADGE_W,
                 badge_h,
             )
-            name_right = stems_rect.left() - self.COL_GAP
+            cursor = stems_rect.left() - self.COL_GAP
+
+        note_widths = [self._note_badge_width(text) for text in notes]
+        notes_span = sum(note_widths) + self.COL_GAP * max(0, len(note_widths) - 1)
+        note_left = cursor - notes_span
+        note_rects: list[tuple[str, QRect]] = []
+        for text, width in zip(notes, note_widths):
+            note_rects.append((text, QRect(note_left, badge_y, width, badge_h)))
+            note_left += width + self.COL_GAP
+
+        name_right = note_rects[0][1].left() - self.COL_GAP if note_rects else cursor
 
         name_left = index_rect.right() + self.COL_GAP
         name_width = max(0, name_right - name_left)
@@ -206,6 +228,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             time_rect=time_rect,
             bpm_rect=bpm_rect,
             stems_rect=stems_rect,
+            note_rects=tuple(note_rects),
             wave_rect=wave_rect,
         )
 
@@ -326,6 +349,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             option.rect,
             badge_h,
             has_stems=_has_stems_from_index(index),
+            notes=_notes_from_index(index),
             show_wave=self._aux_info_for_item(item) is not None,
             fm=option.fontMetrics,
             row_count=row_count,
@@ -410,6 +434,72 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         painter.drawText(rect, int(Qt.AlignmentFlag.AlignCenter), text)
         painter.restore()
 
+    def _wave_parts(self, rect: QRect) -> tuple[QRect, QRect]:
+        """Stop button on the left, scrubbable wave on the right."""
+        stop = QRect(rect.left() + 2, rect.top() + 2, 14, max(8, rect.height() - 4))
+        seek = QRect(
+            stop.right() + 3,
+            rect.top(),
+            max(0, rect.right() - (stop.right() + 3)),
+            rect.height(),
+        )
+        return stop, seek
+
+    def _option_for_row(self, playlist, index):
+        option = QStyleOptionViewItem()
+        playlist.initViewItemOption(option)
+        option.rect = playlist.visualRect(index)
+        self.initStyleOption(option, index)
+        return option
+
+    def _layout_for_row(self, playlist, index, option):
+        item = playlist.item(index.row())
+        aux = self._aux_info_for_item(item)
+        layout = self._layout_columns(
+            option.rect,
+            self._badge_height(option),
+            has_stems=_has_stems_from_index(index),
+            notes=_notes_from_index(index),
+            show_wave=aux is not None,
+            fm=option.fontMetrics,
+            row_count=playlist.count() if hasattr(playlist, "count") else 1,
+        )
+        return layout, item, aux
+
+    def aux_interaction(self, playlist, pos: QPoint):
+        """Hit-test a playing sample row. Returns ('stop'|'seek', item, ratio)."""
+        index = playlist.indexAt(pos)
+        if not index.isValid():
+            return None
+        option = self._option_for_row(playlist, index)
+        layout, item, aux = self._layout_for_row(playlist, index, option)
+        if item is None or aux is None or layout.wave_rect is None:
+            return None
+        stop, seek = self._wave_parts(layout.wave_rect)
+        if stop.contains(pos):
+            return ("stop", item, 0.0)
+        if seek.contains(pos) and seek.width() > 0:
+            ratio = (pos.x() - seek.left()) / float(seek.width())
+            return ("seek", item, max(0.0, min(1.0, ratio)))
+        return None
+
+    def aux_seek_ratio(self, playlist, item, pos: QPoint) -> float | None:
+        row = playlist.row(item) if item is not None else -1
+        if row < 0:
+            return None
+        index = playlist.model().index(row, 0)
+        if not index.isValid():
+            return None
+        option = self._option_for_row(playlist, index)
+        layout, _item, aux = self._layout_for_row(playlist, index, option)
+        if aux is None or layout.wave_rect is None:
+            return None
+        _stop, seek = self._wave_parts(layout.wave_rect)
+        if seek.width() <= 0:
+            return None
+        ratio = (pos.x() - seek.left()) / float(seek.width())
+        return max(0.0, min(1.0, ratio))
+
     def _draw_mini_wave(
         self,
         painter: QPainter,
@@ -425,37 +515,41 @@ class PlaylistItemDelegate(QStyledItemDelegate):
         painter.save()
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
+        stop, seek = self._wave_parts(rect)
         track_bg = QColor(255, 255, 255, 28 if selected else 18)
         painter.setPen(Qt.PenStyle.NoPen)
         painter.setBrush(track_bg)
         painter.drawRoundedRect(rect, 3, 3)
 
-        mid_y = rect.center().y()
-        amp = max(2, rect.height() // 2 - 2)
-        n = max(1, len(peaks))
-        bar_w = max(1.0, rect.width() / float(n))
-        played_x = rect.left() + int(rect.width() * max(0.0, min(1.0, progress)))
+        painter.setBrush(QColor(196, 92, 92, 210))
+        painter.drawRoundedRect(stop, 2, 2)
+        painter.setBrush(QColor("#1a1c20"))
+        glyph = stop.adjusted(4, 4, -4, -4)
+        painter.drawRect(glyph)
 
-        played = QColor(get_token("colors.accent", "#2ad4ea"))
-        rest = QColor(played)
-        rest.setAlpha(90 if selected else 70)
-        for i, peak in enumerate(peaks):
-            h = max(1, int(abs(float(peak)) * amp))
-            x = int(rect.left() + i * bar_w)
-            w = max(1, int(bar_w) - 1)
-            color = played if x + w <= played_x else rest
-            painter.fillRect(x, mid_y - h, w, h * 2, color)
+        if seek.width() > 0:
+            mid_y = seek.center().y()
+            amp = max(2, seek.height() // 2 - 2)
+            n = max(1, len(peaks))
+            bar_w = max(1.0, seek.width() / float(n))
+            played_x = seek.left() + int(seek.width() * max(0.0, min(1.0, progress)))
+            played = QColor("#e0a15a")
+            rest = QColor(played)
+            rest.setAlpha(90 if selected else 70)
+            for i, peak in enumerate(peaks):
+                h = max(1, int(abs(float(peak)) * amp))
+                x = int(seek.left() + i * bar_w)
+                w = max(1, int(bar_w) - 1)
+                color = played if x + w <= played_x else rest
+                painter.fillRect(x, mid_y - h, w, h * 2, color)
+            painter.setPen(QPen(played, 1))
+            painter.drawLine(played_x, seek.top() + 1, played_x, seek.bottom() - 1)
 
-        # Playhead
-        painter.setPen(QPen(played, 1))
-        painter.drawLine(played_x, rect.top() + 1, played_x, rect.bottom() - 1)
-
-        # Channel chip
         label = str(channel_name or "CH")
         chip_w = max(28, painter.fontMetrics().horizontalAdvance(label) + 8)
         chip = QRect(rect.right() - chip_w - 2, rect.top() + 1, chip_w, 12)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 110))
+        painter.setBrush(QColor(0, 0, 0, 140))
         painter.drawRoundedRect(chip, 3, 3)
         painter.setPen(QColor("#ffffff"))
         painter.setFont(self._badge_font)
@@ -485,6 +579,7 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             option.rect,
             badge_h,
             has_stems=has_stems,
+            notes=_notes_from_index(index),
             show_wave=show_wave,
             fm=option.fontMetrics,
             row_count=row_count,
@@ -523,13 +618,23 @@ class PlaylistItemDelegate(QStyledItemDelegate):
             fg=plain_fg,
             font=item_font,
         )
+        accent_bg = self._color("accent", "#2ad4ea")
+        accent_fg = self._color("text_on_accent", "#0c1218")
+        for note_text, note_rect in layout.note_rects:
+            self._draw_badge(
+                painter,
+                note_rect,
+                note_text,
+                bg=accent_bg,
+                fg=accent_fg,
+            )
         if layout.stems_rect is not None:
             self._draw_badge(
                 painter,
                 layout.stems_rect,
                 "stems",
-                bg=self._color("accent", "#2ad4ea"),
-                fg=self._color("text_on_accent", "#0c1218"),
+                bg=accent_bg,
+                fg=accent_fg,
             )
         self._draw_badge(
             painter,

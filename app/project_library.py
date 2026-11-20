@@ -7,6 +7,7 @@ import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from app.playlist_io import normalize_notes
 from app.project import PROJECT_FILENAME, ProjectState, read_project_state
 
 LIBRARY_TRACKS_MIME = "application/x-simpleaudioplayer-library-tracks"
@@ -180,6 +181,10 @@ def _track_from_entry(state: ProjectState, track: dict, source_root: str) -> Lib
         snapshot["stems"] = True
     elif track.get("stems"):
         snapshot["stems"] = True
+
+    notes = normalize_notes(track.get("notes"))
+    if notes:
+        snapshot["notes"] = notes
 
     filename = os.path.basename(path) if path else ""
     search = f"{display}\n{filename}".casefold()
